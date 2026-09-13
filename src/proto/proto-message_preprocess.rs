@@ -9,6 +9,7 @@ pub async fn handle(
     message: &cockatiel_protobuf::MessagePreProcess,
     container: &Container,
     instance_uuid7: &String,
+    ui_state: &Arc<Mutex<EngineState>>,
     modules: &Arc<Mutex<std::collections::HashMap<String, ModuleInfo>>>,
     config_state: &impl std::any::Any, // Replace with your actual ConfigState type if needed
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -28,9 +29,21 @@ pub async fn handle(
 
         final_container.payload = Some(Payload::MessagePostProcess(
             cockatiel_protobuf::MessagePostProcess {
-                platform: message.platform.clone(),
-                raw_data: message.raw_data.clone(),
-                user_uuid7: message.user_uuid7.clone(),
+                platform: message
+                    .core_message
+                    .as_ref()
+                    .map(|c| c.platform.clone())
+                    .unwrap_or_default(),
+                raw_data: message
+                    .core_message
+                    .as_ref()
+                    .map(|c| c.raw_data.clone())
+                    .unwrap_or_default(),
+                user_uuid7: message
+                    .core_message
+                    .as_ref()
+                    .map(|c| c.user_uuid7.clone())
+                    .unwrap_or_default(),
                 raw_message: message.raw_message.clone(),
                 processed_message: String::new(),
                 command: message.command.clone(),

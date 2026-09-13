@@ -2,11 +2,9 @@ mod context;
 mod logger;
 mod module_manager;
 mod title;
+//use cockatiel_lib;
 
 use crate::Payload;
-
-// Pull in your library module containing CockatielClient and generated protobufs
-use lib_cockatiel;
 
 use context::Context;
 use logger::Logger;

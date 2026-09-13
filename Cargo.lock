@@ -258,7 +258,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cockatiel-engine"
+name = "cockatiel-engine-rs"
 version = "0.1.0"
 dependencies = [
  "crossterm",

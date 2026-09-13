@@ -10,8 +10,9 @@ pub async fn handle(
     config_state: &impl std::any::Any,
     ui_state: &impl std::any::Any,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !authenticated {
-        return Ok(());
+    if let Some(core) = &message.core_message {
+        let platform = &core.platform;
+        // do something with platform
     }
 
     broadcast_stage(modules, config_state, "postprocess", container).await;

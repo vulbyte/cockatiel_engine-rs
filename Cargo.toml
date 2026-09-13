@@ -1,8 +1,10 @@
+[workspace] 
+
 [package]
-name = "cockatiel-engine"
+name = "cockatiel-engine-rs"
 version = "0.1.0"
 edition = "2024"
-build = "../proto/build.rs"
+build = "./cockatiel_lib/rust/build.rs"
 
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }

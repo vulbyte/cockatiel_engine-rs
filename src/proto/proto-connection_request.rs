@@ -1,7 +1,9 @@
+use crate::EngineState;
 use crate::cockatiel_protobuf;
+use prost::Message;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::Sender;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use uuid::Uuid;
 
 // Adjust these imports to match your project's module paths
@@ -14,16 +16,16 @@ pub async fn handle<W>(
     request: cockatiel_protobuf::ConnectionRequest, // Adjust type if needed
     container: &Container,
     config_state: &impl std::any::Any, // Replace with your actual ConfigState type
-    ui_state: &impl std::any::Any,     // Replace with your actual UiState type
+    ui_state: &Arc<Mutex<EngineState>>,
     modules: &Arc<Mutex<std::collections::HashMap<String, ModuleInfo>>>,
     websocket: &mut W,
-    tx: &Sender<()>, // Adjust sender type if needed
+    tx: &tokio::sync::mpsc::Sender<Container>,
     module_name_out: &mut String,
     instance_uuid7_out: &mut String,
     authenticated_out: &mut bool,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    W: futures_util::SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    W: futures_util::SinkExt<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
     let config = get_config(config_state);
 
@@ -48,7 +50,7 @@ where
 
         let mut bytes = Vec::new();
         response.encode(&mut bytes)?;
-        websocket.send(Message::Binary(bytes.into())).await?;
+        websocket.send(WsMessage::Binary(bytes.into())).await?;
         return Ok(()); // Replaces the `break` or handles early exit
     }
 
@@ -74,7 +76,7 @@ where
     *instance_uuid7_out = assigned_id.clone();
     *authenticated_out = true;
 
-    let position = match request.process_position.to_lowercase().as_str() {
+    let position = match request.process_position.to_string().as_str() {
         "input" | "inputs" => "input",
         "preprocess" => "preprocess",
         "inprocess" => "inprocess",
@@ -92,7 +94,7 @@ where
             ModuleInfo {
                 name: module_name_out.clone(),
                 instance_uuid7: assigned_id.clone(),
-                priority: request.priority,
+                priority: request.priority as i32,
                 process_position: position.clone(),
                 state: ModuleState::Running,
                 sender: Some(tx.clone()),
@@ -127,7 +129,6 @@ where
     let mut bytes = Vec::new();
     response.encode(&mut bytes)?;
 
-    websocket.send(Message::Binary(bytes.into())).await?;
-
+    websocket.send(WsMessage::Binary(bytes.into())).await?;
     Ok(())
 }

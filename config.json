@@ -1,6 +1,10 @@
 {
-            "database_location": "./",
-            "backup_database_location": "./",
-            "paring_pin": 185245,
-            "port": 9734
+    "database_location": "./cockatiel_data.db",
+    "backup_database_location": "./cockatiel_backup.db",
+    "paring_pin": 685689,
+    "port": 9734,
+    "inputs": [],
+    "preprocessModules": [],
+    "inprocessModules": [],
+    "postprocessModules": []
 }

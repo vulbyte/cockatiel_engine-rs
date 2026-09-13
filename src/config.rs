@@ -5,7 +5,8 @@ use std::{
     env, fs,
     path::PathBuf,
     sync::{Arc, Mutex},
-}; // wherever that struct actually lives
+};
+use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -33,7 +34,7 @@ pub struct ConfigState {
     pub config: Config,
 }
 
-fn create(directory: PathBuf) -> Result<String, String> {
+pub fn create_config(directory: PathBuf) -> Result<String, String> {
     let target = directory.join("config.json");
 
     let pin: u32 = 100000 + (Uuid::new_v4().as_u128() % 900000) as u32;
@@ -57,7 +58,11 @@ fn create(directory: PathBuf) -> Result<String, String> {
     Ok(config)
 }
 
-fn get(state: &Arc<Mutex<ConfigState>>) -> Config {
+pub fn get_file(path: impl Into<PathBuf>) -> Result<String, std::io::Error> {
+    fs::read_to_string(path.into())
+}
+
+pub fn get_config(state: &Arc<Mutex<ConfigState>>) -> Config {
     let mut state = state.lock().unwrap();
 
     if let Ok(metadata) = fs::metadata(&state.path) {
@@ -76,7 +81,7 @@ fn get(state: &Arc<Mutex<ConfigState>>) -> Config {
     state.config.clone()
 }
 
-async fn verify() -> Result<(String, PathBuf), Box<dyn std::error::Error>> {
+pub async fn verify_config() -> Result<(String, PathBuf), Box<dyn std::error::Error>> {
     for path in ["../config.json"] {
         if let Ok(content) = get_file(path) {
             return Ok((content, PathBuf::from(path)));
@@ -96,7 +101,7 @@ async fn verify() -> Result<(String, PathBuf), Box<dyn std::error::Error>> {
     Ok((content, target.join("config.json")))
 }
 
-fn update<F>(state: &Arc<Mutex<ConfigState>>, update: F)
+pub fn update_config<F>(state: &Arc<Mutex<ConfigState>>, update: F)
 where
     F: FnOnce(&mut Config),
 {
@@ -113,7 +118,7 @@ where
     }
 }
 
-fn add_module_to_config(
+pub fn add_module_to_config(
     config_state: &Arc<Mutex<ConfigState>>,
     name: &str,
     position: &str,
