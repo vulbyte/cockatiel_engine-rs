@@ -1501,6 +1501,40 @@ async fn handle_connection(
             return Ok(());
         }
 
+        // Containment: reject the placeholder "unnamed_module" identity. The
+        // client defaults to it when no name is configured, and if two modules
+        // ever connected under it they would silently share one routing slot
+        // and one JWT. The supervisor always passes --name; a module connecting
+        // with a blank/placeholder name is a misconfiguration.
+        let claimed = container.module_name.trim();
+        if claimed.is_empty() || claimed == "unnamed_module" {
+            log_event(
+                &ui_state,
+                format!(
+                    "Rejected: module connected without a valid name ('{}'). The supervisor passes --name.",
+                    container.module_name
+                ),
+            );
+            log_to_timeline(&db, "module_reject", claimed, "blank/unnamed module identity").await;
+            let response = Container {
+                version: 1,
+                auth_token: String::new(),
+                module_name: "cockatiel".into(),
+                module_instance_uuid7: String::new(),
+                payload: Some(Payload::ConnectionRequestReturn(
+                    cockatiel_protobuf::ConnectionRequestReturn {
+                        new_port: 0,
+                        module_instance_uuid7: String::new(),
+                    },
+                )),
+            };
+            let mut bytes = Vec::new();
+            response.encode(&mut bytes)?;
+            websocket.send(WsMessage::Binary(bytes.into())).await?;
+            websocket.close(None).await?;
+            return Ok(());
+        }
+
         module_name = container.module_name.clone();
         let requested_uuid = request.module_instance_uuid7.clone();
         let position = process_position_to_string(ProcessPosition::try_from(request.process_position).unwrap_or(ProcessPosition::Unspecified));
