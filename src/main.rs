@@ -767,6 +767,15 @@ fn is_control_surface(name: &str) -> bool {
     name == "cockatiel-tui" || name == "cockatiel-tui-child"
 }
 
+/// Who may read OTHER modules' credential values from `module_list`.
+/// The TUI control surface (operator) and term-chat (which legitimately reads
+/// adapter client ids/secrets to drive its OAuth login flows) may see them;
+/// every other module gets the structural list with `credential_values`
+/// redacted, so one module cannot dump another module's secrets.
+fn may_read_other_credentials(name: &str) -> bool {
+    is_control_surface(name) || name == "term-chat"
+}
+
 /// The compliance test-runner may archive test results to the timeline.
 fn is_test_runner(name: &str) -> bool {
     name == "cockatiel-test-runner"
@@ -1834,10 +1843,19 @@ let mut bytes = Vec::new();
                             let mut entries: HashMap<String, serde_json::Value> = HashMap::new();
 
                             // 1. Discovered modules — what the engine can find on disk
+                            // `credential_values` contains `.env` secrets; only the
+                            // TUI control surface and term-chat (OAuth login) may see
+                            // them. Other modules get the structural list redacted.
+                            let expose_creds = may_read_other_credentials(&module_name);
                             for (name, discovered) in discovered_registry.lock().unwrap().iter() {
                                 let cred_values = credential_values_map(discovered);
                                 let config_complete =
                                     is_config_complete(&discovered.manifest.credentials, &cred_values);
+                                let exposed_values = if expose_creds {
+                                    cred_values
+                                } else {
+                                    std::collections::HashMap::new()
+                                };
                                 entries.insert(
                                     name.clone(),
                                     serde_json::json!({
@@ -1851,7 +1869,7 @@ let mut bytes = Vec::new();
                                         "shutdown_at": null,
                                         "credentials": discovered.manifest.credentials,
                                         "directory": discovered.directory.to_string_lossy().to_string(),
-                                        "credential_values": cred_values,
+                                        "credential_values": exposed_values,
                                         "config_complete": config_complete,
                                     }),
                                 );
@@ -1908,9 +1926,17 @@ let mut bytes = Vec::new();
                             (true, json.into_bytes(), String::new())
                         } else if query.query_id == "engine_info" {
                             let config = get_config(&config_state);
+                            // The PIN is the master key for first connections — only
+                            // the TUI control surface may read it. Other callers get
+                            // connection metadata only.
+                            let pin = if is_control_surface(&module_name) {
+                                serde_json::json!(config::get_pin(&config_state))
+                            } else {
+                                serde_json::Value::Null
+                            };
                             let json = serde_json::json!({
                                 "port": config.port,
-                                "pin": config::get_pin(&config_state),
+                                "pin": pin,
                                 "timeline_database_location": config.timeline_database_location,
                             }).to_string();
                             (true, json.into_bytes(), String::new())
@@ -1975,6 +2001,13 @@ let mut bytes = Vec::new();
                                 userdb_virtual_query(&user_db_client, &query.query_id, &query.sql, &ui_state, &module_name, peer_loopback).await
                             }
                         } else if query.query_id == "set_credentials" {
+                            // Writing credentials to another module's `.env` /
+                            // `config.json` is a control-surface operation — only
+                            // the TUI may do it. Otherwise any authenticated module
+                            // could rewrite any other module's secrets.
+                            if !is_control_surface(&module_name) {
+                                (false, Vec::new(), "set_credentials denied: not the TUI".to_string())
+                            } else {
                             // Expects JSON: { "module_name": "...", "values": { "key": "value", ... } }
                             let mut result = (false, Vec::new(), "Failed to parse set_credentials payload".to_string());
                             if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&query.sql) {
@@ -2012,6 +2045,7 @@ let mut bytes = Vec::new();
                                 }
                             }
                             result
+                            }
                         } else if query.query_id == "audio_for_message" {
                             // Fetch a message's rendered audio (raw bytes) so
                             // displays can play it. Any module may read it.
