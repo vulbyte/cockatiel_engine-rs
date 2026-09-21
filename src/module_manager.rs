@@ -6,6 +6,41 @@ use std::{
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialField {
+    pub key: String,
+    pub label: String,
+
+    #[serde(default)]
+    pub sensitive: bool,
+
+    #[serde(default)]
+    pub list: bool,
+
+    /// Optional fields don't block "config complete" and are not required
+    /// (e.g. oauth_token, which is auto-acquired by the adapter).
+    #[serde(default)]
+    pub optional: bool,
+
+    /// Environment-variable name this credential maps to (the key the module's
+    /// own code reads, e.g. "KICK_CLIENT_ID"). Credentials are stored in the
+    /// module's `.env` under this name so modules load them via `env::var`.
+    /// Empty → falls back to the field `key`.
+    #[serde(default)]
+    pub env: String,
+}
+
+impl CredentialField {
+    /// The env name used in the module's `.env` file.
+    pub fn env_name(&self) -> &str {
+        if self.env.is_empty() {
+            &self.key
+        } else {
+            &self.env
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleManifest {
     pub name: String,
 
@@ -29,6 +64,22 @@ pub struct ModuleManifest {
 
     #[serde(default)]
     pub autostart: bool,
+
+    #[serde(default)]
+    pub terminal: bool,
+
+    #[serde(default)]
+    pub credentials: Vec<CredentialField>,
+
+    /// Optional per-module dead-air threshold (seconds) before the engine
+    /// probes this module. 0 = use the engine config default (30s).
+    #[serde(default)]
+    pub unresponsive_timeout_secs: u64,
+
+    /// Optional per-module probe response window (seconds). 0 = use the
+    /// engine config default (15s).
+    #[serde(default)]
+    pub probe_response_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -173,5 +224,29 @@ impl ModuleRegistry {
 
     pub fn len(&self) -> usize {
         self.modules.len()
+    }
+
+    /// Update the autostart flag for a discovered module, both in memory and on disk.
+    pub fn set_autostart(&mut self, name: &str, autostart: bool) -> Result<(), String> {
+        let module = self
+            .modules
+            .get_mut(name)
+            .ok_or_else(|| format!("Unknown module: {}", name))?;
+
+        module.manifest.autostart = autostart;
+
+        let manifest_path = module.directory.join("cockatiel_module_info.json");
+        let contents = fs::read_to_string(&manifest_path).map_err(|e| {
+            format!("Could not read {}: {}", manifest_path.display(), e)
+        })?;
+
+        let mut manifest: ModuleManifest = serde_json::from_str(&contents).map_err(|e| {
+            format!("Invalid module manifest {}: {}", manifest_path.display(), e)
+        })?;
+
+        manifest.autostart = autostart;
+
+        let serialized = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
+        fs::write(&manifest_path, serialized).map_err(|e| e.to_string())
     }
 }

@@ -89,6 +89,10 @@ where
 
     {
         let mut mods = modules.lock().unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
         mods.insert(
             assigned_id.clone(),
             ModuleInfo {
@@ -96,7 +100,8 @@ where
                 instance_uuid7: assigned_id.clone(),
                 priority: request.priority as i32,
                 process_position: position.clone(),
-                state: ModuleState::Running,
+                connected_at: Some(now_ms),
+                shutdown_at: None,
                 sender: Some(tx.clone()),
             },
         );

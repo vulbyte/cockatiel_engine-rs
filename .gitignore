@@ -91,3 +91,7 @@ keymap.local.json
 .DS_Store
 ._*
 Thumbs.db
+
+# Engine runtime config — contains the JWT secret + pairing PIN. Never commit.
+config.json
+modules.json
