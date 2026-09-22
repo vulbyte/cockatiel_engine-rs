@@ -167,11 +167,15 @@ impl DatabaseManager {
 
     /// Insert a timeline archival event that is already 'complete' and marked
     /// as synced, so the message-pipeline queue and the remote sync never touch
-    /// it. Used for outbound platform messages (SendToPlatforms) so the actor
-    /// who sent them is recorded in the timeline.
+    /// it. Used for module lifecycle logging and outbound platform messages
+    /// (SendToPlatforms) so the actor who sent them is recorded in the timeline.
+    /// `command` distinguishes the event's semantic kind (e.g.
+    /// "module_lifecycle" for connect/disconnect/log, "send_to_platforms" for
+    /// outbound sends, "test_archive" for compliance results).
     pub async fn insert_archival_event(
         &self,
         platform: &str,
+        command: &str,
         raw_message: &str,
         flags: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -190,7 +194,7 @@ impl DatabaseManager {
                 5, // event_type = 5 (user message)
                 platform,
                 raw_message,
-                "send_to_platforms",
+                command,
                 flags,
                 now,
             ],

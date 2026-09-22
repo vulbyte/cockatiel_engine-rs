@@ -796,7 +796,9 @@ fn prompt_link_for(module_name: &str) -> String {
 /// touched by the message pipeline.
 async fn log_to_timeline(db: &DatabaseManager, kind: &str, source: &str, message: &str) {
     let flags = serde_json::json!({ "source": source, "kind": kind }).to_string();
-    if let Err(e) = db.insert_archival_event("engine", message, &flags).await {
+    // Module lifecycle events are NOT platform sends — label them distinctly so
+    // the `command` column stays meaningful (send_to_platforms vs lifecycle).
+    if let Err(e) = db.insert_archival_event("engine", "module_lifecycle", message, &flags).await {
         eprintln!("[Timeline] failed to record {}: {}", kind, e);
     }
 }
@@ -2084,7 +2086,7 @@ let mut bytes = Vec::new();
                                             continue;
                                         }
                                         match db
-                                            .insert_archival_event("test", json, &format!("test-runner|{}", batch_uuid))
+                                            .insert_archival_event("test", "test_archive", json, &format!("test-runner|{}", batch_uuid))
                                             .await
                                         {
                                             Ok(()) => inserted += 1,
@@ -2198,7 +2200,7 @@ let targets: Vec<&str> = match send.platform.as_str() {
                             "actor_handle": send.actor_handle,
                             "target": send.platform,
                         }).to_string();
-                        if let Err(e) = db.insert_archival_event("engine", &send.msg, &flags).await {
+                        if let Err(e) = db.insert_archival_event("engine", "send_to_platforms", &send.msg, &flags).await {
                             log_event_broadcast(&ui_state, format!("[SendToPlatforms] archival insert failed: {}", e));
                         } else {
                             log_event_broadcast(&ui_state, format!("[SendToPlatforms] '{}' -> {} (by {})", send.msg, send.platform, send.actor_handle));

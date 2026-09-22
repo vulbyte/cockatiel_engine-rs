@@ -477,12 +477,29 @@ impl PipelineOrchestrator {
             return Ok(());
         }
 
+        // Persist the final processed text (what the pipeline produced) before
+        // dropping the in-memory state. Without this, a message that no module
+        // explicitly modified completes with a NULL processed_message even
+        // though it went through the whole pipeline.
+        {
+            let states = self.pipeline_states.lock().await;
+            if let Some(state) = states.get(uuid7) {
+                self.db
+                    .set_processed_message(&uuid7_bytes, &state.processed_message)
+                    .await?;
+            }
+        }
+
         {
             let mut states = self.pipeline_states.lock().await;
             states.remove(uuid7);
         }
 
         self.db.update_stage_completed(&uuid7_bytes, "post_process").await?;
+        // A message is only truly persisted when the whole pipeline has run;
+        // record when that happened (the `persisted_at` column is otherwise
+        // never populated for normally-completed messages).
+        self.db.update_stage_completed(&uuid7_bytes, "persisted").await?;
         self.db.set_pipeline_status(&uuid7_bytes, "complete").await?;
 
         let mut ack_guard = self.ack_tracker.lock().await;
