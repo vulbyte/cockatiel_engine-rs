@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::cockatiel_protobuf;
-use crate::cockatiel_protobuf::{Container, container::Payload, ChatMessage};
+use crate::cockatiel_protobuf::{Container, container::Payload, ChatMessage, Command};
+use crate::command_registry::CommandRegistry;
 use crate::database::DatabaseManager;
 
 const DEFAULT_ACK_TIMEOUT_MS: u64 = 3000;
@@ -29,6 +30,7 @@ pub struct PipelineMessage {
     pub event_type: i32,
     pub command: Option<String>,
     pub flags: Option<String>,
+    pub parsed_command: Option<crate::cockatiel_protobuf::Command>,
     pub user_uuid7: String,
     pub user_data: Option<crate::cockatiel_protobuf::UserData>,
 }
@@ -167,6 +169,9 @@ pub struct PipelineState {
     pub event_type: i32,
     pub command: Option<String>,
     pub flags: Option<String>,
+    /// The engine-parsed command (with flag values) when this message is a
+    /// registered chat command; drives targeted routing + downstream modules.
+    pub parsed_command: Option<Command>,
     pub user_uuid7: String,
     pub user_data: Option<crate::cockatiel_protobuf::UserData>,
     /// Rendered audio carried with the message (created by a pre/in-process
@@ -185,6 +190,7 @@ pub struct PipelineOrchestrator {
     pub pipeline_states: Arc<Mutex<HashMap<String, PipelineState>>>,
     pub config: Arc<Mutex<PipelineConfig>>,
     pub module_senders: Arc<Mutex<HashMap<String, mpsc::Sender<Container>>>>,
+    pub command_registry: Arc<std::sync::Mutex<CommandRegistry>>,
 }
 
 impl PipelineOrchestrator {
@@ -192,6 +198,7 @@ impl PipelineOrchestrator {
         db: DatabaseManager,
         config: PipelineConfig,
         module_senders: Arc<Mutex<HashMap<String, mpsc::Sender<Container>>>>,
+        command_registry: Arc<std::sync::Mutex<CommandRegistry>>,
     ) -> Self {
         Self {
             db,
@@ -199,6 +206,7 @@ impl PipelineOrchestrator {
             pipeline_states: Arc::new(Mutex::new(HashMap::new())),
             config: Arc::new(Mutex::new(config)),
             module_senders,
+            command_registry,
         }
     }
 
@@ -241,6 +249,7 @@ impl PipelineOrchestrator {
             event_type: msg.event_type,
             command: msg.command.clone(),
             flags: msg.flags.clone(),
+            parsed_command: msg.parsed_command.clone(),
             user_uuid7: msg.user_uuid7.clone(),
             user_data: msg.user_data.clone(),
             audio: Vec::new(),
@@ -291,7 +300,7 @@ impl PipelineOrchestrator {
                         raw_data: vec![],
                         raw_message: state.raw_message.clone(),
                         user_uuid7: state.user_uuid7.clone(),
-                        command: None,
+                        command: state.parsed_command.clone(),
                         user_data: state.user_data.clone(),
                     }),
                     audio: Vec::new(),
@@ -300,11 +309,34 @@ impl PipelineOrchestrator {
             )),
         };
 
+        // Targeted command routing: a registered command goes ONLY to the
+        // owning module + any catch-all modules (empty Commands = receives
+        // everything). Everything else fans out to all pre-process modules.
+        let targets: Option<Vec<String>> = {
+            let registry = self.command_registry.lock().unwrap();
+            match &state.parsed_command {
+                Some(pc) => {
+                    let mut t: Vec<String> = Vec::new();
+                    if let Some(owner) = registry.owner(&pc.command_flag, &pc.command_name) {
+                        t.push(owner);
+                    }
+                    t.extend(registry.catch_alls());
+                    Some(t)
+                }
+                None => None,
+            }
+        };
+
         let senders = self.module_senders.lock().await;
         let mut ack_guard = self.ack_tracker.lock().await;
         let cfg = self.config_snapshot().await;
 
-        for module_name in &cfg.pre_process_modules {
+        let recipients: Vec<&String> = match &targets {
+            Some(list) => list.iter().collect(),
+            None => cfg.pre_process_modules.iter().collect(),
+        };
+
+        for module_name in recipients {
             if let Some(sender) = senders.get(module_name) {
                 let _ = sender.send(container.clone()).await;
                 ack_guard.track(
@@ -313,7 +345,6 @@ impl PipelineOrchestrator {
                     module_name.clone(),
                     cfg.ack_timeout_ms,
                 );
-            } else {
             }
         }
 
@@ -694,6 +725,7 @@ impl PipelineOrchestrator {
                             raw_message: chat.raw_message.clone(),
                             command: None,
                             flags: None,
+                            parsed_command: chat.command.clone(),
                             user_uuid7: chat.user_uuid7.clone(),
                             user_data: chat.user_data.clone(),
                         };

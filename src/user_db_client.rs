@@ -12,8 +12,8 @@ pub mod proto {
 
 use proto::{
     user_db_request, AddChannelRequest, AddUserRequest, ChannelRef, DeleteUserRequest,
-    GetUserRequest, ListUsersRequest, RemoveChannelRequest, ScoreRequest, SetRolesRequest,
-    UpdateFlagsRequest, UserDbRequest, UserDbResponse, UserValueDeleteRequest,
+    GetUserRequest, ListUsersRequest, RatingRequest, RemoveChannelRequest, ScoreRequest,
+    SetRolesRequest, UpdateFlagsRequest, UserDbRequest, UserDbResponse, UserValueDeleteRequest,
     UserValueListRequest, UserValueRequest,
 };
 
@@ -113,6 +113,28 @@ impl UserDbClient {
         self.request(user_db_request::Op::RemoveScore(ScoreRequest {
             uuid7: uuid7.to_string(),
             delta,
+            reason: reason.to_string(),
+        })).await
+    }
+
+    /// Commend or reprimand a user (chat-command ratings). The user-db
+    /// enforces the 24h reprimand cooldown atomically; a denial comes back
+    /// with success=false + the cooldown reason.
+    pub async fn rate_user(
+        &self,
+        giver_uuid7: &str,
+        recipient_uuid7: &str,
+        is_commendation: bool,
+        platform: &str,
+        handle: &str,
+        reason: &str,
+    ) -> Result<UserDbResponse, String> {
+        self.request(user_db_request::Op::RateUser(RatingRequest {
+            giver_uuid7: giver_uuid7.to_string(),
+            recipient_uuid7: recipient_uuid7.to_string(),
+            is_commendation,
+            platform: platform.to_string(),
+            handle: handle.to_string(),
             reason: reason.to_string(),
         })).await
     }

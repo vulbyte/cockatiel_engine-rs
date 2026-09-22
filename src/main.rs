@@ -29,6 +29,9 @@ use config::{Config, ConfigState, get_config, verify_config};
 mod auth;
 use auth::{AuthSession, AuthStore, verify_pin};
 
+mod command_registry;
+use command_registry::{CommandRegistry, parse_command};
+
 mod module_registry;
 use module_registry::ModuleRegistryPersistence;
 
@@ -189,6 +192,139 @@ fn module_search_paths() -> Vec<PathBuf> {
 /// carries a non-empty `user_uuid7`, look the user up (by uuid or channel/handle)
 /// and attach a populated `UserData` (username, roles, name color) so downstream
 /// modules (e.g. term-chat) can display the user nicely.
+/// What to do with a raw chat message after command classification.
+enum CommandAction {
+    /// Attach this parsed command (known command — pipeline routes it).
+    Attach(crate::cockatiel_protobuf::Command),
+    /// Send the built-in help list back to the chat.
+    Help,
+    /// Send the apology reply (unregistered command under an alerting flag).
+    Alert,
+    /// Nothing (not a flagged command, or a known command already attached).
+    None,
+}
+
+/// Classify a raw chat message against the command registry. Runs entirely
+/// synchronously so the std MutexGuard never crosses an await boundary.
+fn classify_command(raw: &str, registry: &CommandRegistry) -> CommandAction {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return CommandAction::None;
+    }
+    let lower = raw.to_lowercase();
+    if lower == "!help" || lower.starts_with("!help ") {
+        return CommandAction::Help;
+    }
+    let Some(parsed) = parse_command(raw, registry) else {
+        return CommandAction::None;
+    };
+    let flag = parsed.command.command_flag.clone();
+    let name = parsed.command.command_name.clone();
+    if registry.owner(&flag, &name).is_some() {
+        return CommandAction::Attach(parsed.command);
+    }
+    if registry.alert_owner_for(&flag).is_some() {
+        return CommandAction::Alert;
+    }
+    CommandAction::None
+}
+
+/// Parse a raw chat message for registered commands and act:
+/// - a known command is attached to `chat.command` (the pipeline routes it);
+/// - `!help` lists every registered command back to the chat;
+/// - an unregistered command under a flag whose owner set
+///   `alert_on_unknown_command` gets the apology reply.
+pub async fn handle_command_on_ingest(
+    chat: &mut cockatiel_protobuf::ChatMessage,
+    registry: &Arc<Mutex<CommandRegistry>>,
+    orchestrator: &PipelineOrchestrator,
+    ui_state: &Arc<Mutex<EngineState>>,
+) {
+    let action = {
+        let reg = registry.lock().unwrap();
+        classify_command(&chat.raw_message, &reg)
+    }; // guard dropped here — before any await.
+
+    match action {
+        CommandAction::Attach(cmd) => {
+            chat.command = Some(cmd);
+        }
+        CommandAction::Help => {
+            let reply = {
+                let reg = registry.lock().unwrap();
+                let mut lines = vec!["Available commands:".to_string()];
+                for c in reg.all_commands() {
+                    lines.push(format!("  {}{} — {}", c.command_flag, c.command_name, c.command_description));
+                }
+                if lines.len() == 1 {
+                    lines.push("  (none registered yet)".to_string());
+                }
+                lines.join("\n")
+            };
+            let platform = chat.platform.clone();
+            engine_reply_to_platform(orchestrator, ui_state, &platform, &reply).await;
+        }
+        CommandAction::Alert => {
+            let who = if chat.user_data.as_ref().map(|u| !u.username.is_empty()).unwrap_or(false) {
+                chat.user_data.as_ref().unwrap().username.clone()
+            } else if !chat.user_uuid7.is_empty() {
+                chat.user_uuid7.clone()
+            } else {
+                "user".to_string()
+            };
+            let platform = chat.platform.clone();
+            let reply = format!(
+                "sorry {}, that command isn't valid, try '!help' to see all available commands",
+                who
+            );
+            engine_reply_to_platform(orchestrator, ui_state, &platform, &reply).await;
+        }
+        CommandAction::None => {}
+    }
+}
+
+/// Send an engine-originated reply to a platform's adapters (no actor check —
+/// this is the engine itself, not a human). Routes like SendToPlatforms.
+pub async fn engine_reply_to_platform(
+    orchestrator: &PipelineOrchestrator,
+    ui_state: &Arc<Mutex<EngineState>>,
+    platform: &str,
+    msg: &str,
+) {
+    let targets: Vec<&str> = match platform {
+        "all" => vec!["twitch-adapter", "kick-adapter", "youtube-adapter", "discord-adapter"],
+        "twitch" => vec!["twitch-adapter"],
+        "kick" => vec!["kick-adapter"],
+        "youtube" => vec!["youtube-adapter"],
+        "discord" => vec!["discord-adapter"],
+        _ => return,
+    };
+    let send = cockatiel_protobuf::SendToPlatforms {
+        msg: msg.to_string(),
+        level: 0,
+        module_uuid7: String::new(),
+        pid: String::new(),
+        platform: platform.to_string(),
+        actor_platform: String::new(),
+        actor_handle: "cockatiel".to_string(),
+        actor_uuid7: String::new(),
+    };
+    let container = Container {
+        version: 1,
+        auth_token: String::new(),
+        module_name: "cockatiel".into(),
+        module_instance_uuid7: String::new(),
+        payload: Some(Payload::SendToPlatforms(send)),
+    };
+    let senders = orchestrator.module_senders.lock().await;
+    for name in targets {
+        if let Some(sender) = senders.get(name) {
+            let _ = sender.send(container.clone()).await;
+            log_event_broadcast(&ui_state, format!("[Commands] reply '{}' -> {}", name, msg));
+        }
+    }
+}
+
 pub async fn enrich_chat_user(
     client: &SharedUserDbClient,
     chat: &mut cockatiel_protobuf::ChatMessage,
@@ -636,6 +772,100 @@ pub async fn mod_virtual_query(
             log_event(ui_state, format!("[{}] Mod command error: {}", requester, e));
             (false, Vec::new(), e)
         }
+    }
+}
+
+/// Handle a `chat_commend` / `chat_reprimand` virtual query from the commend /
+/// reprimand command modules. Unlike `mod_*`, the actor does NOT need mod
+/// status — any verified user may rate another user. The user-db enforces the
+/// 24h reprimand cooldown atomically (rating_history); a denial returns
+/// success=false with the cooldown reason.
+pub async fn chat_rating_virtual_query(
+    client: &SharedUserDbClient,
+    query_id: &str,
+    sql: &str,
+    ui_state: &Arc<Mutex<EngineState>>,
+    requester: &str,
+) -> (bool, Vec<u8>, String) {
+    // Gate to the two dedicated modules so no random module can fake ratings.
+    let expected = if query_id == "chat_commend" { "commend" } else { "reprimand" };
+    if requester != expected {
+        log_event(
+            ui_state,
+            format!("[{}] {} denied: requester '{}' is not the '{}' module", requester, query_id, requester, expected),
+        );
+        return (false, Vec::new(), format!("{} denied: not the '{}' module", query_id, expected));
+    }
+
+    let payload: serde_json::Value = match serde_json::from_str(sql) {
+        Ok(v) => v,
+        Err(e) => return (false, Vec::new(), format!("Invalid rating payload: {}", e)),
+    };
+
+    // Actor (the giver) — resolve + require existence (ANY role is fine).
+    let actor = payload.get("actor").filter(|a| !a.is_null());
+    let Some(actor) = actor else {
+        return (false, Vec::new(), "rating requires an actor".to_string());
+    };
+    let actor_uuid = actor.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
+    let actor_platform = actor.get("platform").and_then(|v| v.as_str()).unwrap_or("");
+    let actor_handle = actor.get("handle").and_then(|v| v.as_str()).unwrap_or("");
+    let giver_uuid7 = if !actor_uuid.is_empty() {
+        actor_uuid.to_string()
+    } else if !actor_platform.is_empty() && !actor_handle.is_empty() {
+        match client.get_user("", actor_platform, actor_handle, actor_handle).await {
+            Ok(resp) if resp.success && resp.user.is_some() => resp.user.unwrap().uuid7,
+            Ok(_) => {
+                log_event(ui_state, format!("[{}] rating denied: giver '{}' not found", requester, actor_handle));
+                return (false, Vec::new(), format!("giver '{}' not found on {}", actor_handle, actor_platform));
+            }
+            Err(e) => return (false, Vec::new(), format!("giver lookup failed: {}", e)),
+        }
+    } else {
+        return (false, Vec::new(), "rating actor requires uuid7 or platform+handle".to_string());
+    };
+
+    // Target (the recipient) — resolve by uuid7 or platform + handle.
+    let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
+    let handle = payload.get("handle").and_then(|v| v.as_str()).unwrap_or("");
+    let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+    let explicit_uuid = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
+    let recipient_uuid7 = if !explicit_uuid.is_empty() {
+        explicit_uuid.to_string()
+    } else if !platform.is_empty() && !handle.is_empty() {
+        match client.get_user("", platform, handle, handle).await {
+            Ok(resp) if resp.success && resp.user.is_some() => resp.user.unwrap().uuid7,
+            Ok(_) => {
+                log_event(ui_state, format!("[{}] rating denied: target '{}' not found", requester, handle));
+                return (false, Vec::new(), format!("target '{}' not found on {}", handle, platform));
+            }
+            Err(e) => return (false, Vec::new(), format!("target lookup failed: {}", e)),
+        }
+    } else {
+        return (false, Vec::new(), "rating requires uuid7 or platform+handle".to_string());
+    };
+
+    if recipient_uuid7 == giver_uuid7 {
+        return (false, Vec::new(), "you cannot rate yourself".to_string());
+    }
+
+    let is_commendation = query_id == "chat_commend";
+    match client
+        .rate_user(&giver_uuid7, &recipient_uuid7, is_commendation, platform, handle, reason)
+        .await
+    {
+        Ok(resp) => {
+            if resp.success {
+                log_event(ui_state, format!("[{}] {} applied to '{}'", requester, query_id, handle));
+                (true, resp.message.into_bytes(), String::new())
+            } else {
+                // Cooldown denial — surface the reason to the module (it logs it).
+                let err = if resp.error.is_empty() { resp.message } else { resp.error };
+                log_event(ui_state, format!("[{}] {} denied: {}", requester, query_id, err));
+                (false, Vec::new(), err)
+            }
+        }
+        Err(e) => (false, Vec::new(), format!("rating failed: {}", e)),
     }
 }
 
@@ -1122,6 +1352,11 @@ cockatiel
     let module_senders: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<Container>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
+    // Command registry: which modules subscribe to which chat commands
+    // (populated by `commands_payload` registrations). Shared with the
+    // pipeline for targeted command routing.
+    let cmd_registry: Arc<Mutex<CommandRegistry>> = Arc::new(Mutex::new(CommandRegistry::default()));
+
     // Per-session kill switch: the probe task signals a hung module's
     // connection task to close, so the normal disconnect cleanup runs.
     let kill_map: Arc<
@@ -1263,7 +1498,12 @@ cockatiel
         critical_modules: Vec::new(),
     };
 
-    let orchestrator = PipelineOrchestrator::new(db.clone(), pipeline_config, module_senders.clone());
+    let orchestrator = PipelineOrchestrator::new(
+        db.clone(),
+        pipeline_config,
+        module_senders.clone(),
+        cmd_registry.clone(),
+    );
 
     // Restart recovery: mark any 'processing' messages back to 'queued'
     match db.mark_all_processing_as_queued().await {
@@ -1369,6 +1609,7 @@ cockatiel
         let user_db_client = Arc::clone(&user_db_client);
         let prompt_routes = Arc::clone(&prompt_routes);
         let kill_map = Arc::clone(&kill_map);
+        let cmd_registry = Arc::clone(&cmd_registry);
 
         tokio::spawn(async move {
             if let Err(error) = handle_connection(
@@ -1384,6 +1625,7 @@ cockatiel
                 user_db_client,
                 prompt_routes,
                 kill_map,
+                cmd_registry.clone(),
             )
             .await
             {
@@ -1443,6 +1685,7 @@ async fn handle_connection(
     user_db_client: SharedUserDbClient,
     prompt_routes: SharedPromptRoutes,
     kill_map: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
+    cmd_registry: Arc<Mutex<CommandRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let socket_token = NEXT_SOCKET_TOKEN.fetch_add(1, Ordering::Relaxed);
     let mut websocket = accept_async(stream).await?;
@@ -1854,6 +2097,19 @@ let mut bytes = Vec::new();
                         let mut enriched = msg.clone();
                         if let Some(chat) = enriched.raw_message.as_mut() {
                             enrich_chat_user(&user_db_client, chat).await;
+                            // Command parsing: if the raw message starts with a
+                            // registered flag, attach the parsed Command (with
+                            // flag values) so the pipeline routes it to the
+                            // owning module (+ catch-alls). Unknown commands on
+                            // an alerting flag get the apology reply; `!help`
+                            // lists every registered command.
+                            handle_command_on_ingest(
+                                chat,
+                                &cmd_registry,
+                                &orchestrator,
+                                &ui_state,
+                            )
+                            .await;
                         }
                         let enriched_container = Container {
                             version: container.version,
@@ -2054,6 +2310,12 @@ let mut bytes = Vec::new();
                             // by platform + handle, then apply the action. The
                             // actor (human trigger) is verified first.
                             mod_virtual_query(&user_db_client, &query.query_id, &query.sql, &ui_state, &module_name).await
+                        } else if query.query_id == "chat_commend" || query.query_id == "chat_reprimand" {
+                            // Chat-command ratings (commend/reprimand modules):
+                            // ANY verified user may rate another user (no mod
+                            // status required). The 24h reprimand cooldown is
+                            // enforced in the user-db rating_history.
+                            chat_rating_virtual_query(&user_db_client, &query.query_id, &query.sql, &ui_state, &module_name).await
                         } else if query.query_id == "chat_verify_identity" {
                             // Identity bootstrap / write-through — term-chat only.
                             chat_verify_identity_virtual_query(&user_db_client, &query.sql, &ui_state, &module_name).await
@@ -2273,6 +2535,24 @@ Some(Payload::ModuleControl(_)) => {
                         // Process lifecycle is owned by the TUI supervisor.
                         // The engine no longer starts/stops modules.
                         log_event_broadcast(&ui_state, "[{}] ModuleControl ignored (processes owned by TUI)".to_string());
+                    }
+                    Some(Payload::CommandsPayload(commands)) => {
+                        // Command registration: the module subscribes to these
+                        // (flag, command) pairs. An EMPTY list = catch-all
+                        // (receives every message). `alert_on_unknown_command`
+                        // opts into the apology reply for unregistered commands
+                        // under this module's flags.
+                        let n = commands.commands.len();
+                        cmd_registry.lock().unwrap().register(&module_name, commands.clone());
+                        log_event_broadcast(
+                            &ui_state,
+                            format!(
+                                "[Commands] {} registered ({} command(s), catch_all={})",
+                                module_name,
+                                n,
+                                n == 0
+                            ),
+                        );
                     }
                     Some(Payload::Prompt(ref prompt)) => {
                         // A module is asking the user something (e.g. "allow this
