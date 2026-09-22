@@ -29,6 +29,10 @@ pub struct AuthSession {
     /// mutations with owner perms; remote connections must supply a verified
     /// actor (the remote TUI-login flow is deferred).
     pub peer_loopback: bool,
+    /// Unique id of the socket currently bound to this session. A reconnect
+    /// claims the session under a NEW socket; the old socket's disconnect
+    /// cleanup then sees a mismatched token and must NOT evict the session.
+    pub socket_token: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -101,18 +105,6 @@ impl AuthStore {
         }
     }
 
-    pub fn remove(&self, instance_uuid7: &str) {
-        let mut sessions = self.sessions.lock().unwrap();
-        sessions.remove(instance_uuid7);
-    }
-
-    pub fn set_shutdown_at(&self, instance_uuid7: &str, timestamp: i64) {
-        let mut sessions = self.sessions.lock().unwrap();
-        if let Some(session) = sessions.get_mut(instance_uuid7) {
-            session.shutdown_at = Some(timestamp);
-        }
-    }
-
     /// Record inbound activity for a session and clear any pending probe —
     /// any valid container is proof of life.
     pub fn update_activity(&self, instance_uuid7: &str, now_ms: i64) {
@@ -129,6 +121,48 @@ impl AuthStore {
         let mut sessions = self.sessions.lock().unwrap();
         if let Some(session) = sessions.get_mut(instance_uuid7) {
             session.peer_loopback = peer_loopback;
+        }
+    }
+
+    /// Bind a session to a NEW socket after a reconnect: mark it live again and
+    /// stamp it with the new socket's token so the old socket's cleanup can't
+    /// evict it. No-op if the session no longer exists (handled by the caller).
+    pub fn claim_socket(&self, instance_uuid7: &str, socket_token: u64, now_ms: i64) {
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Some(session) = sessions.get_mut(instance_uuid7) {
+            session.socket_token = socket_token;
+            session.connected_at = Some(now_ms);
+            session.shutdown_at = None;
+            session.last_activity_ms = now_ms;
+            session.probe_deadline_ms = 0;
+            session.unresponsive = false;
+        }
+    }
+
+    /// Remove the session ONLY if it is still bound to the given socket. Used
+    /// by a disconnecting socket so it can't evict a session a reconnect took
+    /// over. Returns whether the session was removed.
+    pub fn remove_if_socket(&self, instance_uuid7: &str, socket_token: u64) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        if sessions
+            .get(instance_uuid7)
+            .map(|s| s.socket_token == socket_token)
+            .unwrap_or(false)
+        {
+            sessions.remove(instance_uuid7);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark shutdown ONLY if the session is still bound to the given socket.
+    pub fn set_shutdown_if_socket(&self, instance_uuid7: &str, timestamp: i64, socket_token: u64) {
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Some(session) = sessions.get_mut(instance_uuid7) {
+            if session.socket_token == socket_token {
+                session.shutdown_at = Some(timestamp);
+            }
         }
     }
 

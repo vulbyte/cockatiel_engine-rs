@@ -7,7 +7,10 @@ use std::{
     collections::HashMap,
     env, fs,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::net::TcpListener;
@@ -1398,6 +1401,11 @@ fn is_read_only_sql(sql: &str) -> bool {
     matches!(kw.to_ascii_uppercase().as_str(), "SELECT" | "WITH" | "EXPLAIN")
 }
 
+/// Monotonic id identifying the socket a session is currently bound to. A
+/// reconnect claims a session under a new id; a stale socket's cleanup can
+/// then detect it no longer owns the session and must not evict it.
+static NEXT_SOCKET_TOKEN: AtomicU64 = AtomicU64::new(1);
+
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     config_state: Arc<Mutex<ConfigState>>,
@@ -1412,6 +1420,7 @@ async fn handle_connection(
     prompt_routes: SharedPromptRoutes,
     kill_map: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let socket_token = NEXT_SOCKET_TOKEN.fetch_add(1, Ordering::Relaxed);
     let mut websocket = accept_async(stream).await?;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Container>(64);
 
@@ -1485,6 +1494,33 @@ async fn handle_connection(
         // A reconnect may arrive from a different interface — refresh the
         // recorded loopback status.
         auth_store.set_peer_loopback(&assigned_uuid, peer_loopback);
+        // Bind the session to THIS socket: the old socket's disconnect
+        // cleanup will see a mismatched socket_token and must not evict it.
+        auth_store.claim_socket(&assigned_uuid, socket_token, reconnect_now);
+        // If the old socket's cleanup already removed the session, rebuild it
+        // as authenticated — the JWT is valid and bound to this module, and
+        // position/priority ride along on the ConnectionRequest.
+        if auth_store.get(&assigned_uuid).is_none() {
+            let position = process_position_to_string(
+                ProcessPosition::try_from(request.process_position).unwrap_or(ProcessPosition::Unspecified),
+            );
+            auth_store.insert(AuthSession {
+                module_name: container.module_name.clone(),
+                instance_uuid7: assigned_uuid.clone(),
+                auth_token: container.auth_token.clone(),
+                position,
+                priority: request.priority as i32,
+                authenticated: true,
+                connected_at: Some(reconnect_now),
+                shutdown_at: None,
+                last_activity_ms: reconnect_now,
+                last_probe_at_ms: 0,
+                probe_deadline_ms: 0,
+                unresponsive: false,
+                peer_loopback,
+                socket_token,
+            });
+        }
     } else {
         // New connection: validate PIN
         if !verify_pin(request.pin, config::get_pin(&config_state)) {
@@ -1645,6 +1681,7 @@ async fn handle_connection(
             probe_deadline_ms: 0,
             unresponsive: false,
             peer_loopback,
+            socket_token,
         });
 
         module_registry.register(module_registry::RegisteredModule {
@@ -2320,8 +2357,10 @@ Some(Payload::ModuleControl(_)) => {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    auth_store.set_shutdown_at(&instance_uuid7, now_ms);
-    auth_store.remove(&instance_uuid7);
+    // Only tear down the session if this socket still owns it — a reconnect
+    // may have already claimed it under a new socket.
+    auth_store.set_shutdown_if_socket(&instance_uuid7, now_ms, socket_token);
+    auth_store.remove_if_socket(&instance_uuid7, socket_token);
 
     Ok(())
 }
