@@ -68,6 +68,19 @@ impl DatabaseManager {
             .unwrap_or(false)
     }
 
+    /// Size of the local timeline DB main file in bytes (the warning logic
+    /// compares this against the configured target).
+    pub fn db_size_bytes(&self) -> u64 {
+        std::fs::metadata(&self.config.local_path)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// The configured target size (MB) for the local DB.
+    pub fn target_mb(&self) -> u32 {
+        self.config.local_target_mb
+    }
+
     pub async fn initialize(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Open the local DB (the write buffer / queue). If it is corrupt or
         // otherwise can't be opened and a backup exists, restore from the

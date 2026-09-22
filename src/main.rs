@@ -1106,7 +1106,7 @@ cockatiel
         local_path: PathBuf::from(&config.timeline_database_location),
         remote_url: Some(config.timeline_database_backup_location.clone()),
         sync_interval_secs: 15,
-        local_target_mb: 50,
+        local_target_mb: config.timeline_database_target_mb,
     };
     let db = DatabaseManager::new(db_config);
     db.initialize().await?;
@@ -1277,8 +1277,14 @@ cockatiel
     {
         let db = db.clone();
         let orchestrator = orchestrator.clone();
+        let ui_state = ui_state.clone();
         let sync_interval = std::time::Duration::from_secs(15);
         const WAL_CHECKPOINT_MB: u64 = 5 * 1024 * 1024;
+        // DB-size warning: fires once when the local file passes the 5 MB
+        // floor and reaches 95% of the configured target; clears when it
+        // drops back below.
+        let warn_floor: u64 = 5 * 1024 * 1024;
+        let mut db_warned = false;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(sync_interval);
             let mut ticks_since_checkpoint = 0u32;
@@ -1298,6 +1304,24 @@ cockatiel
                 }
                 if let Err(e) = orchestrator.handle_timeout().await {
                     eprintln!("[Pipeline] Timeout check error: {}", e);
+                }
+                // Local DB size warning (5 MB floor, 95% of target).
+                let size = db.db_size_bytes();
+                let target = (db.target_mb() as u64) * 1024 * 1024;
+                let over = size > warn_floor && size >= (target * 95) / 100;
+                if over && !db_warned {
+                    db_warned = true;
+                    let pct = if target > 0 { (size * 100) / target } else { 0 };
+                    log_event_broadcast(
+                        &ui_state,
+                        format!(
+                            "WARNING: timeline DB is {:.1} MB ({pct}% of the {} MB target) — consider purging or raising timeline_database_target_mb",
+                            size as f64 / 1048576.0,
+                            db.target_mb()
+                        ),
+                    );
+                } else if !over && db_warned {
+                    db_warned = false;
                 }
             }
         });
@@ -1871,6 +1895,8 @@ let mut bytes = Vec::new();
                             let status = serde_json::json!({
                                 "timeline_backup": db.backup_configured(),
                                 "userdb_backup": userdb_backup,
+                                "timeline_db_size_bytes": db.db_size_bytes(),
+                                "timeline_db_target_mb": db.target_mb(),
                             });
                             (true, status.to_string().into_bytes(), String::new())
                         } else if query.query_id == "module_list" {

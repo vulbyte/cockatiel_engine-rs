@@ -11,6 +11,10 @@ use uuid::Uuid;
 pub struct Config {
     pub timeline_database_location: String,
     pub timeline_database_backup_location: String,
+    /// Local timeline DB target size in MB — the DB-size warning fires when
+    /// the file passes the 5 MB floor and reaches 95% of this target.
+    #[serde(default = "default_timeline_target_mb")]
+    pub timeline_database_target_mb: u32,
     pub port: u16,
 
     #[serde(default)]
@@ -42,6 +46,10 @@ pub struct Config {
 
 fn default_probe_interval_secs() -> u64 {
     30
+}
+
+fn default_timeline_target_mb() -> u32 {
+    50
 }
 
 fn default_probe_response_secs() -> u64 {
