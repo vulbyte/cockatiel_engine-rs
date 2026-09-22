@@ -2696,3 +2696,66 @@ mod tests {
         assert!(!is_loopback_addr(&"10.0.0.5:1111".parse::<std::net::SocketAddr>().unwrap()));
     }
 }
+
+#[cfg(test)]
+mod command_classify_tests {
+    use super::*;
+    use crate::cockatiel_protobuf::{Command, Commands};
+
+    fn reg_with_commands() -> CommandRegistry {
+        let mut r = CommandRegistry::default();
+        r.register("reprimand", Commands {
+            commands: vec![Command {
+                command_name: "reprimand".into(),
+                command_flag: "!".into(),
+                command_description: "reprimand".into(),
+                command_flags: vec![],
+            }],
+            alert_on_unknown_command: false,
+        });
+        // An alerting module also owns `!`.
+        r.register("tts-service", Commands {
+            commands: vec![Command {
+                command_name: "tts".into(),
+                command_flag: "!".into(),
+                command_description: "tts".into(),
+                command_flags: vec![],
+            }],
+            alert_on_unknown_command: true,
+        });
+        r
+    }
+
+    #[test]
+    fn help_classifies_to_help() {
+        let r = reg_with_commands();
+        assert!(matches!(classify_command("!help", &r), CommandAction::Help));
+        assert!(matches!(classify_command("!help what can I do", &r), CommandAction::Help));
+    }
+
+    #[test]
+    fn known_command_attaches() {
+        let r = reg_with_commands();
+        match classify_command("!reprimand @user reason", &r) {
+            CommandAction::Attach(c) => {
+                assert_eq!(c.command_name, "reprimand");
+                assert_eq!(c.command_flag, "!");
+            }
+            other => panic!("expected Attach, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn unknown_on_alerting_flag_alerts() {
+        let r = reg_with_commands();
+        // `!bogus` uses a registered flag (!) but isn't registered; tts-service
+        // owns `!` with alert_on_unknown -> Alert.
+        assert!(matches!(classify_command("!bogus whatever", &r), CommandAction::Alert));
+    }
+
+    #[test]
+    fn plain_message_is_none() {
+        let r = reg_with_commands();
+        assert!(matches!(classify_command("just chatting", &r), CommandAction::None));
+    }
+}
