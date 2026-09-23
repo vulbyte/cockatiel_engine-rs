@@ -396,6 +396,9 @@ pub async fn enrich_chat_user(
     // Expose the raw score too, so displays can apply their own trust level
     // (e.g. term-chat's `image_min_rank` can be a numeric score threshold).
     css.insert("score".to_string(), user.score.to_string());
+    // Expose the rating counters so displays can show a reprimand indicator.
+    css.insert("reprimands".to_string(), user.reprimands.to_string());
+    css.insert("commendations".to_string(), user.commendations.to_string());
 
     chat.user_uuid7 = user.uuid7.clone();
     chat.user_data = Some(cockatiel_protobuf::UserData {
