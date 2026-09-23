@@ -189,6 +189,16 @@ impl AuthStore {
         sessions.values().cloned().collect()
     }
 
+    /// Look up a connected session by module name (the per-session key is the
+    /// instance uuid7). Returns the instance uuid + last activity timestamp.
+    pub fn find_by_module(&self, module_name: &str) -> Option<(String, i64)> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions
+            .values()
+            .find(|s| s.module_name == module_name)
+            .map(|s| (s.instance_uuid7.clone(), s.last_activity_ms))
+    }
+
     pub fn generate_token(&self, instance_uuid7: &str, module_name: &str) -> String {
         generate_auth_token(&self.secret, instance_uuid7, module_name)
     }

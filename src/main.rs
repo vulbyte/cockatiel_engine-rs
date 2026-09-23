@@ -55,7 +55,10 @@ use user_db_client::{SharedUserDbClient, UserDbClient, userdb_response_to_json};
 /* PROTOBUF STUFF */
 pub use cockatiel_proto::proto as cockatiel_protobuf;
 
-use cockatiel_protobuf::{Container, container::Payload, ProcessPosition, DatabaseQueryResult, Prompt, PromptType, Log};
+use cockatiel_protobuf::{
+    Container, container::Payload, ProcessPosition, DatabaseQueryResult, Prompt, PromptType, Log,
+    ChatMessage, Command, DatabaseQuery, MessageAck, MessagePreProcess, Shutdown, AuthVerify,
+};
 
 /// Where a PromptResponse should be routed. The engine's own prompts (module
 /// connection approval) wait on a oneshot; prompts originating from a module
@@ -1651,24 +1654,49 @@ fn is_read_only_sql(sql: &str) -> bool {
     let mut s = sql.trim_start();
     loop {
         if let Some(rest) = s.strip_prefix("--") {
-            s = rest.trim_start();
+            // Skip the whole comment line (not just the `--`).
+            s = match rest.find('\n') {
+                Some(end) => rest[end + 1..].trim_start(),
+                None => return false,
+            };
             continue;
         }
         if let Some(rest) = s.strip_prefix("/*") {
             match rest.find("*/") {
                 Some(end) => s = rest[end + 2..].trim_start(),
-                None => s = "",
+                None => return false,
             }
             continue;
         }
         break;
     }
+    // Leading keyword.
     let mut kw = String::new();
     for c in s.chars() {
         if c.is_ascii_alphabetic() {
             kw.push(c);
         } else {
             break;
+        }
+    }
+    // Reject multi-statement injection: a `;` outside string literals means a
+    // second statement (e.g. `SELECT 1; DROP TABLE …`) — never let it through.
+    let mut in_string = false;
+    let mut quote = ' ';
+    for c in s.chars() {
+        if in_string {
+            if c == quote {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                in_string = true;
+                quote = c;
+            }
+            ';' => return false,
+            _ => {}
         }
     }
     matches!(kw.to_ascii_uppercase().as_str(), "SELECT" | "WITH" | "EXPLAIN")
@@ -1700,6 +1728,137 @@ pub async fn guarded_execute_query(
             }
         }
     }
+}
+
+/// Build a Container payload of the requested probe type. `payload_json`
+/// carries optional fields (e.g. a log line, a SQL string). Unknown types
+/// yield None (the probe is skipped).
+fn build_probe_payload(ptype: &str, json: &serde_json::Value) -> Option<Payload> {
+    match ptype {
+        "auth_verify" => Some(Payload::AuthVerify(AuthVerify { cur_auth: String::new() })),
+        "log" => Some(Payload::Log(Log {
+            log: json.get("log").and_then(|v| v.as_str()).unwrap_or("test probe").to_string(),
+            blob: vec![],
+        })),
+        "database_query" => Some(Payload::DatabaseQuery(DatabaseQuery {
+            query_id: json.get("query_id").and_then(|v| v.as_str()).unwrap_or("probe").to_string(),
+            sql: json.get("sql").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            params: vec![],
+        })),
+        "message_pre_process" => Some(Payload::MessagePreProcess(MessagePreProcess {
+            message_uuid7: String::new(),
+            raw_message: Some(ChatMessage {
+                platform: json.get("platform").and_then(|v| v.as_str()).unwrap_or("test").to_string(),
+                raw_data: vec![],
+                raw_message: json.get("raw_message").and_then(|v| v.as_str()).unwrap_or("probe").to_string(),
+                user_uuid7: String::new(),
+                command: None,
+                user_data: None,
+                channel_id: String::new(),
+            }),
+            audio: Vec::new(),
+            audio_type: String::new(),
+        })),
+        "prompt" => Some(Payload::Prompt(Prompt {
+            prompt_id_uuid7: Uuid::now_v7().to_string(),
+            prompt: json.get("prompt").and_then(|v| v.as_str()).unwrap_or("test probe").to_string(),
+            details: json.get("details").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            yes_dialog: String::new(),
+            no_dialog: String::new(),
+            timeout: 30,
+            origin: "cockatiel".to_string(),
+            origin_uuid7: String::new(),
+            instructions: String::new(),
+            link: String::new(),
+            input_label: String::new(),
+            prompt_type: 0,
+        })),
+        "shutdown" => Some(Payload::Shutdown(Shutdown { reason: "test probe".to_string() })),
+        "message_ack" => Some(Payload::MessageAck(MessageAck {
+            message_uuid7: json.get("message_uuid7").and_then(|v| v.as_str()).unwrap_or("probe").to_string(),
+        })),
+        "command_payload" => Some(Payload::CommandPayload(Command {
+            command_name: json.get("command").and_then(|v| v.as_str()).unwrap_or("probe").to_string(),
+            command_flag: json.get("flag").and_then(|v| v.as_str()).unwrap_or("!").to_string(),
+            command_description: String::new(),
+            command_flags: vec![],
+        })),
+        _ => None,
+    }
+}
+
+/// `test_probe` virtual query: send a payload of the requested type to ONE
+/// module's connection and measure the round-trip (the module's session
+/// `last_activity` advancing proves a response). Returns
+/// `{ module, type, responded, latency_ms }`.
+pub async fn handle_test_probe(
+    sql: &str,
+    orchestrator: &PipelineOrchestrator,
+    auth_store: &AuthStore,
+    ui_state: &Arc<Mutex<EngineState>>,
+) -> Result<String, String> {
+    let payload: serde_json::Value =
+        serde_json::from_str(sql).map_err(|e| format!("Invalid test_probe payload: {}", e))?;
+    let module = payload.get("module").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let ptype = payload.get("type").and_then(|v| v.as_str()).unwrap_or("log").to_string();
+    let pjson = payload.get("payload_json").cloned().unwrap_or_else(|| serde_json::json!({}));
+    if module.is_empty() {
+        return Err("test_probe requires a module".to_string());
+    }
+
+    let (instance_uuid, last_activity) = auth_store
+        .find_by_module(&module)
+        .ok_or_else(|| format!("module '{}' not connected", module))?;
+
+    let probe_payload = build_probe_payload(&ptype, &pjson);
+    let container = Container {
+        version: 1,
+        auth_token: String::new(),
+        module_name: "cockatiel".into(),
+        module_instance_uuid7: instance_uuid.clone(),
+        payload: probe_payload,
+    };
+    let mut buf = Vec::new();
+    container
+        .encode(&mut buf)
+        .map_err(|e| format!("probe encode failed: {}", e))?;
+
+    {
+        let senders = orchestrator.module_senders.lock().await;
+        let sender = senders.get(&module).ok_or_else(|| format!("module '{}' has no sender", module))?;
+        sender.send(container).await.map_err(|e| format!("probe send failed: {}", e))?;
+    }
+
+    let now_ms = || -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    };
+    let sent_at = now_ms();
+    let mut responded = false;
+    let mut latency = 0i64;
+    for _ in 0..200 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if let Some((_, la)) = auth_store.find_by_module(&module) {
+            if la > last_activity {
+                responded = true;
+                latency = now_ms().saturating_sub(sent_at);
+                break;
+            }
+        }
+    }
+    log_event_broadcast(
+        ui_state,
+        format!("[test_probe] '{}' <- {} responded={} latency={}ms", module, ptype, responded, latency),
+    );
+    Ok(serde_json::json!({
+        "module": module,
+        "type": ptype,
+        "responded": responded,
+        "latency_ms": latency,
+    })
+    .to_string())
 }
 
 /// Monotonic id identifying the socket a session is currently bound to. A
@@ -2304,6 +2463,24 @@ let mut bytes = Vec::new();
                                 let engine_pin = config::get_pin(&config_state);
                                 run_test_suite(&query.sql, &ui_state, engine_pin).await
                             }
+                        } else if query.query_id == "test_probe" {
+                            // Per-module probe: the engine sends a payload of the
+                            // requested type to one module's connection and
+                            // measures the round-trip. TUI/test-runner gated.
+                            if !is_control_surface(&module_name) && !is_test_runner(&module_name) {
+                                (false, Vec::new(), "test_probe denied: not the TUI/test-runner".to_string())
+                            } else {
+                                let probe = handle_test_probe(
+                                    &query.sql,
+                                    &orchestrator,
+                                    &auth_store,
+                                    &ui_state,
+                                ).await;
+                                match probe {
+                                    Ok(json) => (true, json.into_bytes(), String::new()),
+                                    Err(e) => (false, Vec::new(), e),
+                                }
+                            }
                         } else if query.query_id == "audit_list" {
                             // List held-for-audit messages. TUI-only.
                             if !is_control_surface(&module_name) {
@@ -2769,90 +2946,4 @@ Some(Payload::ModuleControl(_)) => {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn loopback_grants_owner_perm() {
-        // A loopback TUI connection may act with owner perms even when the
-        // payload supplies no actor.
-        assert_eq!(userdb_actor_perm(true, "user"), "owner");
-        assert_eq!(userdb_actor_perm(true, ""), "owner");
-        // Non-loopback connections keep the supplied actor (remote TUI-login
-        // is deferred); the engine/user DB still enforce it.
-        assert_eq!(userdb_actor_perm(false, "user"), "user");
-        assert_eq!(userdb_actor_perm(false, "admin"), "admin");
-        assert_eq!(userdb_actor_perm(false, ""), "");
-    }
-
-    #[test]
-    fn loopback_addr_detection() {
-        assert!(is_loopback_addr(&"127.0.0.1:1111".parse::<std::net::SocketAddr>().unwrap()));
-        assert!(is_loopback_addr(&"[::1]:1111".parse::<std::net::SocketAddr>().unwrap()));
-        assert!(!is_loopback_addr(&"192.168.1.10:1111".parse::<std::net::SocketAddr>().unwrap()));
-        assert!(!is_loopback_addr(&"10.0.0.5:1111".parse::<std::net::SocketAddr>().unwrap()));
-    }
-}
-
-#[cfg(test)]
-mod command_classify_tests {
-    use super::*;
-    use crate::cockatiel_protobuf::{Command, Commands};
-
-    fn reg_with_commands() -> CommandRegistry {
-        let mut r = CommandRegistry::default();
-        r.register("reprimand", Commands {
-            commands: vec![Command {
-                command_name: "reprimand".into(),
-                command_flag: "!".into(),
-                command_description: "reprimand".into(),
-                command_flags: vec![],
-            }],
-            alert_on_unknown_command: false,
-        });
-        // An alerting module also owns `!`.
-        r.register("tts-service", Commands {
-            commands: vec![Command {
-                command_name: "tts".into(),
-                command_flag: "!".into(),
-                command_description: "tts".into(),
-                command_flags: vec![],
-            }],
-            alert_on_unknown_command: true,
-        });
-        r
-    }
-
-    #[test]
-    fn help_classifies_to_help() {
-        let r = reg_with_commands();
-        assert!(matches!(classify_command("!help", &r), CommandAction::Help));
-        assert!(matches!(classify_command("!help what can I do", &r), CommandAction::Help));
-    }
-
-    #[test]
-    fn known_command_attaches() {
-        let r = reg_with_commands();
-        match classify_command("!reprimand @user reason", &r) {
-            CommandAction::Attach(c) => {
-                assert_eq!(c.command_name, "reprimand");
-                assert_eq!(c.command_flag, "!");
-            }
-            other => panic!("expected Attach, got {:?}", std::mem::discriminant(&other)),
-        }
-    }
-
-    #[test]
-    fn unknown_on_alerting_flag_alerts() {
-        let r = reg_with_commands();
-        // `!bogus` uses a registered flag (!) but isn't registered; tts-service
-        // owns `!` with alert_on_unknown -> Alert.
-        assert!(matches!(classify_command("!bogus whatever", &r), CommandAction::Alert));
-    }
-
-    #[test]
-    fn plain_message_is_none() {
-        let r = reg_with_commands();
-        assert!(matches!(classify_command("just chatting", &r), CommandAction::None));
-    }
-}
+mod tests;
