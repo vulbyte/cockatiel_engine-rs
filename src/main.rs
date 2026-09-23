@@ -262,7 +262,8 @@ pub async fn handle_command_on_ingest(
                 lines.join("\n")
             };
             let platform = chat.platform.clone();
-            engine_reply_to_platform(orchestrator, ui_state, &platform, &reply).await;
+            let channel_id = chat.channel_id.clone();
+            engine_reply_to_platform(orchestrator, ui_state, &platform, &channel_id, &reply).await;
         }
         CommandAction::Alert => {
             let who = if chat.user_data.as_ref().map(|u| !u.username.is_empty()).unwrap_or(false) {
@@ -273,11 +274,12 @@ pub async fn handle_command_on_ingest(
                 "user".to_string()
             };
             let platform = chat.platform.clone();
+            let channel_id = chat.channel_id.clone();
             let reply = format!(
                 "sorry {}, that command isn't valid, try '!help' to see all available commands",
                 who
             );
-            engine_reply_to_platform(orchestrator, ui_state, &platform, &reply).await;
+            engine_reply_to_platform(orchestrator, ui_state, &platform, &channel_id, &reply).await;
         }
         CommandAction::None => {}
     }
@@ -289,6 +291,7 @@ pub async fn engine_reply_to_platform(
     orchestrator: &PipelineOrchestrator,
     ui_state: &Arc<Mutex<EngineState>>,
     platform: &str,
+    channel_id: &str,
     msg: &str,
 ) {
     let targets: Vec<&str> = match platform {
@@ -308,6 +311,7 @@ pub async fn engine_reply_to_platform(
         actor_platform: String::new(),
         actor_handle: "cockatiel".to_string(),
         actor_uuid7: String::new(),
+        channel_id: channel_id.to_string(),
     };
     let container = Container {
         version: 1,
@@ -2580,6 +2584,7 @@ Some(Payload::ModuleControl(_)) => {
                                             raw_message: String::new(),
                                             user_uuid7: String::new(),
                                             command: Some(command.clone()),
+                                            channel_id: String::new(),
                                             user_data: None,
                                         }),
                                         audio: Vec::new(),

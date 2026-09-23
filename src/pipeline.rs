@@ -27,6 +27,7 @@ pub struct PipelineMessage {
     pub command: Option<String>,
     pub flags: Option<String>,
     pub parsed_command: Option<crate::cockatiel_protobuf::Command>,
+    pub channel_id: String,
     pub user_uuid7: String,
     pub user_data: Option<crate::cockatiel_protobuf::UserData>,
 }
@@ -168,6 +169,7 @@ pub struct PipelineState {
     /// The engine-parsed command (with flag values) when this message is a
     /// registered chat command; drives targeted routing + downstream modules.
     pub parsed_command: Option<Command>,
+    pub channel_id: String,
     pub user_uuid7: String,
     pub user_data: Option<crate::cockatiel_protobuf::UserData>,
     /// Rendered audio carried with the message (created by a pre/in-process
@@ -246,6 +248,7 @@ impl PipelineOrchestrator {
             command: msg.command.clone(),
             flags: msg.flags.clone(),
             parsed_command: msg.parsed_command.clone(),
+            channel_id: msg.channel_id.clone(),
             user_uuid7: msg.user_uuid7.clone(),
             user_data: msg.user_data.clone(),
             audio: Vec::new(),
@@ -297,6 +300,7 @@ impl PipelineOrchestrator {
                         raw_message: state.raw_message.clone(),
                         user_uuid7: state.user_uuid7.clone(),
                         command: state.parsed_command.clone(),
+                        channel_id: state.channel_id.clone(),
                         user_data: state.user_data.clone(),
                     }),
                     audio: Vec::new(),
@@ -388,6 +392,7 @@ impl PipelineOrchestrator {
                         raw_message: state.raw_message.clone(),
                         user_uuid7: state.user_uuid7.clone(),
                         command: None,
+                        channel_id: state.channel_id.clone(),
                         user_data: state.user_data.clone(),
                     }),
                     processed_message: state.processed_message.clone(),
@@ -455,6 +460,7 @@ impl PipelineOrchestrator {
                         raw_message: state.raw_message.clone(),
                         user_uuid7: state.user_uuid7.clone(),
                         command: None,
+                        channel_id: state.channel_id.clone(),
                         user_data: state.user_data.clone(),
                     }),
                     processed_message: state.processed_message.clone(),
@@ -722,6 +728,7 @@ impl PipelineOrchestrator {
                             command: None,
                             flags: None,
                             parsed_command: chat.command.clone(),
+                            channel_id: chat.channel_id.clone(),
                             user_uuid7: chat.user_uuid7.clone(),
                             user_data: chat.user_data.clone(),
                         };
