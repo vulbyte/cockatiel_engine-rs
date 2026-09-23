@@ -1674,6 +1674,34 @@ fn is_read_only_sql(sql: &str) -> bool {
     matches!(kw.to_ascii_uppercase().as_str(), "SELECT" | "WITH" | "EXPLAIN")
 }
 
+/// Run a module-supplied SQL query in a contained task so a turso/Limbo
+/// "not yet implemented" panic (e.g. `EXISTS`/subqueries the translator can't
+/// build) surfaces as a query error instead of killing the connection task.
+/// The engine's timeline DB uses the turso/Limbo driver, which panics on
+/// some SQL constructs — the read-only boundary protects writes, this protects
+/// the process from a panic.
+pub async fn guarded_execute_query(
+    db: &DatabaseManager,
+    sql: &str,
+) -> Result<String, String> {
+    let sql = sql.to_string();
+    let db = db.clone();
+    let spawn_db = db.clone();
+    match tokio::spawn(async move { spawn_db.execute_query(&sql).await }).await {
+        Ok(Ok(json)) => Ok(json),
+        Ok(Err(e)) => Err(format!("{}", e)),
+        Err(join) => {
+            // A panicking query poisons the turso connection — reopen a fresh
+            // one so the timeline DB stays usable.
+            let reopened = db.reopen_local().await;
+            match reopened {
+                Ok(()) => Err(format!("query panicked (unsupported SQL?); database reopened: {}", join)),
+                Err(re) => Err(format!("query panicked ({}); reopen failed: {}", join, re)),
+            }
+        }
+    }
+}
+
 /// Monotonic id identifying the socket a session is currently bound to. A
 /// reconnect claims a session under a new id; a stale socket's cleanup can
 /// then detect it no longer owns the session and must not evict it.
@@ -2442,7 +2470,7 @@ let mut bytes = Vec::new();
                             // go through the engine's own methods or a
                             // dedicated virtual query.
                             if is_read_only_sql(&query.sql) {
-                                match db.execute_query(&query.sql).await {
+                                match guarded_execute_query(&db, &query.sql).await {
                                     Ok(json) => (true, json.into_bytes(), String::new()),
                                     Err(e) => {
                                         let msg = format!("{}", e);

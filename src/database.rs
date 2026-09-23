@@ -140,6 +140,16 @@ impl DatabaseManager {
         Ok(conn)
     }
 
+    /// Replace the local connection with a fresh one. Used after a query
+    /// panics: a turso/Limbo "not yet implemented" panic poisons the shared
+    /// connection (even clones), so we discard it and reopen the DB file.
+    pub async fn reopen_local(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let fresh = Self::open_local(&self.config.local_path).await?;
+        let mut local = self.local.lock().await;
+        *local = Some(fresh);
+        Ok(())
+    }
+
     fn now_ms() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -555,10 +565,18 @@ impl DatabaseManager {
     pub async fn execute_query(
         &self,
         sql: &str,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
-        let conn = conn.as_ref().ok_or("Local database not initialized")?;
-
+    ) -> Result<String, String> {
+        // Return a `String` error (Send) so callers can run this in a contained
+        // task that catches turso/Limbo panics on unsupported SQL.
+        let run = async {
+        // Clone the connection and drop the guard BEFORE running the query:
+        // a turso/Limbo "not yet implemented" panic on the SQL would otherwise
+        // poison the shared mutex and brick the timeline DB. The clone is a
+        // cheap shared handle (turso::Connection is Clone).
+        let conn = {
+            let guard = self.local.lock().await;
+            guard.as_ref().ok_or("Local database not initialized")?.clone()
+        };
         let mut stmt = conn.prepare(sql).await?;
         let columns: Vec<String> = stmt.columns().iter().map(|c| c.name().to_string()).collect();
         let mut rows = stmt.query(()).await?;
@@ -592,6 +610,8 @@ impl DatabaseManager {
         }
 
         Ok(serde_json::to_string(&results)?)
+        };
+        run.await.map_err(|e: Box<dyn std::error::Error>| e.to_string())
     }
 
     pub async fn mark_all_processing_as_queued(&self) -> Result<u64, Box<dyn std::error::Error>> {
