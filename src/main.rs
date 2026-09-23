@@ -1168,6 +1168,46 @@ async fn prompt_user_to_allow(
 /// Hold a message for audit and ask the user (via a Prompt to connected UIs)
 /// to approve (resubmit as a normal message) or reject it. First response wins.
 /// If no UI answers, the message stays held.
+/// Human-readable broadcast line for a rejected message (shown in UIs/log).
+fn compose_rejection_broadcast(origin: &str, uuid: &str, reason: &str, raw: &str, processed: &str) -> String {
+    format!(
+        "[{}] rejected {}: {} (\"{}\" -> \"{}\")",
+        origin, uuid, reason, raw, processed
+    )
+}
+
+/// Searchable timeline record for a rejected message (persisted to the DB).
+fn compose_rejection_record(origin: &str, reason: &str, raw: &str, processed: &str) -> String {
+    format!(
+        "[rejected by {}] {} : \"{}\" -> \"{}\"",
+        origin, reason, raw, processed
+    )
+}
+
+/// A module reported it rejected a message. Surface it clearly (structured
+/// broadcast, no buried log strings) and persist a searchable timeline record.
+/// The message itself still flows as the module chose — this is an audit
+/// record, not a pipeline stop.
+async fn handle_chat_message_rejected(
+    db: &DatabaseManager,
+    ui_state: &Arc<Mutex<EngineState>>,
+    rej: &cockatiel_protobuf::ChatMessageRejected,
+) {
+    let origin = &rej.origin;
+    let reason = &rej.reason;
+    let raw = &rej.message.as_ref().map(|m| m.raw_message.clone()).unwrap_or_default();
+    let processed = &rej.processed_message;
+    log_event_broadcast(
+        ui_state,
+        compose_rejection_broadcast(origin, &rej.message_uuid7, reason, raw, processed),
+    );
+    let platform = rej.message.as_ref().map(|m| m.platform.clone()).unwrap_or_default();
+    let record = compose_rejection_record(origin, reason, raw, processed);
+    if let Err(e) = db.insert_archival_event(&platform, "chat_rejected", &record, raw).await {
+        log_event(ui_state, format!("[chat_rejected] failed to persist record: {}", e));
+    }
+}
+
 async fn handle_audit_flag(
     db: &DatabaseManager,
     flag: &cockatiel_protobuf::AuditFlag,
@@ -2895,6 +2935,13 @@ Some(Payload::ModuleControl(_)) => {
                             &ui_state,
                         )
                         .await;
+                    }
+                    Some(Payload::ChatMessageRejected(ref rej)) => {
+                        // A module rejected a message: surface it clearly (no
+                        // buried log strings) and persist it as a searchable
+                        // timeline record. The message itself still flows as the
+                        // module chose — this is an audit record, not a stop.
+                        handle_chat_message_rejected(&db, &ui_state, rej).await;
                     }
                     _ => {}
                 }
