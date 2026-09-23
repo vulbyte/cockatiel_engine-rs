@@ -217,11 +217,6 @@ pub fn get_pin(state: &Arc<Mutex<ConfigState>>) -> u32 {
     state.lock().unwrap().pin
 }
 
-/// The engine's JWT signing secret (from `.env`).
-pub fn get_jwt_secret(state: &Arc<Mutex<ConfigState>>) -> String {
-    state.lock().unwrap().jwt_secret.clone()
-}
-
 pub fn create_config(directory: PathBuf) -> Result<String, String> {
     let target = directory.join("config.json");
 
@@ -354,14 +349,5 @@ pub fn add_module_to_config(
         });
 
         list.sort_by_key(|entry| entry.priority);
-    });
-}
-
-pub fn remove_module_from_config(config_state: &Arc<Mutex<ConfigState>>, name: &str) {
-    update_config(config_state, |config| {
-        config.inputs.retain(|entry| entry.name != name);
-        config.preprocess_modules.retain(|entry| entry.name != name);
-        config.inprocess_modules.retain(|entry| entry.name != name);
-        config.postprocess_modules.retain(|entry| entry.name != name);
     });
 }

@@ -210,43 +210,11 @@ impl ModuleRegistry {
         self.modules.get(name)
     }
 
-    pub fn contains(&self, name: &str) -> bool {
-        self.modules.contains_key(name)
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = (&String, &DiscoveredModule)> {
         self.modules.iter()
     }
 
-    pub fn values(&self) -> impl Iterator<Item = &DiscoveredModule> {
-        self.modules.values()
-    }
-
     pub fn len(&self) -> usize {
         self.modules.len()
-    }
-
-    /// Update the autostart flag for a discovered module, both in memory and on disk.
-    pub fn set_autostart(&mut self, name: &str, autostart: bool) -> Result<(), String> {
-        let module = self
-            .modules
-            .get_mut(name)
-            .ok_or_else(|| format!("Unknown module: {}", name))?;
-
-        module.manifest.autostart = autostart;
-
-        let manifest_path = module.directory.join("cockatiel_module_info.json");
-        let contents = fs::read_to_string(&manifest_path).map_err(|e| {
-            format!("Could not read {}: {}", manifest_path.display(), e)
-        })?;
-
-        let mut manifest: ModuleManifest = serde_json::from_str(&contents).map_err(|e| {
-            format!("Invalid module manifest {}: {}", manifest_path.display(), e)
-        })?;
-
-        manifest.autostart = autostart;
-
-        let serialized = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
-        fs::write(&manifest_path, serialized).map_err(|e| e.to_string())
     }
 }

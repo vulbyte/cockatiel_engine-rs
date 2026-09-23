@@ -18,10 +18,6 @@ fn uuid7_string() -> Option<String> {
     Some(uuid::Uuid::now_v7().to_string())
 }
 
-fn uuid7_bytes_to_string(b: &[u8]) -> String {
-    String::from_utf8_lossy(b).to_string()
-}
-
 #[derive(Debug, Clone)]
 pub struct PipelineMessage {
     pub uuid7: String,

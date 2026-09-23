@@ -42,16 +42,6 @@ impl ModuleRegistryPersistence {
         crate::config::write_atomic(&self.path, &content).map_err(|e| e.to_string())
     }
 
-    pub fn find_by_name(&self, name: &str) -> Option<RegisteredModule> {
-        let modules = self.modules.lock().unwrap();
-        modules.iter().find(|m| m.name == name).cloned()
-    }
-
-    pub fn find_by_uuid(&self, uuid: &str) -> Option<RegisteredModule> {
-        let modules = self.modules.lock().unwrap();
-        modules.iter().find(|m| m.instance_uuid7 == uuid).cloned()
-    }
-
     pub fn register(&self, module: RegisteredModule) {
         let mut modules = self.modules.lock().unwrap();
         if let Some(existing) = modules.iter_mut().find(|m| m.name == module.name) {
@@ -72,29 +62,8 @@ impl ModuleRegistryPersistence {
             .unwrap_or(false)
     }
 
-    pub fn get_token_for(&self, name: &str) -> Option<String> {
-        let modules = self.modules.lock().unwrap();
-        modules
-            .iter()
-            .find(|m| m.name == name)
-            .map(|m| m.auth_token.clone())
-    }
-
     pub fn values(&self) -> Vec<RegisteredModule> {
         let modules = self.modules.lock().unwrap();
         modules.clone()
-    }
-
-    /// Remove a module by name from the persistent registry.
-    pub fn remove(&self, name: &str) -> bool {
-        let mut modules = self.modules.lock().unwrap();
-        let before = modules.len();
-        modules.retain(|m| m.name != name);
-        let removed = modules.len() != before;
-        drop(modules);
-        if removed {
-            let _ = self.save();
-        }
-        removed
     }
 }
