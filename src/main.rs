@@ -1840,12 +1840,12 @@ pub async fn handle_test_probe(
     let mut latency = 0i64;
     for _ in 0..200 {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        if let Some((_, la)) = auth_store.find_by_module(&module) {
-            if la > last_activity {
-                responded = true;
-                latency = now_ms().saturating_sub(sent_at);
-                break;
-            }
+        if let Some((_, la)) = auth_store.find_by_module(&module)
+            && la > last_activity
+        {
+            responded = true;
+            latency = now_ms().saturating_sub(sent_at);
+            break;
         }
     }
     log_event_broadcast(
