@@ -2554,6 +2554,67 @@ Some(Payload::ModuleControl(_)) => {
                             ),
                         );
                     }
+                    Some(Payload::CommandPayload(command)) => {
+                        // Standalone command invocation: a module/UI sends a
+                        // `Command` outside of any chat message. The engine
+                        // routes it to the owning module (delivered as a
+                        // MessagePreProcess carrying the command, origin =
+                        // the sender's module identity). Unregistered commands
+                        // are logged + ignored.
+                        let owner = {
+                        let registry = cmd_registry.lock().unwrap();
+                        registry.owner(&command.command_flag, &command.command_name)
+                    }; // guard dropped before any await
+                    if let Some(owner) = owner {
+                            let forward = Container {
+                                version: 1,
+                                auth_token: String::new(),
+                                module_name: "cockatiel".into(),
+                                module_instance_uuid7: String::new(),
+                                payload: Some(Payload::MessagePreProcess(
+                                    cockatiel_protobuf::MessagePreProcess {
+                                        message_uuid7: String::new(),
+                                        raw_message: Some(cockatiel_protobuf::ChatMessage {
+                                            platform: format!("command:{}", module_name),
+                                            raw_data: vec![],
+                                            raw_message: String::new(),
+                                            user_uuid7: String::new(),
+                                            command: Some(command.clone()),
+                                            user_data: None,
+                                        }),
+                                        audio: Vec::new(),
+                                        audio_type: String::new(),
+                                    },
+                                )),
+                            };
+                            let senders = orchestrator.module_senders.lock().await;
+                            if let Some(sender) = senders.get(&owner) {
+                                let _ = sender.send(forward).await;
+                                log_event_broadcast(
+                                    &ui_state,
+                                    format!(
+                                        "[Commands] {} invoked '{}' -> {}",
+                                        module_name,
+                                        command.command_name,
+                                        owner
+                                    ),
+                                );
+                            } else {
+                                log_event_broadcast(
+                                    &ui_state,
+                                    format!("[Commands] owner '{}' of '{}' not connected", owner, command.command_name),
+                                );
+                            }
+                        } else {
+                            log_event_broadcast(
+                                &ui_state,
+                                format!(
+                                    "[Commands] unregistered command '{}' invoked by {}",
+                                    command.command_name, module_name
+                                ),
+                            );
+                        }
+                    }
                     Some(Payload::Prompt(ref prompt)) => {
                         // A module is asking the user something (e.g. "allow this
                         // action?"). Forward it to every OTHER connected module so
