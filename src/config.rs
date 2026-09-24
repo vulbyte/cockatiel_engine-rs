@@ -121,13 +121,9 @@ fn write_env_file(dir: &PathBuf, pairs: &[(&str, &str)]) {
     if !content.ends_with('\n') {
         content.push('\n');
     }
-    if fs::write(&path, content).is_ok() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-        }
-    }
+    // Atomic owner-only write (unique temp + 0o600 before rename) so the
+    // secrets never sit in a world-readable window.
+    let _ = write_atomic(&path, &content);
 }
 
 /// Resolve the engine's secrets (PIN + JWT secret) and persist them in `.env`.
@@ -251,15 +247,38 @@ pub fn get_file(path: impl Into<PathBuf>) -> Result<String, std::io::Error> {
     fs::read_to_string(path.into())
 }
 
-/// Write a file atomically: write to a temp sibling, fsync, then rename over
-/// the target. `modules.json`/`config.json` are written by BOTH the engine and
-/// the TUI supervisor — a torn/interleaved write must never leave a half-written
-/// JSON the other side (or the engine's size-based reload) can pick up.
+/// Write a file atomically: write to a unique-name temp sibling (owner-only),
+/// fsync, then rename over the target. `modules.json`/`config.json` are
+/// written by BOTH the engine and the TUI supervisor — a torn/interleaved
+/// write must never leave a half-written JSON the other side (or the engine's
+/// size-based reload) can pick up. The temp name is a fresh UUIDv7 so an
+/// attacker can't pre-create a symlink at a predictable `.name.tmp<pid>` path.
 pub fn write_atomic(path: &PathBuf, content: &str) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
-    let tmp = dir.join(format!(".{}.tmp{}", path.file_name().unwrap_or_default().to_string_lossy(), std::process::id()));
+    let tmp = dir.join(format!(
+        ".{}.tmp{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        Uuid::now_v7()
+    ));
     std::fs::write(&tmp, content)?;
+    chmod_owner_only(&tmp)?;
+    std::fs::File::open(&tmp)?.sync_all()?;
     std::fs::rename(&tmp, path)
+}
+
+/// Restrict a file to owner-only access (0o600 on unix). No-op on platforms
+/// without unix permission bits. Used on secret stores and the TLS key.
+pub fn chmod_owner_only(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 pub fn modules_path(config_state: &Arc<Mutex<ConfigState>>) -> PathBuf {

@@ -44,6 +44,10 @@ fn ensure_cert() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), St
     let key_path = key_path();
 
     if cert_path.exists() && key_path.exists() {
+        // One-time remediation: a key written before perms were tightened may
+        // still be world-readable. Best-effort — a failure to chmod is not
+        // fatal, the key still loads.
+        let _ = crate::config::chmod_owner_only(&key_path);
         let cert_der = load_cert(&cert_path)?;
         let key_der = load_key(&key_path)?;
         return Ok((cert_der, key_der));
@@ -69,6 +73,9 @@ fn ensure_cert() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), St
     std::fs::create_dir_all(tls_dir()).map_err(|e| format!("tls dir: {}", e))?;
     std::fs::write(&cert_path, &cert_pem).map_err(|e| format!("write cert: {}", e))?;
     std::fs::write(&key_path, &key_pem).map_err(|e| format!("write key: {}", e))?;
+    // The private key must be owner-only (the cert stays 0644 — clients must
+    // read it to pin the self-signed identity).
+    crate::config::chmod_owner_only(&key_path).map_err(|e| format!("chmod key: {}", e))?;
 
     let cert_der = load_cert(&cert_path)?;
     let key_der = load_key(&key_path)?;

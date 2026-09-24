@@ -82,6 +82,56 @@ enum PromptOutcome {
     TimedOut,
 }
 
+/// Per-peer-IP failed-PIN tracker: 5 consecutive failures lock that IP out for
+/// 60s. A correct PIN resets the counter. Modules share one PIN, so an attacker
+/// brute-forcing from a single address gets throttled while a legit module
+/// (different IP) is unaffected.
+#[derive(Default, Clone)]
+struct PinGate {
+    inner: Arc<Mutex<HashMap<std::net::IpAddr, PinAttempt>>>,
+}
+
+#[derive(Default)]
+struct PinAttempt {
+    failures: u32,
+    locked_until_ms: i64,
+}
+
+impl PinGate {
+    /// Whether a PIN attempt from `ip` is currently allowed.
+    fn check(&self, ip: std::net::IpAddr) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let inner = self.inner.lock().unwrap();
+        match inner.get(&ip) {
+            Some(attempt) => attempt.locked_until_ms <= now,
+            None => true,
+        }
+    }
+
+    /// Record a wrong PIN. After 5 consecutive failures the IP is locked for
+    /// 60s (checked via `locked_until_ms`).
+    fn record_failure(&self, ip: std::net::IpAddr) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let mut inner = self.inner.lock().unwrap();
+        let attempt = inner.entry(ip).or_default();
+        attempt.failures = attempt.failures.saturating_add(1);
+        if attempt.failures >= 5 {
+            attempt.locked_until_ms = now + 60_000;
+        }
+    }
+
+    /// Record a correct PIN: clear the per-IP failure state.
+    fn record_success(&self, ip: std::net::IpAddr) {
+        self.inner.lock().unwrap().remove(&ip);
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ModuleEntry {
     pub name: String,
@@ -994,6 +1044,39 @@ fn is_loopback_addr(addr: &std::net::SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
 
+/// Startup remediation: tighten the engine's own secret files (`.env`,
+/// `config.json`, `modules.json`, the TLS key) to owner-only 0o600. Best-effort
+/// — a file that can't be chmodded (or doesn't exist yet) is logged, never fatal.
+fn remediate_secret_file_permissions(
+    config_state: &Arc<Mutex<ConfigState>>,
+    ui_state: &Arc<Mutex<EngineState>>,
+) {
+    let dir = config_state
+        .lock()
+        .unwrap()
+        .path
+        .parent()
+        .unwrap_or(&PathBuf::from("."))
+        .to_path_buf();
+    let targets = [
+        config::env_path(&dir),
+        config_state.lock().unwrap().path.clone(),
+        config::modules_path(config_state),
+        tls::key_path(),
+    ];
+    for path in targets {
+        if !path.exists() {
+            continue;
+        }
+        if let Err(e) = config::chmod_owner_only(&path) {
+            log_event_broadcast(
+                ui_state,
+                format!("WARN: could not tighten permissions on {}: {}", path.display(), e),
+            );
+        }
+    }
+}
+
 /// Owner-perm override for privileged userdb mutations (set_roles, delete_user).
 /// A TUI control-surface connection from loopback (the operator's own machine)
 /// acts with owner perms regardless of any supplied actor; any other
@@ -1397,10 +1480,22 @@ cockatiel
     let db = DatabaseManager::new(db_config);
     db.initialize().await?;
 
-    // User database client (remote-only service, engine-internal).
+    // User database client (remote-only service, engine-internal). The token is
+    // a real secret — never fall back to a known constant. The TUI supervisor
+    // generates one and passes it when it launches the engine.
     let user_db_host = env::var("USER_DB_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let user_db_port: u16 = env::var("USER_DB_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(9736);
-    let user_db_token = env::var("USER_DB_TOKEN").unwrap_or_else(|_| "userdb-default-token".to_string());
+    let user_db_token = env::var("USER_DB_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "USER_DB_TOKEN is required: set it in the environment or run the \
+                 engine through the TUI supervisor (which generates and passes it). \
+                 Refusing to start with a default token.",
+            )
+        })?;
     let user_db_client: SharedUserDbClient = Arc::new(UserDbClient::new(&user_db_host, user_db_port, &user_db_token));
     log_event_broadcast(&ui_state, format!("UserDB client configured for {}:{}", user_db_host, user_db_port));
 
@@ -1652,7 +1747,8 @@ cockatiel
         });
     }
 
-let listener = TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
+let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let listener = TcpListener::bind(format!("{}:{}", bind_ip, config.port)).await?;
 
     // The engine only accepts WSS:// — every connection must complete a TLS
     // handshake against the engine's self-signed cert (generated + persisted
@@ -1665,16 +1761,22 @@ let listener = TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
             return Err(e.into());
         }
     };
-    log_event_broadcast(&ui_state, format!("Listening on port {} (WSS) | PIN: {:06}", config.port, config::get_pin(&config_state)));
+    remediate_secret_file_permissions(&config_state, &ui_state);
+    // Never print the actual PIN (it lives in `.env` as COCKATIEL_PIN).
+    log_event_broadcast(&ui_state, format!("Listening on {}:{} (WSS) | PIN: see .env (COCKATIEL_PIN)", bind_ip, config.port));
     log_event_broadcast(&ui_state, format!("TLS certificate: {}", cert_path.display()));
 
     let prompt_routes: SharedPromptRoutes = Arc::new(Mutex::new(HashMap::new()));
+
+    // Per-IP failed-PIN throttle (5 strikes -> 60s lockout).
+    let pin_gate = PinGate::default();
 
     loop {
         let (stream, address) = listener.accept().await?;
         // Capture the peer before the TLS handshake (the TlsStream doesn't
         // expose peer_addr directly).
         let peer_loopback = is_loopback_addr(&address);
+        let peer_ip = address.ip();
         let tls_acceptor = tls_acceptor.clone();
         // Clone shared state per iteration so the async closure never moves
         // a variable still borrowed by the loop.
@@ -1690,6 +1792,7 @@ let listener = TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
         let prompt_routes = Arc::clone(&prompt_routes);
         let kill_map = Arc::clone(&kill_map);
         let cmd_registry = Arc::clone(&cmd_registry);
+        let pin_gate = pin_gate.clone();
         tokio::spawn(async move {
             match tls_acceptor.accept(stream).await {
                 Ok(tls_stream) => {
@@ -1697,6 +1800,8 @@ let listener = TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
                     if let Err(error) = handle_connection(
                         tls_stream,
                         peer_loopback,
+                        peer_ip,
+                        pin_gate,
                         config_state,
                         modules,
                         ui_state.clone(),
@@ -1726,9 +1831,12 @@ let listener = TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
 
 /// Read-only SQL boundary for the `DatabaseQuery` fallback. Strips leading
 /// whitespace and `--`/`/* */` comment lines, then requires the statement to
-/// begin with SELECT / WITH / EXPLAIN. Any other statement (INSERT, UPDATE,
-/// DELETE, DROP, ALTER, CREATE, PRAGMA, ...) is denied — modules can only
-/// read the timeline, never write to it through arbitrary SQL.
+/// begin with SELECT / EXPLAIN. Any other statement (INSERT, UPDATE, DELETE,
+/// DROP, ALTER, CREATE, PRAGMA, WITH, ...) is denied — modules can only read
+/// the timeline, never write to it through arbitrary SQL. A `WITH` block is not
+/// allowed up front because a `WITH x AS (...) INSERT/DELETE/...` CTE can smuggle
+/// a write through; as defense-in-depth the whole statement is also tokenized
+/// and rejected if any write keyword appears anywhere in it.
 fn is_read_only_sql(sql: &str) -> bool {
     let mut s = sql.trim_start();
     loop {
@@ -1778,7 +1886,30 @@ fn is_read_only_sql(sql: &str) -> bool {
             _ => {}
         }
     }
-    matches!(kw.to_ascii_uppercase().as_str(), "SELECT" | "WITH" | "EXPLAIN")
+    if !matches!(kw.to_ascii_uppercase().as_str(), "SELECT" | "EXPLAIN") {
+        return false;
+    }
+    // Defense-in-depth: a write keyword ANYWHERE in the statement is fatal
+    // (catches CTE-smuggled writes and anything the leading-keyword gate
+    // missed). Tokenize on any non-alphanumeric char and compare lowercased.
+    const WRITE_TOKENS: &[&str] = &[
+        "insert",
+        "update",
+        "delete",
+        "replace",
+        "alter",
+        "drop",
+        "attach",
+        "vacuum",
+        "pragma",
+        "create",
+    ];
+    for token in s.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if WRITE_TOKENS.contains(&token.to_ascii_lowercase().as_str()) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Run a module-supplied SQL query in a contained task so a turso/Limbo
@@ -1952,6 +2083,8 @@ static NEXT_SOCKET_TOKEN: AtomicU64 = AtomicU64::new(1);
 async fn handle_connection<S>(
     stream: S,
     peer_loopback: bool,
+    peer_ip: std::net::IpAddr,
+    pin_gate: PinGate,
     config_state: Arc<Mutex<ConfigState>>,
     modules: Arc<Mutex<HashMap<String, ModuleInfo>>>,
     ui_state: Arc<Mutex<EngineState>>,
@@ -2065,8 +2198,33 @@ where
             });
         }
     } else {
-        // New connection: validate PIN
+        // New connection: validate PIN (throttled per peer IP — 5 consecutive
+        // failures lock the address out for 60s to blunt brute-force).
+        if !pin_gate.check(peer_ip) {
+            log_event(
+                &ui_state,
+                format!("PIN locked out for {}", peer_ip),
+            );
+            let response = Container {
+                version: 1,
+                auth_token: String::new(),
+                module_name: "cockatiel".into(),
+                module_instance_uuid7: String::new(),
+                payload: Some(Payload::ConnectionRequestReturn(
+                    cockatiel_protobuf::ConnectionRequestReturn {
+                        new_port: 0,
+                        module_instance_uuid7: String::new(),
+                    },
+                )),
+            };
+            let mut bytes = Vec::new();
+            response.encode(&mut bytes)?;
+            websocket.send(WsMessage::Binary(bytes)).await?;
+            websocket.close(None).await?;
+            return Ok(());
+        }
         if !verify_pin(request.pin, config::get_pin(&config_state)) {
+            pin_gate.record_failure(peer_ip);
             log_event(
                 &ui_state,
                 format!("Rejected: invalid PIN from '{}'", container.module_name),
@@ -2090,6 +2248,7 @@ where
             websocket.close(None).await?;
             return Ok(());
         }
+        pin_gate.record_success(peer_ip);
 
         // Containment: reject the placeholder "unnamed_module" identity. The
         // client defaults to it when no name is configured, and if two modules
@@ -2144,19 +2303,24 @@ where
             }
         };
 
-        // Approve known/auto-authed modules outright. The TUI is always
-        // trusted (it's the control surface and would otherwise block its own
-        // connection waiting on a prompt). Everything else goes through a
-        // Prompt routed to connected modules (e.g. the TUI); if no UI is
-        // connected, fall back to an interactive terminal prompt.
+        // Approve known/auto-authed modules outright. A trusted/known module is
+        // auto-approved ONLY if it presents the exact instance uuid the engine
+        // registered for it (name-trust alone is spoofable: every module holds
+        // the PIN). EXCEPTION: the very first registration of an always-trusted
+        // name (fresh-install bootstrap) is auto-approved so the TUI can connect
+        // once and approve everyone else — after that registration the uuid is
+        // pinned. Everything else goes through a Prompt routed to connected
+        // modules (e.g. the TUI); if no UI is connected, fall back to an
+        // interactive terminal prompt.
         // Refresh the registry first: the TUI may have registered this module
         // at runtime (e.g. a duplicated module) since the engine booted.
         module_registry.refresh();
-        let approved = if is_always_trusted(&module_name) {
-            log_event_broadcast(&ui_state, format!("Auto-approving trusted module: {}", module_name));
-            true
-        } else if module_registry.is_known_and_auto_auth(&module_name) {
-            log_event_broadcast(&ui_state, format!("Auto-approving known module: {}", module_name));
+        let registry_entry = module_registry.find(&module_name);
+        let uuid_matches = module_registry.is_known_auto_auth_for(&module_name, &assigned_uuid);
+        let auto_approve =
+            uuid_matches || (is_always_trusted(&module_name) && registry_entry.is_none());
+        let approved = if auto_approve {
+            log_event_broadcast(&ui_state, format!("Auto-approving {}", module_name));
             true
         } else {
             match prompt_user_to_allow(
@@ -2241,7 +2405,7 @@ where
 
         config::add_module_to_config(&config_state, &module_name, &position, priority);
 
-        log_event_broadcast(&ui_state, format!("Approved: {} [{}] on {}", module_name, assigned_uuid, position));
+        log_event_broadcast(&ui_state, format!("Approved: {} on {}", module_name, position));
         log_to_timeline(
             &db,
             "module_connect",

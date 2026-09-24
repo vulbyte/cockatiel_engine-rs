@@ -1,5 +1,5 @@
 //! Read-only SQL boundary tests: the engine's `DatabaseQuery` only permits
-//! SELECT/WITH/EXPLAIN for modules; every write construct must be rejected.
+//! SELECT/EXPLAIN for modules; every write construct must be rejected.
 
 use crate::is_read_only_sql;
 
@@ -7,11 +7,20 @@ use crate::is_read_only_sql;
 fn read_only_queries_pass() {
     assert!(is_read_only_sql("SELECT * FROM timeline_events"));
     assert!(is_read_only_sql("  SELECT uuid7 FROM users"));
-    assert!(is_read_only_sql("WITH x AS (SELECT 1) SELECT * FROM x"));
     assert!(is_read_only_sql("EXPLAIN SELECT * FROM timeline_events"));
     // Case-insensitive keyword.
     assert!(is_read_only_sql("select 1"));
-    assert!(is_read_only_sql("With x AS (select 1) select * from x"));
+}
+
+#[test]
+fn with_cte_is_not_a_read_only_leader() {
+    // A `WITH` block can smuggle a write via a CTE (`WITH x AS (...) DELETE…`),
+    // so it is no longer a permitted leading keyword.
+    assert!(!is_read_only_sql("WITH x AS (SELECT 1) SELECT * FROM x"));
+    assert!(!is_read_only_sql("With x AS (select 1) select * from x"));
+    assert!(!is_read_only_sql("WITH x AS (SELECT 1) DELETE FROM timeline_events"));
+    assert!(!is_read_only_sql("WITH x AS (SELECT 1) INSERT INTO timeline_events (uuid7) VALUES (1)"));
+    assert!(!is_read_only_sql("WITH x AS (SELECT 1) UPDATE timeline_events SET x=1"));
 }
 
 #[test]
@@ -32,6 +41,10 @@ fn write_statements_are_rejected() {
     assert!(!is_read_only_sql("PRAGMA wal_checkpoint"));
     assert!(!is_read_only_sql("CREATE TABLE x (y INT)"));
     assert!(!is_read_only_sql("ALTER TABLE x ADD y INT"));
+    // Defense-in-depth token scan: a write keyword nested anywhere in the
+    // statement (here inside a subquery) is fatal even when the leading
+    // keyword is SELECT and there is no `;`.
+    assert!(!is_read_only_sql("SELECT * FROM (DELETE FROM timeline_events)"));
 }
 
 /// SQL injection: a read-only prefix must not smuggle a write through.

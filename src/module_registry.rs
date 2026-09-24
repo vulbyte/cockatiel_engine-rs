@@ -65,12 +65,23 @@ impl ModuleRegistryPersistence {
         }
     }
 
-    pub fn is_known_and_auto_auth(&self, name: &str) -> bool {
+    /// Look up a registered module by name. Returns None when the name has no
+    /// registry entry (e.g. a fresh install bootstrap).
+    pub fn find(&self, name: &str) -> Option<RegisteredModule> {
+        let modules = self.modules.lock().unwrap();
+        modules.iter().find(|m| m.name == name).cloned()
+    }
+
+    /// True only when an entry for `name` EXISTS, is marked auto_auth, AND its
+    /// pinned instance_uuid7 matches the uuid the connecting module presented.
+    /// Name-trust alone is no longer enough — an attacker holding the PIN must
+    /// also present the exact uuid the engine registered for that module.
+    pub fn is_known_auto_auth_for(&self, name: &str, instance_uuid7: &str) -> bool {
         let modules = self.modules.lock().unwrap();
         modules
             .iter()
             .find(|m| m.name == name)
-            .map(|m| m.auto_auth)
+            .map(|m| m.auto_auth && m.instance_uuid7 == instance_uuid7)
             .unwrap_or(false)
     }
 

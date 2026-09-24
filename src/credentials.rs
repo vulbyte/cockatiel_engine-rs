@@ -36,7 +36,8 @@ pub fn read_env_map(path: &PathBuf) -> HashMap<String, String> {
     out
 }
 
-/// Write a KEY=VALUE `.env` file (merging into any existing file), owner-only.
+/// Write a KEY=VALUE `.env` file (merging into any existing file), owner-only
+/// via the engine's atomic 0600 writer (unique temp + fsync + rename).
 pub fn write_env_map(path: &PathBuf, entries: &[(String, String)]) -> Result<(), String> {
     let mut lines: Vec<String> = std::fs::read_to_string(path)
         .map(|c| c.lines().map(|l| l.to_string()).collect())
@@ -54,13 +55,7 @@ pub fn write_env_map(path: &PathBuf, entries: &[(String, String)]) -> Result<(),
     if !content.ends_with('\n') {
         content.push('\n');
     }
-    std::fs::write(path, content).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    crate::config::write_atomic(path, &content).map_err(|e| e.to_string())
 }
 
 /// Current credential values as a map key -> value. Sensitive fields are read
@@ -253,7 +248,7 @@ pub fn save_module_credentials(
         }
         root["module_specific"] = serde_json::Value::Object(spec);
         if let Ok(pretty) = serde_json::to_string_pretty(&root) {
-            let _ = std::fs::write(&path, pretty);
+            let _ = crate::config::write_atomic(&path, &pretty);
         }
     }
 
