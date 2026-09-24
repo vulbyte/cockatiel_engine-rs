@@ -23,6 +23,8 @@ use uuid::Uuid;
 mod module_manager;
 use module_manager::ModuleRegistry;
 
+mod tls;
+
 mod config;
 use config::{Config, ConfigState, get_config, verify_config};
 
@@ -323,13 +325,12 @@ pub async fn engine_reply_to_platform(
         module_instance_uuid7: String::new(),
         payload: Some(Payload::SendToPlatforms(send)),
     };
-    let senders = orchestrator.module_senders.lock().await;
     for name in targets {
-        if let Some(sender) = senders.get(name) {
-            let _ = sender.send(container.clone()).await;
-            log_event_broadcast(&ui_state, format!("[Commands] reply '{}' -> {}", name, msg));
+            let sent = crate::pipeline::send_to_module(&orchestrator.module_senders, name, container.clone(), "commands").await;
+            if sent {
+                log_event_broadcast(&ui_state, format!("[Commands] reply '{}' -> {}", name, msg));
+            }
         }
-    }
 }
 
 pub async fn enrich_chat_user(
@@ -464,15 +465,19 @@ pub async fn run_test_suite(
 
     log_event(ui_state, format!("[test] running suite '{}' (module: '{}', n={})", suite, module, iterations));
 
-    let output = match tokio::process::Command::new(&runner_bin)
-        .args(&args)
-        .current_dir(runner_dir)
-        .env("COCKATIEL_PIN", engine_pin.to_string())
-        .output()
-        .await
+    let output = match tokio::time::timeout(
+        Duration::from_secs(300),
+        tokio::process::Command::new(&runner_bin)
+            .args(&args)
+            .current_dir(runner_dir)
+            .env("COCKATIEL_PIN", engine_pin.to_string())
+            .output(),
+    )
+    .await
     {
-        Ok(o) => o,
-        Err(e) => return (false, Vec::new(), format!("failed to spawn test runner: {}", e)),
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return (false, Vec::new(), format!("failed to spawn test runner: {}", e)),
+        Err(_) => return (false, Vec::new(), "test runner timed out after 300s".to_string()),
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -1082,7 +1087,8 @@ async fn broadcast_prompt_and_wait(
         payload: Some(Payload::Prompt(prompt)),
     };
     for sender in senders {
-        let _ = sender.send(container.clone()).await;
+        // Best-effort broadcast: a full module queue must never wedge a prompt.
+        let _ = sender.try_send(container.clone());
     }
 
     log_event(ui_state, log_label.to_string());
@@ -1314,7 +1320,7 @@ pub async fn broadcast_stage(
                 .collect()
         };
         for sender in matching_senders {
-            let _ = sender.send(container.clone()).await;
+            let _ = sender.try_send(container.clone());
         }
     }
 }
@@ -1431,6 +1437,11 @@ cockatiel
                     .unwrap_or_default()
                     .as_millis() as i64;
 
+                // Garbage-collect sessions that were disconnected but whose
+                // cleanup never finished (wedged connection task) — they would
+                // otherwise linger forever and make dead modules look live.
+                auth_store.sweep_shutdown_sessions(now_ms, 60_000);
+
                 for session in auth_store.values() {
                     if session.unresponsive {
                         continue;
@@ -1501,10 +1512,7 @@ cockatiel
                                 cur_auth: String::new(),
                             })),
                         };
-                        let senders = module_senders.lock().await;
-                        if let Some(sender) = senders.get(&session.module_name) {
-                            let _ = sender.send(probe).await;
-                        }
+                        let _ = crate::pipeline::send_to_module(&module_senders, &session.module_name, probe, "probe").await;
                     }
                 }
             }
@@ -1532,9 +1540,14 @@ cockatiel
                         blob: vec![],
                     })),
                 };
-                let senders = module_senders.lock().await;
-                for sender in senders.values() {
-                    let _ = sender.send(container.clone()).await;
+                let senders: Vec<_> = {
+                    let senders = module_senders.lock().await;
+                    senders.values().cloned().collect()
+                };
+                for sender in senders {
+                    // Best-effort: a full module queue must never wedge the
+                    // log broadcast (which would then back up unboundedly).
+                    let _ = sender.try_send(container.clone());
                 }
             }
         });
@@ -1639,15 +1652,32 @@ cockatiel
         });
     }
 
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
-    log_event_broadcast(&ui_state, format!("Listening on port {} | PIN: {:06}", config.port, config::get_pin(&config_state)));
+let listener = TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
+
+    // The engine only accepts WSS:// — every connection must complete a TLS
+    // handshake against the engine's self-signed cert (generated + persisted
+    // under `tls/`). A plain ws:// connection fails the handshake and is
+    // dropped before any Cockatiel frame is exchanged.
+    let (tls_acceptor, cert_path) = match tls::build_tls_acceptor() {
+        Ok(pair) => pair,
+        Err(e) => {
+            log_event_broadcast(&ui_state, format!("FATAL: could not set up TLS: {}", e));
+            return Err(e.into());
+        }
+    };
+    log_event_broadcast(&ui_state, format!("Listening on port {} (WSS) | PIN: {:06}", config.port, config::get_pin(&config_state)));
+    log_event_broadcast(&ui_state, format!("TLS certificate: {}", cert_path.display()));
 
     let prompt_routes: SharedPromptRoutes = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         let (stream, address) = listener.accept().await?;
-        log_event_broadcast(&ui_state, format!("Connection from {}", address));
-
+        // Capture the peer before the TLS handshake (the TlsStream doesn't
+        // expose peer_addr directly).
+        let peer_loopback = is_loopback_addr(&address);
+        let tls_acceptor = tls_acceptor.clone();
+        // Clone shared state per iteration so the async closure never moves
+        // a variable still borrowed by the loop.
         let config_state = Arc::clone(&config_state);
         let modules = Arc::clone(&modules);
         let ui_state = Arc::clone(&ui_state);
@@ -1660,26 +1690,35 @@ cockatiel
         let prompt_routes = Arc::clone(&prompt_routes);
         let kill_map = Arc::clone(&kill_map);
         let cmd_registry = Arc::clone(&cmd_registry);
-
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(
-                stream,
-                config_state,
-                modules,
-                ui_state,
-                auth_store,
-                module_registry,
-                orchestrator,
-                db,
-                discovered_registry,
-                user_db_client,
-                prompt_routes,
-                kill_map,
-                cmd_registry.clone(),
-            )
-            .await
-            {
-                eprintln!("Connection error: {}", error);
+            match tls_acceptor.accept(stream).await {
+                Ok(tls_stream) => {
+                    log_event_broadcast(&ui_state, format!("TLS connection from {}", address));
+                    if let Err(error) = handle_connection(
+                        tls_stream,
+                        peer_loopback,
+                        config_state,
+                        modules,
+                        ui_state.clone(),
+                        auth_store,
+                        module_registry,
+                        orchestrator,
+                        db,
+                        discovered_registry,
+                        user_db_client,
+                        prompt_routes,
+                        kill_map,
+                        cmd_registry,
+                    )
+                    .await
+                    {
+                        log_event_broadcast(&ui_state, format!("Connection error from {}: {}", address, error));
+                    }
+                }
+                Err(e) => {
+                    // Plain ws:// (or a bogus handshake) lands here.
+                    log_event_broadcast(&ui_state, format!("Rejected non-TLS connection from {}: {}", address, e));
+                }
             }
         });
     }
@@ -1755,10 +1794,14 @@ pub async fn guarded_execute_query(
     let sql = sql.to_string();
     let db = db.clone();
     let spawn_db = db.clone();
-    match tokio::spawn(async move { spawn_db.execute_query(&sql).await }).await {
-        Ok(Ok(json)) => Ok(json),
-        Ok(Err(e)) => Err(format!("{}", e)),
-        Err(join) => {
+    let query_fut = async move { spawn_db.execute_query(&sql).await };
+    // Bound the query: a hung (not panicking) turso call must not block the
+    // calling module's read loop forever (a wedged read loop can't answer the
+    // engine's own AuthVerify probe and gets killed).
+    match tokio::time::timeout(Duration::from_secs(10), tokio::spawn(query_fut)).await {
+        Ok(Ok(Ok(json))) => Ok(json),
+        Ok(Ok(Err(e))) => Err(format!("{}", e)),
+        Ok(Err(join)) => {
             // A panicking query poisons the turso connection — reopen a fresh
             // one so the timeline DB stays usable.
             let reopened = db.reopen_local().await;
@@ -1767,6 +1810,7 @@ pub async fn guarded_execute_query(
                 Err(re) => Err(format!("query panicked ({}); reopen failed: {}", join, re)),
             }
         }
+        Err(_) => Err("query timed out after 10s".to_string()),
     }
 }
 
@@ -1863,10 +1907,9 @@ pub async fn handle_test_probe(
         .encode(&mut buf)
         .map_err(|e| format!("probe encode failed: {}", e))?;
 
-    {
-        let senders = orchestrator.module_senders.lock().await;
-        let sender = senders.get(&module).ok_or_else(|| format!("module '{}' has no sender", module))?;
-        sender.send(container).await.map_err(|e| format!("probe send failed: {}", e))?;
+    let sent = crate::pipeline::send_to_module(&orchestrator.module_senders, &module, container, "test_probe").await;
+    if !sent {
+        return Err(format!("module '{}' has no sender", module));
     }
 
     let now_ms = || -> i64 {
@@ -1906,8 +1949,9 @@ pub async fn handle_test_probe(
 /// then detect it no longer owns the session and must not evict it.
 static NEXT_SOCKET_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-async fn handle_connection(
-    stream: tokio::net::TcpStream,
+async fn handle_connection<S>(
+    stream: S,
+    peer_loopback: bool,
     config_state: Arc<Mutex<ConfigState>>,
     modules: Arc<Mutex<HashMap<String, ModuleInfo>>>,
     ui_state: Arc<Mutex<EngineState>>,
@@ -1920,18 +1964,16 @@ async fn handle_connection(
     prompt_routes: SharedPromptRoutes,
     kill_map: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
     cmd_registry: Arc<Mutex<CommandRegistry>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let socket_token = NEXT_SOCKET_TOKEN.fetch_add(1, Ordering::Relaxed);
     let mut websocket = accept_async(stream).await?;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Container>(64);
 
-    // Loopback status of the peer: a TUI control surface on the operator's own
-    // machine may exercise privileged userdb mutations with owner perms.
-    let peer_loopback = websocket
-        .get_ref()
-        .peer_addr()
-        .map(|a| is_loopback_addr(&a))
-        .unwrap_or(false);
+    // Loopback status is computed from the pre-TLS peer address (passed in) —
+    // a TlsStream doesn't expose peer_addr directly.
 
     // ── Await ConnectionRequest ─────────────────────────────────────────
     let first_msg = websocket.next().await;
@@ -2448,8 +2490,12 @@ let mut bytes = Vec::new();
                                 entry["priority"] = serde_json::json!(m.priority);
                             }
 
-                            // 3. Live sessions — overlay current state on top
-                            for s in &sessions {
+                            // 3. Live sessions — overlay current state on top.
+                            // Shutdown sessions (disconnected but cleanup not
+                            // yet finished) are NOT live: they must not appear
+                            // as connected (that made UIs probe a dead module
+                            // and restart it).
+                            for s in sessions.iter().filter(|s| s.shutdown_at.is_none()) {
                                 let entry = entries
                                     .entry(s.module_name.clone())
                                     .or_insert_with(|| serde_json::json!({
@@ -2711,7 +2757,9 @@ let mut bytes = Vec::new();
                                 result_blob,
                             })),
                         };
-                        let _ = tx.send(response).await;
+                        if tokio::time::timeout(Duration::from_millis(1000), tx.send(response)).await.is_err() {
+                            log_event_broadcast(&ui_state, format!("[{}] dropped query response (outbound full)", module_name));
+                        }
                     }
 Some(Payload::SendToPlatforms(send)) => {
                         // The actor (the human who triggered the send) must be
@@ -2760,16 +2808,14 @@ let targets: Vec<&str> = match send.platform.as_str() {
                             module_instance_uuid7: container.module_instance_uuid7.clone(),
                             payload: Some(Payload::SendToPlatforms(send.clone())),
                         };
-                        let senders = orchestrator.module_senders.lock().await;
                         for name in targets {
-                            if let Some(sender) = senders.get(name) {
-                                let _ = sender.send(forward.clone()).await;
+                            let sent = crate::pipeline::send_to_module(&orchestrator.module_senders, name, forward.clone(), "SendToPlatforms").await;
+                            if sent {
                                 log_event_broadcast(&ui_state, format!("[SendToPlatforms] '{}' -> {}", container.module_name, name));
                             } else {
                                 log_event_broadcast(&ui_state, format!("[SendToPlatforms] adapter '{}' not connected", name));
                             }
                         }
-                        drop(senders);
 
                         // Timeline archival: record who sent the outbound message.
                         let flags = serde_json::json!({
@@ -2840,9 +2886,8 @@ Some(Payload::ModuleControl(_)) => {
                                     },
                                 )),
                             };
-                            let senders = orchestrator.module_senders.lock().await;
-                            if let Some(sender) = senders.get(&owner) {
-                                let _ = sender.send(forward).await;
+                            let sent = crate::pipeline::send_to_module(&orchestrator.module_senders, &owner, forward, "command").await;
+                            if sent {
                                 log_event_broadcast(
                                     &ui_state,
                                     format!(
@@ -2894,7 +2939,7 @@ Some(Payload::ModuleControl(_)) => {
                                 .collect()
                         };
                         for sender in senders {
-                            let _ = sender.send(forward.clone()).await;
+                            let _ = sender.try_send(forward.clone());
                         }
                     }
                     Some(Payload::PromptResponse(ref resp)) => {
@@ -2909,6 +2954,7 @@ Some(Payload::ModuleControl(_)) => {
                         if let Some(sink) = sink {
                             match sink {
                                 PromptSink::Engine(tx) => {
+                                    // oneshot send — non-blocking by construction.
                                     let _ = tx.send(resp.accepted);
                                 }
                                 PromptSink::Module(sender) => {
@@ -2919,7 +2965,7 @@ Some(Payload::ModuleControl(_)) => {
                                         module_instance_uuid7: container.module_instance_uuid7.clone(),
                                         payload: Some(Payload::PromptResponse(resp)),
                                     };
-                                    let _ = sender.send(forward).await;
+                                    let _ = tokio::time::timeout(Duration::from_millis(1000), sender.send(forward)).await;
                                 }
                             }
                         }
@@ -2927,14 +2973,25 @@ Some(Payload::ModuleControl(_)) => {
                     Some(Payload::AuditFlag(ref flag)) => {
                         // A module flagged a message for human review (e.g. a
                         // different language). Hold it and ask a connected UI.
-                        handle_audit_flag(
-                            &db,
-                            flag,
-                            &orchestrator.module_senders,
-                            &prompt_routes,
-                            &ui_state,
-                        )
-                        .await;
+                        // Runs DETACHED: the prompt can wait up to the prompt
+                        // timeout for an operator answer, which must never
+                        // block this module's read loop (it couldn't answer
+                        // its own liveness probe and would be killed).
+                        let flag = flag.clone();
+                        let audit_db = db.clone();
+                        let audit_senders = orchestrator.module_senders.clone();
+                        let audit_routes = prompt_routes.clone();
+                        let audit_ui = ui_state.clone();
+                        tokio::spawn(async move {
+                            handle_audit_flag(
+                                &audit_db,
+                                &flag,
+                                &audit_senders,
+                                &audit_routes,
+                                &audit_ui,
+                            )
+                            .await;
+                        });
                     }
                     Some(Payload::ChatMessageRejected(ref rej)) => {
                         // A module rejected a message: surface it clearly (no
@@ -2972,10 +3029,31 @@ Some(Payload::ModuleControl(_)) => {
     // Unregister the kill switch.
     kill_map.lock().await.remove(&instance_uuid7);
 
-    // Unregister module sender (keyed by module name)
+    // Drop any prompt routes whose origin module just disconnected (their
+    // outbound channel is now closed). Without this, unanswered module prompts
+    // leak entries forever, retaining a dead sender.
     {
-        let mut senders = orchestrator.module_senders.lock().await;
-        senders.remove(&module_name);
+        let mut routes = prompt_routes.lock().unwrap();
+        routes.retain(|_, sink| match sink {
+            PromptSink::Module(tx) => !tx.is_closed(),
+            PromptSink::Engine(_) => true,
+        });
+    }
+
+    // Unregister the module sender (keyed by module name) — but ONLY if no OTHER
+    // live session with the same name remains. A relaunch can briefly coexist
+    // with the old instance; removing the name slot unconditionally would
+    // evict the still-connected sibling's sender (killing its routing + probe
+    // delivery → it gets flagged unresponsive).
+    {
+        let sibling_alive = auth_store
+            .values()
+            .iter()
+            .any(|s| s.module_name == module_name && s.instance_uuid7 != instance_uuid7);
+        if !sibling_alive {
+            let mut senders = orchestrator.module_senders.lock().await;
+            senders.remove(&module_name);
+        }
     }
 
     log_event_broadcast(&ui_state, format!("Disconnected: {} [{}]", module_name, instance_uuid7));

@@ -14,6 +14,38 @@ fn uuid7_string_to_bytes(s: &str) -> Vec<u8> {
     s.as_bytes().to_vec()
 }
 
+/// Bounded, non-wedging send to a connected module. Clones the sender out of
+/// the shared `module_senders` lock (so the lock is never held across the
+/// send), `try_send`s first, and only falls back to a short timeout send when
+/// the channel is full — a module that isn't draining its socket must not
+/// stall the liveness watchdog or the routing lock for every other module.
+/// Returns whether a sender existed (i.e. the module was connected).
+pub(crate) async fn send_to_module(
+    senders: &Arc<Mutex<HashMap<String, mpsc::Sender<Container>>>>,
+    module_name: &str,
+    container: Container,
+    label: &str,
+) -> bool {
+    let sender = {
+        let senders = senders.lock().await;
+        senders.get(module_name).cloned()
+    };
+    let Some(sender) = sender else {
+        return false;
+    };
+    if sender.try_send(container.clone()).is_ok() {
+        return true;
+    }
+    if tokio::time::timeout(Duration::from_millis(1000), sender.send(container)).await.is_ok() {
+        return true;
+    }
+    eprintln!(
+        "[engine] dropped send to '{}' ({}) — channel full >1s",
+        module_name, label
+    );
+    true
+}
+
 fn uuid7_string() -> Option<String> {
     Some(uuid::Uuid::now_v7().to_string())
 }
@@ -73,6 +105,27 @@ impl AckTracker {
 
     pub fn ack(&mut self, uuid7: &str) -> Vec<PendingAck> {
         self.pending.remove(uuid7).unwrap_or_default()
+    }
+
+    /// Remove ONLY the acking module's pending entry for `uuid7` (a stage with
+    /// several modules must wait for ALL of them to ack, not advance on the
+    /// first). Returns the stage that was acked, if this module had a pending
+    /// ack for the message.
+    pub fn ack_module(&mut self, uuid7: &str, module_name: &str) -> Option<String> {
+        let stage = {
+            let entries = self.pending.get(uuid7)?;
+            entries
+                .iter()
+                .find(|e| e.module_name == module_name)
+                .map(|e| e.stage.clone())?
+        };
+        if let Some(entries) = self.pending.get_mut(uuid7) {
+            entries.retain(|e| e.module_name != module_name);
+            if entries.is_empty() {
+                self.pending.remove(uuid7);
+            }
+        }
+        Some(stage)
     }
 
     pub fn check_timeouts(&mut self) -> Vec<PendingAck> {
@@ -327,7 +380,6 @@ impl PipelineOrchestrator {
             }
         };
 
-        let senders = self.module_senders.lock().await;
         let mut ack_guard = self.ack_tracker.lock().await;
         let cfg = self.config_snapshot().await;
 
@@ -335,10 +387,13 @@ impl PipelineOrchestrator {
             Some(list) => list.iter().collect(),
             None => cfg.pre_process_modules.iter().collect(),
         };
+        let recipients_empty = recipients.is_empty();
 
+        let mut sent_any = false;
         for module_name in recipients {
-            if let Some(sender) = senders.get(module_name) {
-                let _ = sender.send(container.clone()).await;
+            let sent = send_to_module(&self.module_senders, module_name, container.clone(), "pre_process").await;
+            if sent {
+                sent_any = true;
                 ack_guard.track(
                     uuid7.to_string(),
                     "pre_process".into(),
@@ -346,6 +401,14 @@ impl PipelineOrchestrator {
                     cfg.ack_timeout_ms,
                 );
             }
+        }
+        drop(ack_guard);
+
+        // No pre-process module is connected — there is nobody to ack, so
+        // advance immediately instead of leaving the message stuck in
+        // `pipeline_states` forever (a leak + a perpetually 'processing' row).
+        if recipients_empty || !sent_any {
+            self.start_in_process(uuid7).await?;
         }
 
         Ok(())
@@ -403,17 +466,32 @@ impl PipelineOrchestrator {
             )),
         };
 
-        let senders = self.module_senders.lock().await;
-        let mut ack_guard = self.ack_tracker.lock().await;
-
-        if let Some(sender) = senders.get(module_name) {
-            let _ = sender.send(container).await;
-            ack_guard.track(
+        let sent = send_to_module(&self.module_senders, module_name, container, "in_process").await;
+        if sent {
+            self.ack_tracker.lock().await.track(
                 uuid7.to_string(),
                 "in_process".into(),
                 module_name.clone(),
                 cfg.ack_timeout_ms,
             );
+        } else {
+            // The configured in-process module isn't connected — nothing will
+            // ever ack this stage. Skip to the next stage so the message
+            // doesn't hang in `pipeline_states` forever.
+            let next_index = {
+                let mut states = self.pipeline_states.lock().await;
+                if let Some(state) = states.get_mut(uuid7) {
+                    state.current_in_process_index += 1;
+                    state.current_in_process_index
+                } else {
+                    return Ok(());
+                }
+            };
+            if next_index >= cfg.in_process_modules.len() {
+                self.start_post_process(uuid7).await?;
+            } else {
+                Box::pin(self.start_in_process(uuid7)).await?;
+            }
         }
 
         Ok(())
@@ -470,15 +548,13 @@ impl PipelineOrchestrator {
             )),
         };
 
-        let senders = self.module_senders.lock().await;
-        let mut ack_guard = self.ack_tracker.lock().await;
         let cfg = self.config_snapshot().await;
 
         let mut sent_any = false;
         for module_name in &cfg.post_process_modules {
-            if let Some(sender) = senders.get(module_name) {
-                let _ = sender.send(container.clone()).await;
-                ack_guard.track(
+            let sent = send_to_module(&self.module_senders, module_name, container.clone(), "post_process").await;
+            if sent {
+                self.ack_tracker.lock().await.track(
                     uuid7.to_string(),
                     "post_process".into(),
                     module_name.clone(),
@@ -491,8 +567,6 @@ impl PipelineOrchestrator {
         // If no post-process module is actually connected, there is nobody to
         // ack — complete the message now instead of leaving it stuck forever.
         if cfg.post_process_modules.is_empty() || !sent_any {
-            drop(ack_guard);
-            drop(senders);
             self.mark_complete(uuid7).await?;
         }
 
@@ -564,12 +638,12 @@ impl PipelineOrchestrator {
     pub async fn handle_ack(
         &self,
         uuid7: &str,
+        module_name: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cfg = self.config_snapshot().await;
         let completed_stage = {
             let mut ack_guard = self.ack_tracker.lock().await;
-            let acks = ack_guard.ack(uuid7);
-            acks.first().map(|a| a.stage.clone())
+            ack_guard.ack_module(uuid7, module_name)
         };
 
         let stage = match completed_stage {
@@ -588,7 +662,6 @@ impl PipelineOrchestrator {
                     let uuid7_bytes = uuid7_string_to_bytes(uuid7);
                     self.db.update_stage_completed(&uuid7_bytes, "pre_process").await?;
                     self.start_in_process(uuid7).await?;
-                } else {
                 }
             }
             "in_process" => {
@@ -752,7 +825,7 @@ impl PipelineOrchestrator {
                 let uuid7_bytes = uuid7_string_to_bytes(&msg.message_uuid7);
                 self.db.set_processed_message(&uuid7_bytes, &processed).await?;
                 self.store_audio(&msg.message_uuid7, "pre", &msg.audio_type, &msg.audio).await?;
-                self.handle_ack(&msg.message_uuid7).await?;
+                self.handle_ack(&msg.message_uuid7, &container.module_name).await?;
                 Ok(true)
             }
             Some(Payload::MessageInProcess(msg)) => {
@@ -770,7 +843,7 @@ impl PipelineOrchestrator {
                 let uuid7_bytes = uuid7_string_to_bytes(&msg.message_uuid7);
                 self.db.set_processed_message(&uuid7_bytes, &msg.processed_message).await?;
                 self.store_audio(&msg.message_uuid7, "in", &msg.audio_type, &msg.audio).await?;
-                self.handle_ack(&msg.message_uuid7).await?;
+                self.handle_ack(&msg.message_uuid7, &container.module_name).await?;
                 Ok(true)
             }
             Some(Payload::MessagePostProcess(msg)) => {
@@ -788,14 +861,14 @@ impl PipelineOrchestrator {
                 let uuid7_bytes = uuid7_string_to_bytes(&msg.message_uuid7);
                 self.db.set_processed_message(&uuid7_bytes, &msg.processed_message).await?;
                 self.store_audio(&msg.message_uuid7, "post", &msg.audio_type, &msg.audio).await?;
-                self.handle_ack(&msg.message_uuid7).await?;
+                self.handle_ack(&msg.message_uuid7, &container.module_name).await?;
                 Ok(true)
             }
             Some(Payload::MessageAck(ack)) => {
                 if ack.message_uuid7.is_empty() {
                     return Ok(true);
                 }
-                self.handle_ack(&ack.message_uuid7).await?;
+                self.handle_ack(&ack.message_uuid7, &container.module_name).await?;
                 Ok(true)
             }
             _ => Ok(false),

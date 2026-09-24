@@ -184,18 +184,35 @@ impl AuthStore {
         }
     }
 
+    /// Remove sessions that were shut down (disconnected) but never cleaned up
+    /// for longer than `max_age_ms`. A session whose connection task wedged
+    /// before `remove_if_socket` ran would otherwise linger forever (inflating
+    /// `module_list` and making UIs probe a dead module).
+    pub fn sweep_shutdown_sessions(&self, now_ms: i64, max_age_ms: i64) {
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.retain(|_, s| match s.shutdown_at {
+            Some(t) => now_ms - t < max_age_ms,
+            None => true,
+        });
+    }
+
     pub fn values(&self) -> Vec<AuthSession> {
         let sessions = self.sessions.lock().unwrap();
         sessions.values().cloned().collect()
     }
 
-    /// Look up a connected session by module name (the per-session key is the
-    /// instance uuid7). Returns the instance uuid + last activity timestamp.
+    /// Look up the LIVE session by module name (the per-session key is the
+    /// instance uuid7). With multiple instances of one module (a relaunch
+    /// before the old session's cleanup runs), this returns the newest
+    /// connected one — never an arbitrary/stale session, which would make
+    /// liveness probes and `test_probe` measure the wrong instance. Returns
+    /// the instance uuid + last activity timestamp.
     pub fn find_by_module(&self, module_name: &str) -> Option<(String, i64)> {
         let sessions = self.sessions.lock().unwrap();
         sessions
             .values()
-            .find(|s| s.module_name == module_name)
+            .filter(|s| s.module_name == module_name)
+            .max_by_key(|s| s.connected_at.unwrap_or(0))
             .map(|s| (s.instance_uuid7.clone(), s.last_activity_ms))
     }
 

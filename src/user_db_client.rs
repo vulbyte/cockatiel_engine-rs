@@ -38,8 +38,12 @@ impl UserDbClient {
     async fn request(&self, op: user_db_request::Op) -> Result<UserDbResponse, String> {
         let mut guard = self.conn.lock().await;
         if guard.is_none() {
-            let (ws, _) = connect_async(&self.url)
+            // Bounded connect: the user DB is on the engine's hot read-loop
+            // path (message enrichment), so an unreachable service must never
+            // hang a module's read loop for a TCP-connect timeout (~75s).
+            let (ws, _) = tokio::time::timeout(Duration::from_secs(3), connect_async(&self.url))
                 .await
+                .map_err(|_| "UserDB connect timed out after 3s".to_string())?
                 .map_err(|e| format!("UserDB connect failed: {}", e))?;
             *guard = Some(ws);
         }
