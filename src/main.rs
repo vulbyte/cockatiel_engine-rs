@@ -2303,22 +2303,44 @@ where
             }
         };
 
-        // Approve known/auto-authed modules outright. A trusted/known module is
-        // auto-approved ONLY if it presents the exact instance uuid the engine
-        // registered for it (name-trust alone is spoofable: every module holds
-        // the PIN). EXCEPTION: the very first registration of an always-trusted
-        // name (fresh-install bootstrap) is auto-approved so the TUI can connect
-        // once and approve everyone else — after that registration the uuid is
-        // pinned. Everything else goes through a Prompt routed to connected
-        // modules (e.g. the TUI); if no UI is connected, fall back to an
-        // interactive terminal prompt.
+        // Approve known/auto-authed modules outright. Two different trust
+        // models apply:
+        //  - Control-surface names (cockatiel-tui, -test-runner,
+        //    -audit-viewer): auto-approved ONLY when the connecting module
+        //    presents the exact instance uuid the engine pinned for that name
+        //    (a PIN-holder must not mint a control-surface identity by name
+        //    alone). EXCEPTION: the very first registration of such a name
+        //    (fresh-install bootstrap) is auto-approved so the TUI can connect
+        //    once and approve everyone else — after that registration the uuid
+        //    is pinned.
+        //  - Regular registered modules: name-only auto-approval. The client
+        //    SDK connects FIRST-CONTACT with a fresh uuid and empty auth_token
+        //    on every reconnect (it never replays a stored identity), so
+        //    requiring the pinned uuid here would break every module reconnect.
+        // Everything else goes through a Prompt routed to connected modules
+        // (e.g. the TUI); if no UI is connected, fall back to an interactive
+        // terminal prompt.
         // Refresh the registry first: the TUI may have registered this module
         // at runtime (e.g. a duplicated module) since the engine booted.
         module_registry.refresh();
         let registry_entry = module_registry.find(&module_name);
-        let uuid_matches = module_registry.is_known_auto_auth_for(&module_name, &assigned_uuid);
-        let auto_approve =
-            uuid_matches || (is_always_trusted(&module_name) && registry_entry.is_none());
+        let auto_approve = if is_always_trusted(&module_name) {
+            // Control-surface names: only the pinned instance uuid may auto-approve
+            // (a PIN-holder must not mint a control-surface identity by name alone),
+            // EXCEPT on the very first registration of such a name (fresh-install
+            // bootstrap so the TUI can connect once and approve everyone else).
+            let uuid_matches = registry_entry
+                .as_ref()
+                .map(|e| e.instance_uuid7 == assigned_uuid)
+                .unwrap_or(false);
+            uuid_matches || registry_entry.is_none()
+        } else {
+            // Regular registered module: name-only auto-approval. The client SDK
+            // connects first-contact with a fresh uuid on EVERY reconnect (it never
+            // replays a stored identity), so requiring the pinned uuid here would
+            // break every module reconnect.
+            module_registry.is_known_and_auto_auth(&module_name)
+        };
         let approved = if auto_approve {
             log_event_broadcast(&ui_state, format!("Auto-approving {}", module_name));
             true
