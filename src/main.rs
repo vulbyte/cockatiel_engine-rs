@@ -218,6 +218,45 @@ fn process_position_to_string(pos: ProcessPosition) -> String {
     .to_string()
 }
 
+/// Best-effort startup warning when a module's manifest `capabilities`
+/// (discovered_registry) disagree with the `process_position` it requested at
+/// connect/approval time. Log-only — the module is still approved; the operator
+/// can move it in config.json.
+fn warn_stage_capability_mismatch(
+    module_name: &str,
+    position: &str,
+    discovered_registry: &Arc<Mutex<ModuleRegistry>>,
+    ui_state: &Arc<Mutex<EngineState>>,
+) {
+    let capability = discovered_registry
+        .lock()
+        .unwrap()
+        .get(module_name)
+        .map(|m| m.manifest.capabilities.trim().to_lowercase())
+        .unwrap_or_default();
+    if capability.is_empty() {
+        return;
+    }
+    // Normalize capability aliases ("output"/"display" are postprocess, etc.)
+    // so only genuine stage disagreements warn.
+    let normalized = match capability.as_str() {
+        "input" | "inputs" | "connection" => "input",
+        "preprocess" | "pre" => "preprocess",
+        "inprocess" | "process" => "inprocess",
+        "postprocess" | "output" | "outputs" | "display" | "post" => "postprocess",
+        other => other,
+    };
+    if normalized != position {
+        log_event_broadcast(
+            ui_state,
+            format!(
+                "WARN: module '{}' manifests capability '{}' but requested stage '{}' — verify config.json pipeline placement",
+                module_name, capability, position
+            ),
+        );
+    }
+}
+
 fn module_search_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
@@ -700,6 +739,77 @@ pub async fn userdb_virtual_query(
     }
 }
 
+/// Handle the `userdb_adjust_score` virtual query: apply a REAL arbitrary delta
+/// to a user's `score` (no ±1 clamp, no user-db rating cooldown). Unlike the
+/// `mod_commend`/`mod_reprimand` SYSTEM path it accepts any signed delta.
+///
+/// Gate: only the score-messages module or the TUI control surface may call it.
+/// NOTE: the user-db's `add_score`/`remove_score` ops also increment the
+/// `commendations`/`reprimands` counters — a dedicated score-only user-db op is
+/// out of scope for the engine; until it lands this reuses the only available
+/// score path.
+pub async fn userdb_adjust_score_virtual_query(
+    client: &SharedUserDbClient,
+    sql: &str,
+    ui_state: &Arc<Mutex<EngineState>>,
+    requester: &str,
+) -> (bool, Vec<u8>, String) {
+    let payload: serde_json::Value = match serde_json::from_str(sql) {
+        Ok(v) => v,
+        Err(e) => return (false, Vec::new(), format!("Invalid userdb_adjust_score payload: {}", e)),
+    };
+
+    let delta = payload.get("delta").and_then(|v| v.as_i64()).unwrap_or(0);
+    let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("userdb_adjust_score");
+
+    // Resolve the target user: prefer an explicit uuid7, else by (platform, handle).
+    let explicit_uuid = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
+    let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
+    let handle = payload.get("handle").and_then(|v| v.as_str()).unwrap_or("");
+
+    let uuid7 = if !explicit_uuid.is_empty() {
+        explicit_uuid.to_string()
+    } else if !platform.is_empty() && !handle.is_empty() {
+        let resolved = match client.get_user("", platform, handle, handle).await {
+            Ok(r) => r,
+            Err(e) => return (false, Vec::new(), e),
+        };
+        if !resolved.success {
+            log_event(ui_state, format!("[{}] userdb_adjust_score: target '{}' not found on '{}'", requester, handle, platform));
+            return (false, Vec::new(), format!("User '{}' not found on {}", handle, platform));
+        }
+        let Some(user) = resolved.user else {
+            return (false, Vec::new(), format!("User '{}' not found on {}", handle, platform));
+        };
+        user.uuid7
+    } else {
+        return (false, Vec::new(), "userdb_adjust_score requires uuid7 or platform + handle".to_string());
+    };
+
+    if delta == 0 {
+        let json = serde_json::json!({ "success": true, "uuid7": uuid7, "delta": 0 }).to_string();
+        return (true, json.into_bytes(), String::new());
+    }
+
+    let outcome = if delta > 0 {
+        client.add_score(&uuid7, delta, reason).await
+    } else {
+        client.remove_score(&uuid7, -delta, reason).await
+    };
+
+    match outcome {
+        Ok(resp) => {
+            log_event(ui_state, format!("[{}] userdb_adjust_score {} by {} -> {}", requester, delta, requester, uuid7));
+            let json = userdb_response_to_json(&resp);
+            (resp.success, json.into_bytes(), if resp.success { String::new() } else { resp.error.clone() })
+        }
+        Err(e) => {
+            log_event(ui_state, format!("[{}] userdb_adjust_score error: {}", requester, e));
+            (false, Vec::new(), e)
+        }
+    }
+}
+
 /// Handle a `mod_*` virtual query from an adapter (e.g. a mod typing a command
 /// in chat). The adapter identifies the target by platform + handle; the engine
 /// resolves the user DB record and applies the action.
@@ -957,11 +1067,6 @@ pub async fn chat_verify_identity_virtual_query(
 
     let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
     let handle = payload.get("handle").and_then(|v| v.as_str()).unwrap_or("");
-    let verified = payload.get("verified_roles").cloned().unwrap_or_else(|| serde_json::json!({}));
-    let v_sponsor = verified.get("is_sponsor").and_then(|v| v.as_bool()).unwrap_or(false);
-    let v_moderator = verified.get("is_moderator").and_then(|v| v.as_bool()).unwrap_or(false);
-    let v_admin = verified.get("is_admin").and_then(|v| v.as_bool()).unwrap_or(false);
-    let v_owner = verified.get("is_owner").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Create-or-find the user keyed by channel (the service already does
     // find-by-channel and returns the existing record).
@@ -984,11 +1089,33 @@ pub async fn chat_verify_identity_virtual_query(
         return (false, Vec::new(), "chat_verify_identity: no user returned".to_string());
     };
 
-    // Union of the existing roles and the verified roles — elevate, never revoke.
-    let is_sponsor = user.is_sponsor || v_sponsor;
-    let is_moderator = user.is_moderator || v_moderator;
-    let is_admin = user.is_admin || v_admin;
-    let is_owner = user.is_owner || v_owner;
+    // term-chat asserts its platform-verified roles as booleans under
+    // `verified_roles`. The engine must NOT union those onto the stored record
+    // (that can never revoke — and a self-asserted login_kick handle would
+    // stick elevated roles onto the matching stored user forever). Set each
+    // role EXACTLY from the claim so a role that is no longer asserted is
+    // revoked (straight assignment, never AND/OR with the stored value).
+    // When the payload carries no verified_roles at all, preserve the stored
+    // roles (previous behavior) but surface a warning — the claim is untrusted.
+    let verified_roles = payload.get("verified_roles");
+    let (is_sponsor, is_moderator, is_admin, is_owner) = match verified_roles {
+        Some(verified) if verified.is_object() => (
+            verified.get("is_sponsor").and_then(|v| v.as_bool()).unwrap_or(false),
+            verified.get("is_moderator").and_then(|v| v.as_bool()).unwrap_or(false),
+            verified.get("is_admin").and_then(|v| v.as_bool()).unwrap_or(false),
+            verified.get("is_owner").and_then(|v| v.as_bool()).unwrap_or(false),
+        ),
+        _ => {
+            log_event(
+                ui_state,
+                format!(
+                    "[{}] chat_verify_identity: payload for '{}' on '{}' carries no verified_roles — preserving stored roles (unverified claim)",
+                    module_name, handle, platform
+                ),
+            );
+            (user.is_sponsor, user.is_moderator, user.is_admin, user.is_owner)
+        }
+    };
 
     let set_resp = match client
         .set_roles(&user.uuid7, "", "owner", is_sponsor, is_moderator, is_admin, is_owner)
@@ -1297,6 +1424,10 @@ async fn handle_chat_message_rejected(
     }
 }
 
+/// Detached continuation of an audit flag: the timeline row was ALREADY marked
+/// `audit` synchronously by the caller (so the hold lands before the flagging
+/// module's ack can be processed); this only drives the operator prompt and the
+/// eventual release.
 async fn handle_audit_flag(
     db: &DatabaseManager,
     flag: &cockatiel_protobuf::AuditFlag,
@@ -1307,13 +1438,6 @@ async fn handle_audit_flag(
     ui_state: &Arc<Mutex<EngineState>>,
 ) {
     let uuid_bytes = flag.message_uuid7.as_bytes().to_vec();
-    if db.is_audited(&uuid_bytes).await.unwrap_or(false) {
-        return;
-    }
-    if db.mark_audit(&uuid_bytes, &flag.reason).await.is_err() {
-        log_event(ui_state, format!("[audit] failed to hold message {}", flag.message_uuid7));
-        return;
-    }
 
     let entry = db.get_audit_entry(&uuid_bytes).await.ok().flatten();
     let details = match &entry {
@@ -2426,6 +2550,7 @@ where
         });
 
         config::add_module_to_config(&config_state, &module_name, &position, priority);
+        warn_stage_capability_mismatch(&module_name, &position, &discovered_registry, &ui_state);
 
         log_event_broadcast(&ui_state, format!("Approved: {} on {}", module_name, position));
         log_to_timeline(
@@ -2806,6 +2931,15 @@ let mut bytes = Vec::new();
                         } else if query.query_id == "chat_verify_identity" {
                             // Identity bootstrap / write-through — term-chat only.
                             chat_verify_identity_virtual_query(&user_db_client, &query.sql, &ui_state, &module_name).await
+                        } else if query.query_id == "userdb_adjust_score" {
+                            // Real arbitrary score delta for the score-messages
+                            // module (no ±1 clamp, no user-db rating cooldown).
+                            // The TUI control surface may also call it.
+                            if !is_control_surface(&module_name) && module_name != "score-messages" {
+                                (false, Vec::new(), "userdb_adjust_score denied: not the TUI or score-messages".to_string())
+                            } else {
+                                userdb_adjust_score_virtual_query(&user_db_client, &query.sql, &ui_state, &module_name).await
+                            }
                         } else if query.query_id.starts_with("userdb_") {
                             // User database is engine-internal — only the TUI
                             // control surface may access it. Modules are denied.
@@ -2918,7 +3052,7 @@ let mut bytes = Vec::new();
                             }
                         } else {
                             // Regular database query — hard read-only boundary.
-                            // Only SELECT/WITH/EXPLAIN may run; any write must
+                            // Only SELECT/EXPLAIN may run; any write must
                             // go through the engine's own methods or a
                             // dedicated virtual query.
                             if is_read_only_sql(&query.sql) {
@@ -2931,7 +3065,7 @@ let mut bytes = Vec::new();
                                     }
                                 }
                             } else {
-                                (false, Vec::new(), "Denied: only read-only SQL (SELECT/WITH/EXPLAIN) is allowed via DatabaseQuery — use a dedicated virtual query for writes".to_string())
+                                (false, Vec::new(), "Denied: only read-only SQL (SELECT/EXPLAIN) is allowed via DatabaseQuery — use a dedicated virtual query for writes".to_string())
                             }
                         };
                         let response = Container {
@@ -3162,25 +3296,51 @@ Some(Payload::ModuleControl(_)) => {
                     Some(Payload::AuditFlag(ref flag)) => {
                         // A module flagged a message for human review (e.g. a
                         // different language). Hold it and ask a connected UI.
-                        // Runs DETACHED: the prompt can wait up to the prompt
-                        // timeout for an operator answer, which must never
-                        // block this module's read loop (it couldn't answer
-                        // its own liveness probe and would be killed).
-                        let flag = flag.clone();
-                        let audit_db = db.clone();
-                        let audit_senders = orchestrator.module_senders.clone();
-                        let audit_routes = prompt_routes.clone();
-                        let audit_ui = ui_state.clone();
-                        tokio::spawn(async move {
-                            handle_audit_flag(
-                                &audit_db,
-                                &flag,
-                                &audit_senders,
-                                &audit_routes,
-                                &audit_ui,
-                            )
-                            .await;
-                        });
+                        //
+                        // The DB hold MUST land BEFORE the flagging module's
+                        // pre-process ack is processed: start_in_process()
+                        // consults is_audited() before advancing, so if the
+                        // timeline row is still marked 'queued' the flagged
+                        // message slips past the hold. The row update is fast
+                        // and is AWAITED INLINE here. Only the prompt wait (up
+                        // to the 120s prompt timeout) runs DETACHED — it must
+                        // never block this module's read loop (it couldn't
+                        // answer its own liveness probe and would be killed).
+                        let uuid_bytes = flag.message_uuid7.as_bytes().to_vec();
+                        // Already held (a prior flag is unresolved): do not
+                        // re-hold or spawn a second prompt — the operator is
+                        // already looking at it.
+                        let newly_held = if db.is_audited(&uuid_bytes).await.unwrap_or(false) {
+                            false
+                        } else {
+                            match db.mark_audit(&uuid_bytes, &flag.reason).await {
+                                Ok(()) => true,
+                                Err(_) => {
+                                    log_event(
+                                        &ui_state,
+                                        format!("[audit] failed to hold message {}", flag.message_uuid7),
+                                    );
+                                    false
+                                }
+                            }
+                        };
+                        if newly_held {
+                            let flag = flag.clone();
+                            let audit_db = db.clone();
+                            let audit_senders = orchestrator.module_senders.clone();
+                            let audit_routes = prompt_routes.clone();
+                            let audit_ui = ui_state.clone();
+                            tokio::spawn(async move {
+                                handle_audit_flag(
+                                    &audit_db,
+                                    &flag,
+                                    &audit_senders,
+                                    &audit_routes,
+                                    &audit_ui,
+                                )
+                                .await;
+                            });
+                        }
                     }
                     Some(Payload::ChatMessageRejected(ref rej)) => {
                         // A module rejected a message: surface it clearly (no

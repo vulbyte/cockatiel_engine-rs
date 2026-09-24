@@ -162,6 +162,13 @@ impl AckTracker {
             .map(|v| !v.is_empty())
             .unwrap_or(false)
     }
+
+    /// Test-only: inject pending entries with arbitrary `sent_at`/`timeout` so
+    /// timeout semantics can be exercised deterministically without sleeping.
+    #[cfg(test)]
+    pub(crate) fn inject(&mut self, uuid7: String, entries: Vec<PendingAck>) {
+        self.pending.insert(uuid7, entries);
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -6,3 +6,4 @@
 mod auth_tests;
 mod command_tests;
 mod sql_tests;
+mod ack_tests;
