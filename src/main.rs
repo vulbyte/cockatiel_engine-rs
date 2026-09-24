@@ -740,14 +740,11 @@ pub async fn userdb_virtual_query(
 }
 
 /// Handle the `userdb_adjust_score` virtual query: apply a REAL arbitrary delta
-/// to a user's `score` (no ±1 clamp, no user-db rating cooldown). Unlike the
-/// `mod_commend`/`mod_reprimand` SYSTEM path it accepts any signed delta.
+/// to a user's `score` (no ±1 clamp, no user-db rating cooldown, no counter
+/// inflation). Unlike `mod_commend`/`mod_reprimand` it accepts any signed delta
+/// and uses the user-db's dedicated score-only op.
 ///
 /// Gate: only the score-messages module or the TUI control surface may call it.
-/// NOTE: the user-db's `add_score`/`remove_score` ops also increment the
-/// `commendations`/`reprimands` counters — a dedicated score-only user-db op is
-/// out of scope for the engine; until it lands this reuses the only available
-/// score path.
 pub async fn userdb_adjust_score_virtual_query(
     client: &SharedUserDbClient,
     sql: &str,
@@ -791,11 +788,7 @@ pub async fn userdb_adjust_score_virtual_query(
         return (true, json.into_bytes(), String::new());
     }
 
-    let outcome = if delta > 0 {
-        client.add_score(&uuid7, delta, reason).await
-    } else {
-        client.remove_score(&uuid7, -delta, reason).await
-    };
+    let outcome = client.adjust_score_only(&uuid7, delta, reason).await;
 
     match outcome {
         Ok(resp) => {

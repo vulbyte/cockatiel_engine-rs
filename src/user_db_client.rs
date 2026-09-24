@@ -121,6 +121,18 @@ impl UserDbClient {
         })).await
     }
 
+    /// Score-only adjustment: changes `score` by `delta` WITHOUT incrementing
+    /// the commendations/reprimands counters and WITHOUT the rating cooldown.
+    /// Used by the automated scorer so real configured deltas apply without
+    /// corrupting the human-rating counters.
+    pub async fn adjust_score_only(&self, uuid7: &str, delta: i64, reason: &str) -> Result<UserDbResponse, String> {
+        self.request(user_db_request::Op::AdjustScoreOnly(ScoreRequest {
+            uuid7: uuid7.to_string(),
+            delta,
+            reason: reason.to_string(),
+        })).await
+    }
+
     /// Commend or reprimand a user (chat-command ratings). The user-db
     /// enforces the 24h reprimand cooldown atomically; a denial comes back
     /// with success=false + the cooldown reason.
