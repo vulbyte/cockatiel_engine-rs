@@ -2149,6 +2149,9 @@ where
         // connection waiting on a prompt). Everything else goes through a
         // Prompt routed to connected modules (e.g. the TUI); if no UI is
         // connected, fall back to an interactive terminal prompt.
+        // Refresh the registry first: the TUI may have registered this module
+        // at runtime (e.g. a duplicated module) since the engine booted.
+        module_registry.refresh();
         let approved = if is_always_trusted(&module_name) {
             log_event_broadcast(&ui_state, format!("Auto-approving trusted module: {}", module_name));
             true

@@ -53,6 +53,18 @@ impl ModuleRegistryPersistence {
         let _ = self.save();
     }
 
+    /// Re-read modules.json from disk, replacing the in-memory list. The TUI
+    /// registers modules at runtime (e.g. a duplicated module), so a connection
+    /// from a name the engine hasn't seen since startup must pick it up.
+    pub fn refresh(&self) {
+        if let Ok(content) = fs::read_to_string(&self.path) {
+            if let Ok(modules) = serde_json::from_str::<Vec<RegisteredModule>>(&content) {
+                let mut guard = self.modules.lock().unwrap();
+                *guard = modules;
+            }
+        }
+    }
+
     pub fn is_known_and_auto_auth(&self, name: &str) -> bool {
         let modules = self.modules.lock().unwrap();
         modules
