@@ -95,3 +95,10 @@ Thumbs.db
 # Engine runtime config — contains the JWT secret + pairing PIN. Never commit.
 config.json
 modules.json
+
+# Generated TLS identity (self-signed cert + private key). The engine writes
+# these on first boot so clients can pin the cert; the private key must NEVER
+# be committed.
+tls/
+*.pem
+*.key
