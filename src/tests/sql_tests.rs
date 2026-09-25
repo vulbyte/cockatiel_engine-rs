@@ -62,3 +62,21 @@ fn empty_or_garbage_does_not_pass() {
     assert!(!is_read_only_sql("SHOW TABLES"));
     assert!(!is_read_only_sql("VACUUM"));
 }
+#[test]
+fn write_keywords_inside_string_literals_are_data_not_statements() {
+    // A write keyword used as a VALUE (or identifier) in a read-only query is
+    // not a write — the token scan must be string-literal-aware.
+    assert!(is_read_only_sql("SELECT * FROM users WHERE name = 'delete'"));
+    assert!(is_read_only_sql("SELECT * FROM users WHERE status = 'drop' AND flag = 'create'"));
+    assert!(is_read_only_sql("SELECT 'insert', 'update' FROM users"));
+    assert!(is_read_only_sql("SELECT * FROM users WHERE \"delete\" = 1"));
+}
+
+#[test]
+fn real_write_keywords_still_rejected_even_near_literals() {
+    // The literal-awareness must not hide an actual write.
+    assert!(!is_read_only_sql("SELECT * FROM users WHERE name = 'x' DELETE FROM users"));
+    assert!(!is_read_only_sql("DELETE FROM users WHERE name = 'delete'"));
+    assert!(!is_read_only_sql("UPDATE users SET name = 'update'"));
+    assert!(!is_read_only_sql("WITH x AS (SELECT 1) DELETE FROM users WHERE name = 'x'"));
+}

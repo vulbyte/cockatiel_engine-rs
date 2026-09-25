@@ -70,7 +70,8 @@ use cockatiel_protobuf::{
 /// are forwarded back to that module's connection.
 enum PromptSink {
     Engine(oneshot::Sender<bool>),
-    Module(tokio::sync::mpsc::Sender<Container>),
+    /// A module-originated prompt: (origin module name, response channel).
+    Module(String, tokio::sync::mpsc::Sender<Container>),
 }
 
 type SharedPromptRoutes = Arc<Mutex<HashMap<String, PromptSink>>>;
@@ -2141,6 +2142,9 @@ fn is_read_only_sql(sql: &str) -> bool {
     // Defense-in-depth: a write keyword ANYWHERE in the statement is fatal
     // (catches CTE-smuggled writes and anything the leading-keyword gate
     // missed). Tokenize on any non-alphanumeric char and compare lowercased.
+    // Tokens inside a string literal are SKIPPED so a query like
+    // `WHERE name = 'delete'` isn't a false positive — the literal is data,
+    // not a statement.
     const WRITE_TOKENS: &[&str] = &[
         "insert",
         "update",
@@ -2153,10 +2157,32 @@ fn is_read_only_sql(sql: &str) -> bool {
         "pragma",
         "create",
     ];
-    for token in s.split(|c: char| !c.is_ascii_alphanumeric()) {
-        if WRITE_TOKENS.contains(&token.to_ascii_lowercase().as_str()) {
-            return false;
+    let mut in_string = false;
+    let mut quote = ' ';
+    let mut token = String::new();
+    for c in s.chars() {
+        if in_string {
+            if c == quote {
+                in_string = false;
+            }
+            continue;
         }
+        match c {
+            '\'' | '"' => {
+                in_string = true;
+                quote = c;
+            }
+            c if c.is_ascii_alphanumeric() => token.push(c),
+            _ => {
+                if WRITE_TOKENS.contains(&token.to_ascii_lowercase().as_str()) {
+                    return false;
+                }
+                token.clear();
+            }
+        }
+    }
+    if WRITE_TOKENS.contains(&token.to_ascii_lowercase().as_str()) {
+        return false;
     }
     true
 }
@@ -2939,6 +2965,19 @@ let mut bytes = Vec::new();
                             (true, status.to_string().into_bytes(), String::new())
                         } else if query.query_id == "module_list" {
                             let sessions = auth_store.values();
+                            // Modules with an unanswered prompt are waiting on
+                            // the operator (e.g. a setup/credential question) —
+                            // expose it so UIs and the test harness can tell a
+                            // connected-but-stuck module apart from an idle one.
+                            let pending_prompts: std::collections::HashSet<String> = prompt_routes
+                                .lock()
+                                .unwrap()
+                                .values()
+                                .filter_map(|sink| match sink {
+                                    PromptSink::Module(origin, _) => Some(origin.clone()),
+                                    PromptSink::Engine(_) => None,
+                                })
+                                .collect();
                             let registered = module_registry.values();
 
                             // Merge by module name: discovered (manifests on disk) +
@@ -3020,6 +3059,8 @@ let mut bytes = Vec::new();
                                 entry["shutdown_at"] = serde_json::json!(s.shutdown_at);
                                 entry["alive"] = serde_json::json!(!s.unresponsive);
                                 entry["last_seen"] = serde_json::json!(s.last_activity_ms);
+                                entry["pending_prompt"] =
+                                    serde_json::json!(pending_prompts.contains(&s.module_name));
                             }
 
                             let mut list: Vec<serde_json::Value> = entries.into_values().collect();
@@ -3446,7 +3487,7 @@ Some(Payload::ModuleControl(_)) => {
                         let prompt = prompt.clone();
                         prompt_routes.lock().unwrap().insert(
                             prompt.prompt_id_uuid7.clone(),
-                            PromptSink::Module(tx.clone()),
+                            PromptSink::Module(module_name.clone(), tx.clone()),
                         );
                         let forward = Container {
                             version: 1,
@@ -3482,7 +3523,7 @@ Some(Payload::ModuleControl(_)) => {
                                     // oneshot send — non-blocking by construction.
                                     let _ = tx.send(resp.accepted);
                                 }
-                                PromptSink::Module(sender) => {
+                                PromptSink::Module(_origin, sender) => {
                                     let forward = Container {
                                         version: 1,
                                         auth_token: container.auth_token.clone(),
@@ -3586,7 +3627,7 @@ Some(Payload::ModuleControl(_)) => {
     {
         let mut routes = prompt_routes.lock().unwrap();
         routes.retain(|_, sink| match sink {
-            PromptSink::Module(tx) => !tx.is_closed(),
+            PromptSink::Module(_origin, tx) => !tx.is_closed(),
             PromptSink::Engine(_) => true,
         });
     }
