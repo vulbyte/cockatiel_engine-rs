@@ -15,7 +15,10 @@ use std::{
 };
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tokio_tungstenite::{accept_async, tungstenite::protocol::Message as WsMessage};
+use tokio_tungstenite::{
+    accept_async_with_config, tungstenite::protocol::{Message as WsMessage, WebSocketConfig},
+    WebSocketStream,
+};
 use uuid::Uuid;
 
 /* MODULES & CONFIG */
@@ -49,7 +52,7 @@ use credentials::{
 };
 
 mod pipeline;
-use pipeline::{PipelineConfig, PipelineOrchestrator};
+use pipeline::{PipelineConfig, PipelineOrchestrator, SendOutcome};
 
 mod user_db_client;
 use user_db_client::{SharedUserDbClient, UserDbClient, userdb_response_to_json};
@@ -172,6 +175,17 @@ impl EngineState {
             log_broadcast_tx: None,
         }
     }
+}
+
+/// Resource bounds for module connections, read from config once at startup:
+/// WS message size cap, max concurrent connections, and the handshake / send
+/// timeouts that keep a wedged socket from stalling a connection task forever.
+#[derive(Clone)]
+struct EngineBounds {
+    max_message_bytes: usize,
+    max_connections: usize,
+    handshake_timeout_secs: u64,
+    send_timeout_secs: u64,
 }
 
 pub fn log_event(state: &Arc<Mutex<EngineState>>, text: impl Into<String>) {
@@ -416,7 +430,7 @@ pub async fn engine_reply_to_platform(
     };
     for name in targets {
             let sent = crate::pipeline::send_to_module(&orchestrator.module_senders, name, container.clone(), "commands").await;
-            if sent {
+            if matches!(sent, SendOutcome::Sent) {
                 log_event_broadcast(&ui_state, format!("[Commands] reply '{}' -> {}", name, msg));
             }
         }
@@ -1593,6 +1607,10 @@ cockatiel
     // Secrets (PIN + JWT secret) come from `.env` (migrated out of a legacy
     // config.json that still carried them); config.json holds settings only.
     let jwt_secret = config::ensure_secrets(&config_state);
+    // Backfill any newly-added settings keys into config.json (they already
+    // resolved to code defaults in memory via #[serde(default)] — this makes
+    // them explicit and editable on disk).
+    config::backfill_config_defaults(&config_state);
     let auth_store = AuthStore::new(jwt_secret);
     let module_registry = ModuleRegistryPersistence::load(&config_state);
 
@@ -1791,10 +1809,21 @@ cockatiel
         cmd_registry.clone(),
     );
 
-    // Restart recovery: mark any 'processing' messages back to 'queued'
-    match db.mark_all_processing_as_queued().await {
+    // Normalize any TEXT-stored uuid7 rows to BLOB (all keyed queries bind
+    // bytes; a BLOB param never equals a TEXT column in SQLite). Do this
+    // before the recovery drain so stranded rows are found and progressed.
+    match db.normalize_uuid_storage().await {
+        Ok(n) if n > 0 => log_event_broadcast(&ui_state, format!("Recovery: normalized {} uuid columns to BLOB", n)),
+        _ => {}
+    }
+
+    // Restart recovery: any 'processing' rows were mid-flight when the engine
+    // died — they can never complete, so mark them failed. Stranded 'queued'
+    // rows (inserted but never started) are drained by the recovery task
+    // spawned below.
+    match db.mark_all_processing_as_failed("interrupted by engine restart").await {
         Ok(count) if count > 0 => {
-            log_event_broadcast(&ui_state, format!("Recovery: re-queued {} interrupted messages", count));
+            log_event_broadcast(&ui_state, format!("Recovery: marked {} interrupted messages failed", count));
         }
         _ => {}
     }
@@ -1848,6 +1877,37 @@ cockatiel
                     );
                 } else if !over && db_warned {
                     db_warned = false;
+                }
+            }
+        });
+    }
+
+    // Crash recovery: drain stranded 'queued' messages (rows the pipeline
+    // inserted but never broadcast — e.g. a crash between insert and start).
+    // Waits `recovery_grace_secs` so a live pipeline can claim them first; the
+    // get_config read happens once, before the task, not inside the loop.
+    {
+        let db = db.clone();
+        let orchestrator = orchestrator.clone();
+        let ui_state = ui_state.clone();
+        let grace = config::get_config(&config_state).recovery_grace_secs;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(grace)).await;
+            loop {
+                let uuids = match db.get_queued_uuids().await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        log_event_broadcast(&ui_state, format!("Recovery error: {}", e));
+                        break;
+                    }
+                };
+                if uuids.is_empty() {
+                    break;
+                }
+                for s in uuids {
+                    if let Err(e) = orchestrator.recover_one(&s).await {
+                        log_event_broadcast(&ui_state, format!("Recovery failed for {}: {}", s, e));
+                    }
                 }
             }
         });
@@ -1910,13 +1970,37 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
     // Per-IP failed-PIN throttle (5 strikes -> 60s lockout).
     let pin_gate = PinGate::default();
 
+    // Resource bounds read once from config: WS message size cap, connection
+    // ceiling, and the handshake/send timeouts. (recovery_grace_secs is read
+    // by the recovery task above.)
+    let bounds = EngineBounds {
+        max_message_bytes: config.max_message_bytes as usize,
+        max_connections: config.max_connections,
+        handshake_timeout_secs: config.handshake_timeout_secs,
+        send_timeout_secs: config.send_timeout_secs,
+    };
+    // Connection ceiling: each spawned connection holds one permit for its
+    // whole lifetime; when the ceiling is reached, new connections are dropped
+    // before the (expensive) TLS handshake instead of piling up.
+    let conn_sem = Arc::new(tokio::sync::Semaphore::new(bounds.max_connections));
+
     loop {
         let (stream, address) = listener.accept().await?;
+        // Refuse above the connection ceiling — drop the socket outright.
+        let permit = match conn_sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                log_event_broadcast(&ui_state, "Connection limit reached");
+                drop(stream);
+                continue;
+            }
+        };
         // Capture the peer before the TLS handshake (the TlsStream doesn't
         // expose peer_addr directly).
         let peer_loopback = is_loopback_addr(&address);
         let peer_ip = address.ip();
         let tls_acceptor = tls_acceptor.clone();
+        let bounds = bounds.clone();
         // Clone shared state per iteration so the async closure never moves
         // a variable still borrowed by the loop.
         let config_state = Arc::clone(&config_state);
@@ -1933,14 +2017,26 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
         let cmd_registry = Arc::clone(&cmd_registry);
         let pin_gate = pin_gate.clone();
         tokio::spawn(async move {
-            match tls_acceptor.accept(stream).await {
-                Ok(tls_stream) => {
+            // The permit is held for the connection's lifetime (dropping it
+            // frees a slot in the connection ceiling).
+            let _permit = permit;
+            // Bound the TLS handshake: a client that connects but never
+            // completes it must not squat a task (and a connection slot)
+            // forever.
+            match tokio::time::timeout(
+                Duration::from_secs(bounds.handshake_timeout_secs),
+                tls_acceptor.accept(stream),
+            )
+            .await
+            {
+                Ok(Ok(tls_stream)) => {
                     log_event_broadcast(&ui_state, format!("TLS connection from {}", address));
                     if let Err(error) = handle_connection(
                         tls_stream,
                         peer_loopback,
                         peer_ip,
                         pin_gate,
+                        bounds,
                         config_state,
                         modules,
                         ui_state.clone(),
@@ -1959,9 +2055,12 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
                         log_event_broadcast(&ui_state, format!("Connection error from {}: {}", address, error));
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     // Plain ws:// (or a bogus handshake) lands here.
                     log_event_broadcast(&ui_state, format!("Rejected non-TLS connection from {}: {}", address, e));
+                }
+                Err(_) => {
+                    log_event_broadcast(&ui_state, format!("TLS handshake timed out from {}", address));
                 }
             }
         });
@@ -2178,7 +2277,7 @@ pub async fn handle_test_probe(
         .map_err(|e| format!("probe encode failed: {}", e))?;
 
     let sent = crate::pipeline::send_to_module(&orchestrator.module_senders, &module, container, "test_probe").await;
-    if !sent {
+    if !matches!(sent, SendOutcome::Sent) {
         return Err(format!("module '{}' has no sender", module));
     }
 
@@ -2219,11 +2318,30 @@ pub async fn handle_test_probe(
 /// then detect it no longer owns the session and must not evict it.
 static NEXT_SOCKET_TOKEN: AtomicU64 = AtomicU64::new(1);
 
+/// Send a WebSocket message with a bounded wait so a wedged socket can't stall
+/// the connection task indefinitely. A timeout (or a send error) is treated as
+/// a send failure — callers decide whether to `?`/break and let cleanup run.
+async fn bounded_ws_send<S>(
+    websocket: &mut WebSocketStream<S>,
+    msg: WsMessage,
+    timeout_secs: u64,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), websocket.send(msg)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => Err("outbound WebSocket send timed out".into()),
+    }
+}
+
 async fn handle_connection<S>(
     stream: S,
     peer_loopback: bool,
     peer_ip: std::net::IpAddr,
     pin_gate: PinGate,
+    bounds: EngineBounds,
     config_state: Arc<Mutex<ConfigState>>,
     modules: Arc<Mutex<HashMap<String, ModuleInfo>>>,
     ui_state: Arc<Mutex<EngineState>>,
@@ -2241,16 +2359,31 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let socket_token = NEXT_SOCKET_TOKEN.fetch_add(1, Ordering::Relaxed);
-    let mut websocket = accept_async(stream).await?;
+    let mut websocket = accept_async_with_config(
+        stream,
+        Some(WebSocketConfig {
+            max_message_size: Some(bounds.max_message_bytes),
+            max_frame_size: Some(bounds.max_message_bytes),
+            ..Default::default()
+        }),
+    )
+    .await?;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Container>(64);
 
     // Loopback status is computed from the pre-TLS peer address (passed in) —
     // a TlsStream doesn't expose peer_addr directly.
 
     // ── Await ConnectionRequest ─────────────────────────────────────────
-    let first_msg = websocket.next().await;
-    let Some(first_msg) = first_msg else {
-        return Ok(());
+    // Bound the wait for the first message: a client that connects (TLS done)
+    // but never speaks must not squat the connection task (or a slot) forever.
+    let first_msg = match tokio::time::timeout(
+        Duration::from_secs(bounds.handshake_timeout_secs),
+        websocket.next(),
+    )
+    .await
+    {
+        Ok(Some(msg)) => msg,
+        Ok(None) | Err(_) => return Ok(()),
     };
     let first_msg = first_msg?;
     let WsMessage::Binary(data) = first_msg else {
@@ -2358,7 +2491,7 @@ where
             };
             let mut bytes = Vec::new();
             response.encode(&mut bytes)?;
-            websocket.send(WsMessage::Binary(bytes)).await?;
+            bounded_ws_send(&mut websocket, WsMessage::Binary(bytes), bounds.send_timeout_secs).await?;
             websocket.close(None).await?;
             return Ok(());
         }
@@ -2383,7 +2516,7 @@ where
             };
             let mut bytes = Vec::new();
             response.encode(&mut bytes)?;
-            websocket.send(WsMessage::Binary(bytes.into())).await?;
+            bounded_ws_send(&mut websocket, WsMessage::Binary(bytes), bounds.send_timeout_secs).await?;
             websocket.close(None).await?;
             return Ok(());
         }
@@ -2418,7 +2551,7 @@ where
             };
             let mut bytes = Vec::new();
             response.encode(&mut bytes)?;
-            websocket.send(WsMessage::Binary(bytes.into())).await?;
+            bounded_ws_send(&mut websocket, WsMessage::Binary(bytes), bounds.send_timeout_secs).await?;
             websocket.close(None).await?;
             return Ok(());
         }
@@ -2527,7 +2660,7 @@ where
             };
             let mut bytes = Vec::new();
             response.encode(&mut bytes)?;
-            websocket.send(WsMessage::Binary(bytes.into())).await?;
+            bounded_ws_send(&mut websocket, WsMessage::Binary(bytes), bounds.send_timeout_secs).await?;
             websocket.close(None).await?;
             return Ok(());
         }
@@ -2590,7 +2723,7 @@ where
         };
 let mut bytes = Vec::new();
         response.encode(&mut bytes)?;
-        websocket.send(WsMessage::Binary(bytes.into())).await?;
+        bounded_ws_send(&mut websocket, WsMessage::Binary(bytes), bounds.send_timeout_secs).await?;
     }
 
     let instance_uuid7 = assigned_uuid;
@@ -3148,8 +3281,10 @@ let targets: Vec<&str> = match send.platform.as_str() {
                         };
                         for name in targets {
                             let sent = crate::pipeline::send_to_module(&orchestrator.module_senders, name, forward.clone(), "SendToPlatforms").await;
-                            if sent {
+                            if matches!(sent, SendOutcome::Sent) {
                                 log_event_broadcast(&ui_state, format!("[SendToPlatforms] '{}' -> {}", container.module_name, name));
+                            } else if matches!(sent, SendOutcome::Dropped) {
+                                log_event_broadcast(&ui_state, format!("[SendToPlatforms] adapter '{}' dropped (channel full)", name));
                             } else {
                                 log_event_broadcast(&ui_state, format!("[SendToPlatforms] adapter '{}' not connected", name));
                             }
@@ -3225,7 +3360,7 @@ Some(Payload::ModuleControl(_)) => {
                                 )),
                             };
                             let sent = crate::pipeline::send_to_module(&orchestrator.module_senders, &owner, forward, "command").await;
-                            if sent {
+                            if matches!(sent, SendOutcome::Sent) {
                                 log_event_broadcast(
                                     &ui_state,
                                     format!(
@@ -3233,6 +3368,14 @@ Some(Payload::ModuleControl(_)) => {
                                         module_name,
                                         command.command_name,
                                         owner
+                                    ),
+                                );
+                            } else if matches!(sent, SendOutcome::Dropped) {
+                                log_event_broadcast(
+                                    &ui_state,
+                                    format!(
+                                        "[Commands] owner '{}' of '{}' dropped (channel full)",
+                                        owner, command.command_name
                                     ),
                                 );
                             } else {
@@ -3376,7 +3519,7 @@ Some(Payload::ModuleControl(_)) => {
                 let mut bytes = Vec::new();
                 outbound.encode(&mut bytes)?;
 
-                if websocket.send(WsMessage::Binary(bytes.into())).await.is_err() {
+                if bounded_ws_send(&mut websocket, WsMessage::Binary(bytes), bounds.send_timeout_secs).await.is_err() {
                     break;
                 }
             }

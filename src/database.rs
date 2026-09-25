@@ -45,6 +45,20 @@ pub struct DatabaseConfig {
     pub local_target_mb: u32,
 }
 
+/// The content of a queued (never-started) timeline row, enough to rebuild a
+/// pipeline message after a crash. NOTE: `channel_id`, `user_data` and the
+/// parsed `Command` are NOT persisted on the timeline row — a recovered message
+/// runs without them.
+#[derive(Debug, Clone)]
+pub struct QueuedMessage {
+    pub event_type: i32,
+    pub platform: String,
+    pub raw_message: String,
+    pub command: String,
+    pub flags: String,
+    pub user_uuid7: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct DatabaseManager {
     config: DatabaseConfig,
@@ -614,16 +628,115 @@ impl DatabaseManager {
         run.await.map_err(|e: Box<dyn std::error::Error>| e.to_string())
     }
 
-    pub async fn mark_all_processing_as_queued(&self) -> Result<u64, Box<dyn std::error::Error>> {
+    /// Mark every 'processing' row as failed with the given reason. Called on
+    /// restart: mid-flight messages can never complete (the process that was
+    /// running them is gone), so they must not be left 'processing' forever.
+    /// Returns the number of rows updated.
+    pub async fn mark_all_processing_as_failed(&self, reason: &str) -> Result<u64, Box<dyn std::error::Error>> {
         let conn = self.local.lock().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         let result = conn.execute(
-            "UPDATE timeline_events SET pipeline_status = 'queued' WHERE pipeline_status = 'processing'",
-            (),
+            "UPDATE timeline_events SET pipeline_status = 'failed', error_message = ?1 WHERE pipeline_status = 'processing'",
+            turso::params![reason],
         ).await?;
 
         Ok(result as u64)
+    }
+
+    /// Load a queued row's content by uuid7, if it is still `pipeline_status =
+    /// 'queued'`. Returns None when the row is missing or already claimed by a
+    /// live pipeline (moved off 'queued').
+    pub async fn load_queued_message(&self, uuid7: &[u8]) -> Result<Option<QueuedMessage>, Box<dyn std::error::Error>> {
+        let conn = self.local.lock().await;
+        let conn = conn.as_ref().ok_or("Local database not initialized")?;
+
+        let mut rows = conn.query(
+            "SELECT event_type, platform, raw_message, command, flags, user_uuid7 FROM timeline_events WHERE uuid7 = ?1 AND pipeline_status = 'queued'",
+            turso::params![uuid7],
+        ).await?;
+
+        if let Some(row) = rows.next().await? {
+            let event_type: i32 = row.get(0)?;
+            let platform: Option<String> = row.get(1)?;
+            let raw_message: String = row.get(2)?;
+            let command: Option<String> = row.get(3)?;
+            let flags: Option<String> = row.get(4)?;
+            let user_uuid7: Option<String> = row.get(5)?;
+            Ok(Some(QueuedMessage {
+                event_type,
+                platform: platform.unwrap_or_default(),
+                raw_message,
+                command: command.unwrap_or_default(),
+                flags: flags.unwrap_or_default(),
+                user_uuid7: user_uuid7.unwrap_or_default(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Every uuid7 currently `pipeline_status = 'queued'`, in ascending uuid7
+    /// order — the crash-recovery drain set.
+    /// Uuids of every stranded 'queued' row, oldest first. The uuid7 column may be
+    /// stored as BLOB or TEXT depending on how the row was inserted (turso's
+    /// `FromValue for Vec<u8>` only accepts BLOB and `String` only TEXT, so
+    /// neither alone is safe) — use `get_value` and decode both.
+    pub async fn get_queued_uuids(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let conn = self.local.lock().await;
+        let conn = conn.as_ref().ok_or("Local database not initialized")?;
+
+        let mut rows = conn.query(
+            "SELECT uuid7 FROM timeline_events WHERE pipeline_status = 'queued' ORDER BY uuid7 ASC",
+            (),
+        ).await?;
+
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let uuid7: turso::Value = row.get_value(0)?;
+            let uuid = match uuid7 {
+                turso::Value::Text(t) => t,
+                turso::Value::Blob(b) => String::from_utf8_lossy(&b).to_string(),
+                _ => continue,
+            };
+            results.push(uuid);
+        }
+
+        Ok(results)
+    }
+
+    /// Normalize uuid7 storage to BLOB. Historical rows (e.g. direct SQL
+    /// inserts with a string, or older writers) can store the uuid as TEXT;
+    /// every keyed read/write in the pipeline binds the uuid as bytes (BLOB),
+    /// and SQLite's type rules mean a BLOB param never equals a TEXT column.
+    /// Re-write those rows as BLOB so all byte-keyed queries (status updates,
+    /// stage completion, recovery) work on them. Returns rows normalized.
+    pub async fn normalize_uuid_storage(&self) -> Result<u64, Box<dyn std::error::Error>> {
+        let conn = self.local.lock().await;
+        let conn = conn.as_ref().ok_or("Local database not initialized")?;
+
+        let mut rows = conn.query(
+            "SELECT uuid7 FROM timeline_events WHERE typeof(uuid7) = 'text'",
+            (),
+        ).await?;
+        let mut text_uuids: Vec<String> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let v: turso::Value = row.get_value(0)?;
+            if let turso::Value::Text(t) = v {
+                text_uuids.push(t);
+            }
+        }
+
+        let mut normalized = 0u64;
+        for u in text_uuids {
+            // Match the TEXT row by string; set the same bytes as a BLOB.
+            conn.execute(
+                "UPDATE timeline_events SET uuid7 = ?1 WHERE uuid7 = ?2 AND typeof(uuid7) = 'text'",
+                turso::params![u.as_bytes(), u.as_str()],
+            ).await?;
+            normalized += 1;
+        }
+        Ok(normalized)
     }
 
     // ── Audit (held-for-review messages) ───────────────────────────────

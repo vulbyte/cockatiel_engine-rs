@@ -14,36 +14,58 @@ fn uuid7_string_to_bytes(s: &str) -> Vec<u8> {
     s.as_bytes().to_vec()
 }
 
+/// The outcome of a bounded, non-wedging send to a module. Distinguishes a
+/// module that simply isn't connected (no sender slot) from a connected module
+/// whose outbound queue is full (the container was dropped) — so callers can
+/// tell a genuine drop apart from a missing peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendOutcome {
+    /// A sender existed and the container was queued (try_send or timed send).
+    Sent,
+    /// No sender exists for the module (it is not connected).
+    NotConnected,
+    /// A sender existed but its channel was full and the timed send fell
+    /// through — the container was dropped.
+    Dropped,
+}
+
 /// Bounded, non-wedging send to a connected module. Clones the sender out of
 /// the shared `module_senders` lock (so the lock is never held across the
 /// send), `try_send`s first, and only falls back to a short timeout send when
 /// the channel is full — a module that isn't draining its socket must not
 /// stall the liveness watchdog or the routing lock for every other module.
-/// Returns whether a sender existed (i.e. the module was connected).
+/// A missing sender slot yields `NotConnected`; a closed channel is treated as
+/// not connected too (the module is gone even if its slot lingers); a full
+/// channel that never frees up yields `Dropped`.
 pub(crate) async fn send_to_module(
     senders: &Arc<Mutex<HashMap<String, mpsc::Sender<Container>>>>,
     module_name: &str,
     container: Container,
     label: &str,
-) -> bool {
+) -> SendOutcome {
     let sender = {
         let senders = senders.lock().await;
         senders.get(module_name).cloned()
     };
     let Some(sender) = sender else {
-        return false;
+        return SendOutcome::NotConnected;
     };
+    // A closed channel means the module's socket is gone even though its sender
+    // slot still lingers in the map — report NotConnected, not Dropped.
+    if sender.is_closed() {
+        return SendOutcome::NotConnected;
+    }
     if sender.try_send(container.clone()).is_ok() {
-        return true;
+        return SendOutcome::Sent;
     }
     if tokio::time::timeout(Duration::from_millis(1000), sender.send(container)).await.is_ok() {
-        return true;
+        return SendOutcome::Sent;
     }
     eprintln!(
         "[engine] dropped send to '{}' ({}) — channel full >1s",
         module_name, label
     );
-    true
+    SendOutcome::Dropped
 }
 
 fn uuid7_string() -> Option<String> {
@@ -332,6 +354,54 @@ impl PipelineOrchestrator {
         Ok(())
     }
 
+    /// Re-process a message that was stranded in the queue: a crash between the
+    /// timeline insert and the first broadcast left the row 'queued' with no
+    /// live task ever going to drain it. Reloads the row, rebuilds a fresh
+    /// pipeline state, marks it 'processing' and runs it through pre-process.
+    /// NOTE: a recovered message loses `channel_id`, `user_data` and the
+    /// engine-parsed `command` — those are never persisted on the timeline row,
+    /// so recovery cannot reconstruct them. Messages that pass through a
+    /// command flag still classify on ingest (if an adapter re-sends them); a
+    /// recovered row only has the stored raw message.
+    pub async fn recover_one(&self, uuid7: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let uuid7_bytes = uuid7_string_to_bytes(uuid7);
+
+        let Some(msg) = self.db.load_queued_message(&uuid7_bytes).await? else {
+            // Row missing or already claimed by a live pipeline — nothing to do.
+            return Ok(());
+        };
+
+        let state = PipelineState {
+            uuid7: uuid7.to_string(),
+            stage: PipelineStage::PreProcessing,
+            current_in_process_index: 0,
+            raw_message: msg.raw_message.clone(),
+            processed_message: msg.raw_message.clone(),
+            platform: msg.platform.clone(),
+            event_type: msg.event_type,
+            command: if msg.command.is_empty() { None } else { Some(msg.command.clone()) },
+            flags: if msg.flags.is_empty() { None } else { Some(msg.flags.clone()) },
+            parsed_command: None,
+            channel_id: String::new(),
+            user_uuid7: msg.user_uuid7.clone(),
+            user_data: None,
+            audio: Vec::new(),
+            audio_type: String::new(),
+            audio_stage: String::new(),
+        };
+
+        {
+            let mut states = self.pipeline_states.lock().await;
+            states.insert(uuid7.to_string(), state);
+        }
+
+        self.db.set_pipeline_status(&uuid7_bytes, "processing").await?;
+
+        self.broadcast_pre_process(uuid7).await?;
+
+        Ok(())
+    }
+
     async fn broadcast_pre_process(
         &self,
         uuid7: &str,
@@ -398,15 +468,23 @@ impl PipelineOrchestrator {
 
         let mut sent_any = false;
         for module_name in recipients {
-            let sent = send_to_module(&self.module_senders, module_name, container.clone(), "pre_process").await;
-            if sent {
-                sent_any = true;
-                ack_guard.track(
-                    uuid7.to_string(),
-                    "pre_process".into(),
-                    module_name.clone(),
-                    cfg.ack_timeout_ms,
-                );
+            match send_to_module(&self.module_senders, module_name, container.clone(), "pre_process").await {
+                SendOutcome::Sent => {
+                    sent_any = true;
+                    ack_guard.track(
+                        uuid7.to_string(),
+                        "pre_process".into(),
+                        module_name.clone(),
+                        cfg.ack_timeout_ms,
+                    );
+                }
+                SendOutcome::Dropped => {
+                    eprintln!(
+                        "[engine] dropped send to '{}' (pre_process) — channel full >1s",
+                        module_name
+                    );
+                }
+                SendOutcome::NotConnected => {}
             }
         }
         drop(ack_guard);
@@ -474,30 +552,40 @@ impl PipelineOrchestrator {
         };
 
         let sent = send_to_module(&self.module_senders, module_name, container, "in_process").await;
-        if sent {
-            self.ack_tracker.lock().await.track(
-                uuid7.to_string(),
-                "in_process".into(),
-                module_name.clone(),
-                cfg.ack_timeout_ms,
-            );
-        } else {
-            // The configured in-process module isn't connected — nothing will
-            // ever ack this stage. Skip to the next stage so the message
-            // doesn't hang in `pipeline_states` forever.
-            let next_index = {
-                let mut states = self.pipeline_states.lock().await;
-                if let Some(state) = states.get_mut(uuid7) {
-                    state.current_in_process_index += 1;
-                    state.current_in_process_index
-                } else {
-                    return Ok(());
+        match sent {
+            SendOutcome::Sent => {
+                self.ack_tracker.lock().await.track(
+                    uuid7.to_string(),
+                    "in_process".into(),
+                    module_name.clone(),
+                    cfg.ack_timeout_ms,
+                );
+            }
+            _ => {
+                // The configured in-process module isn't connected (or its
+                // channel is full — nothing will ever ack this stage). Skip to
+                // the next stage so the message doesn't hang in
+                // `pipeline_states` forever.
+                if sent == SendOutcome::Dropped {
+                    eprintln!(
+                        "[engine] dropped send to '{}' (in_process) — channel full >1s",
+                        module_name
+                    );
                 }
-            };
-            if next_index >= cfg.in_process_modules.len() {
-                self.start_post_process(uuid7).await?;
-            } else {
-                Box::pin(self.start_in_process(uuid7)).await?;
+                let next_index = {
+                    let mut states = self.pipeline_states.lock().await;
+                    if let Some(state) = states.get_mut(uuid7) {
+                        state.current_in_process_index += 1;
+                        state.current_in_process_index
+                    } else {
+                        return Ok(());
+                    }
+                };
+                if next_index >= cfg.in_process_modules.len() {
+                    self.start_post_process(uuid7).await?;
+                } else {
+                    Box::pin(self.start_in_process(uuid7)).await?;
+                }
             }
         }
 
@@ -559,15 +647,23 @@ impl PipelineOrchestrator {
 
         let mut sent_any = false;
         for module_name in &cfg.post_process_modules {
-            let sent = send_to_module(&self.module_senders, module_name, container.clone(), "post_process").await;
-            if sent {
-                self.ack_tracker.lock().await.track(
-                    uuid7.to_string(),
-                    "post_process".into(),
-                    module_name.clone(),
-                    cfg.ack_timeout_ms,
-                );
-                sent_any = true;
+            match send_to_module(&self.module_senders, module_name, container.clone(), "post_process").await {
+                SendOutcome::Sent => {
+                    self.ack_tracker.lock().await.track(
+                        uuid7.to_string(),
+                        "post_process".into(),
+                        module_name.clone(),
+                        cfg.ack_timeout_ms,
+                    );
+                    sent_any = true;
+                }
+                SendOutcome::Dropped => {
+                    eprintln!(
+                        "[engine] dropped send to '{}' (post_process) — channel full >1s",
+                        module_name
+                    );
+                }
+                SendOutcome::NotConnected => {}
             }
         }
 

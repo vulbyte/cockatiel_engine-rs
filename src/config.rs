@@ -42,6 +42,30 @@ pub struct Config {
     /// Headless module-approval policy: "auto-deny" (default) or "auto-allow".
     #[serde(default = "default_approval_policy")]
     pub module_approval_policy: String,
+
+    /// Maximum size (bytes) of a single WebSocket message/frame the engine
+    /// will accept from a module connection. Defaults to 16 MB.
+    #[serde(default = "default_max_message_bytes")]
+    pub max_message_bytes: u64,
+
+    /// Maximum number of concurrent module/TUI connections. Defaults to 128.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+
+    /// Seconds a connection has to complete its TLS handshake and send its
+    /// first (ConnectionRequest) message before it is dropped. Defaults to 10.
+    #[serde(default = "default_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
+
+    /// Seconds a WebSocket outbound send may block before it is treated as a
+    /// send failure. Defaults to 5.
+    #[serde(default = "default_send_timeout_secs")]
+    pub send_timeout_secs: u64,
+
+    /// Seconds the engine waits after startup before draining stranded
+    /// 'queued' messages from the timeline DB. Defaults to 10.
+    #[serde(default = "default_recovery_grace_secs")]
+    pub recovery_grace_secs: u64,
 }
 
 fn default_probe_interval_secs() -> u64 {
@@ -58,6 +82,26 @@ fn default_probe_response_secs() -> u64 {
 
 fn default_approval_policy() -> String {
     "auto-deny".to_string()
+}
+
+fn default_max_message_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+fn default_max_connections() -> usize {
+    128
+}
+
+fn default_handshake_timeout_secs() -> u64 {
+    10
+}
+
+fn default_send_timeout_secs() -> u64 {
+    5
+}
+
+fn default_recovery_grace_secs() -> u64 {
+    10
 }
 
 pub struct ConfigState {
@@ -218,6 +262,47 @@ pub fn get_pin(state: &Arc<Mutex<ConfigState>>) -> u32 {
     state.lock().unwrap().pin
 }
 
+/// Startup backfill (house convention): write any NEW config keys into
+/// config.json with their code defaults so they are explicit and editable on
+/// disk. Missing keys already resolve to the same defaults in memory via
+/// `#[serde(default)]`; this only persists them. All other keys are preserved
+/// untouched, and the file is only rewritten (atomically) when something was
+/// actually added.
+pub fn backfill_config_defaults(state: &Arc<Mutex<ConfigState>>) {
+    let cfg_path = state.lock().unwrap().path.clone();
+    let Ok(data) = fs::read_to_string(&cfg_path) else {
+        return;
+    };
+    let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&data) else {
+        return;
+    };
+    let obj = match root.as_object_mut() {
+        Some(obj) => obj,
+        None => return,
+    };
+
+    let mut changed = false;
+    let defaults: [(&str, serde_json::Value); 5] = [
+        ("max_message_bytes", serde_json::json!(default_max_message_bytes())),
+        ("max_connections", serde_json::json!(default_max_connections())),
+        ("handshake_timeout_secs", serde_json::json!(default_handshake_timeout_secs())),
+        ("send_timeout_secs", serde_json::json!(default_send_timeout_secs())),
+        ("recovery_grace_secs", serde_json::json!(default_recovery_grace_secs())),
+    ];
+    for (key, value) in defaults {
+        if obj.get(key).is_none() {
+            obj.insert(key.to_string(), value);
+            changed = true;
+        }
+    }
+
+    if changed {
+        if let Ok(pretty) = serde_json::to_string_pretty(&root) {
+            let _ = write_atomic(&cfg_path, &pretty);
+        }
+    }
+}
+
 pub fn create_config(directory: PathBuf) -> Result<String, String> {
     let target = directory.join("config.json");
 
@@ -239,7 +324,12 @@ pub fn create_config(directory: PathBuf) -> Result<String, String> {
     "postprocessModules": [],
     "module_probe_interval_secs": 30,
     "module_probe_response_secs": 15,
-    "module_approval_policy": "auto-deny"
+    "module_approval_policy": "auto-deny",
+    "max_message_bytes": 16777216,
+    "max_connections": 128,
+    "handshake_timeout_secs": 10,
+    "send_timeout_secs": 5,
+    "recovery_grace_secs": 10
 }"#
     .to_string();
 

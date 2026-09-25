@@ -7,3 +7,6 @@ mod auth_tests;
 mod command_tests;
 mod sql_tests;
 mod ack_tests;
+mod pipeline_tests;
+mod db_tests;
+mod config_tests;
