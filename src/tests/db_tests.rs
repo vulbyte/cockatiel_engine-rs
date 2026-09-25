@@ -70,3 +70,48 @@ async fn get_queued_uuids_is_ordered_ascending() {
         vec![String::from_utf8(a).unwrap(), String::from_utf8(b).unwrap()]
     );
 }
+
+/// sync_to_remote must produce a portable backup file that survives repeated
+/// calls, and the backup must contain the inserted event when re-opened as a
+/// fresh DatabaseManager. Also guards the destroy-then-rename regression: a
+/// second sync over an existing backup must not clobber it.
+#[tokio::test]
+async fn sync_to_remote_writes_a_consistent_reusable_backup() {
+    let dir = std::env::temp_dir().join(format!("cockatiel-backup-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let local_path = dir.join("cockatiel_data_test.db");
+    let backup_path = dir.join("cockatiel_backup_test.db");
+
+    let db = DatabaseManager::new(DatabaseConfig {
+        local_path: local_path.clone(),
+        remote_url: Some(backup_path.to_string_lossy().into_owned()),
+        sync_interval_secs: 15,
+        local_target_mb: 50,
+    });
+    db.initialize().await.unwrap();
+
+    let uuid = b"sync-backup-uuid-000001".to_vec();
+    db.insert_event(&uuid, 1, "twitch", &[], "backup me", "!test", "{}").await.unwrap();
+
+    // First sync creates the backup; a second sync over it must succeed and
+    // leave the file present (no destroy-then-rename window).
+    assert_eq!(db.sync_to_remote().await.unwrap(), 1);
+    assert!(backup_path.exists(), "backup file must exist after first sync");
+    assert_eq!(db.sync_to_remote().await.unwrap(), 1);
+    assert!(backup_path.exists(), "backup file must survive a second sync");
+
+    // The backup is a real DB: re-open it as a fresh manager and find the event.
+    let restored = DatabaseManager::new(DatabaseConfig {
+        local_path: backup_path.clone(),
+        remote_url: None,
+        sync_interval_secs: 15,
+        local_target_mb: 50,
+    });
+    restored.initialize().await.unwrap();
+    let json = restored.get_event_as_json(&uuid).await.unwrap().expect("backup must contain the synced event");
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["raw_message"], "backup me");
+    assert_eq!(v["command"], "!test");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

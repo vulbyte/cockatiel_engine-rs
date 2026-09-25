@@ -444,6 +444,21 @@ pub fn add_module_to_config(
     priority: i32,
 ) {
     update_config(config_state, |config| {
+        // A module lives in ONE stage. If its placement changed (e.g. an
+        // adapter re-registered into `inputs` per its manifest after a legacy
+        // `preprocess` registration), remove it from the OTHER stage lists so
+        // it doesn't stay in the pre/in/post fanout forever.
+        for (label, list) in [
+            ("input", &mut config.inputs),
+            ("preprocess", &mut config.preprocess_modules),
+            ("inprocess", &mut config.inprocess_modules),
+            ("postprocess", &mut config.postprocess_modules),
+        ] {
+            if label != position {
+                list.retain(|entry| entry.name != name);
+            }
+        }
+
         let list = match position {
             "input" => &mut config.inputs,
             "preprocess" => &mut config.preprocess_modules,

@@ -110,6 +110,13 @@ impl DatabaseManager {
                             "[Database] local DB unavailable — restoring from backup {}",
                             bp
                         );
+                        // A stale -wal/-shm for the corrupt local DB would be
+                        // re-applied over the restored file — drop them
+                        // (best-effort) before copying so the restored snapshot
+                        // is clean.
+                        let local_path = self.config.local_path.to_string_lossy();
+                        let _ = std::fs::remove_file(format!("{}-wal", local_path));
+                        let _ = std::fs::remove_file(format!("{}-shm", local_path));
                         if std::fs::copy(backup_file, &self.config.local_path).is_ok() {
                             Self::open_local(&self.config.local_path).await?
                         } else {
@@ -880,9 +887,15 @@ impl DatabaseManager {
 
         let conn = self.local.lock().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
-        // Merge the WAL so the copy is authoritative.
+        // Merge the WAL so the copy is authoritative — but only when a -wal
+        // file actually exists for the local DB (checkpointing a missing WAL
+        // should not fail the backup). Best-effort either way: a failed
+        // checkpoint must never fail the backup.
         // (PRAGMA returns a result row — drain it so the driver doesn't error.)
-        if let Ok(mut stmt) = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await {
+        let wal_path = format!("{}-wal", self.config.local_path.to_string_lossy());
+        if std::path::Path::new(&wal_path).exists()
+            && let Ok(mut stmt) = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await
+        {
             while let Ok(Some(_)) = stmt.next().await {}
         }
 
@@ -891,9 +904,12 @@ impl DatabaseManager {
         let _ = std::fs::remove_file(&tmp);
         std::fs::copy(&self.config.local_path, &tmp)
             .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
-        drop(conn);
+        // Drop the borrowed connection reference (the MutexGuard itself was
+        // already released when `conn` was shadowed) before the atomic rename.
+        let _ = conn;
 
-        let _ = std::fs::remove_file(bp);
+        // POSIX rename() atomically replaces an existing target — never delete
+        // the last good backup before the new snapshot lands.
         std::fs::rename(&tmp, bp).map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
         Ok(1)
     }

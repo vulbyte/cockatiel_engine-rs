@@ -232,13 +232,29 @@ fn process_position_to_string(pos: ProcessPosition) -> String {
     .to_string()
 }
 
+/// Normalize a module manifest `capabilities` string to a canonical pipeline
+/// stage name ("input"/"preprocess"/"inprocess"/"postprocess"). Known aliases
+/// map to their stage; anything unrecognized is returned trimmed+lowercased
+/// as-is so callers can tell it apart from a real stage.
+fn normalize_capability(cap: &str) -> String {
+    match cap.trim().to_lowercase().as_str() {
+        "input" | "inputs" | "connection" => "input",
+        "preprocess" | "pre" => "preprocess",
+        "inprocess" | "process" => "inprocess",
+        "postprocess" | "output" | "outputs" | "display" | "post" => "postprocess",
+        other => other,
+    }
+    .to_string()
+}
+
 /// Best-effort startup warning when a module's manifest `capabilities`
-/// (discovered_registry) disagree with the `process_position` it requested at
-/// connect/approval time. Log-only — the module is still approved; the operator
-/// can move it in config.json.
+/// (discovered_registry) normalizes to something OTHER than a known pipeline
+/// stage. Known-stage capabilities are already honored by the approval-time
+/// override in the connection flow (which trusts the manifest over the
+/// requested process_position), so only genuinely unrecognized capabilities
+/// warn here. Log-only — the module is still approved.
 fn warn_stage_capability_mismatch(
     module_name: &str,
-    position: &str,
     discovered_registry: &Arc<Mutex<ModuleRegistry>>,
     ui_state: &Arc<Mutex<EngineState>>,
 ) {
@@ -251,21 +267,16 @@ fn warn_stage_capability_mismatch(
     if capability.is_empty() {
         return;
     }
-    // Normalize capability aliases ("output"/"display" are postprocess, etc.)
-    // so only genuine stage disagreements warn.
-    let normalized = match capability.as_str() {
-        "input" | "inputs" | "connection" => "input",
-        "preprocess" | "pre" => "preprocess",
-        "inprocess" | "process" => "inprocess",
-        "postprocess" | "output" | "outputs" | "display" | "post" => "postprocess",
-        other => other,
-    };
-    if normalized != position {
+    let normalized = normalize_capability(&capability);
+    if !matches!(
+        normalized.as_str(),
+        "input" | "preprocess" | "inprocess" | "postprocess"
+    ) {
         log_event_broadcast(
             ui_state,
             format!(
-                "WARN: module '{}' manifests capability '{}' but requested stage '{}' — verify config.json pipeline placement",
-                module_name, capability, position
+                "WARN: module '{}' manifests unrecognized capability '{}' — verify config.json pipeline placement",
+                module_name, capability
             ),
         );
     }
@@ -2558,8 +2569,41 @@ where
 
         module_name = container.module_name.clone();
         let requested_uuid = request.module_instance_uuid7.clone();
-        let position = process_position_to_string(ProcessPosition::try_from(request.process_position).unwrap_or(ProcessPosition::Unspecified));
+        let mut position = process_position_to_string(ProcessPosition::try_from(request.process_position).unwrap_or(ProcessPosition::Unspecified));
         let priority = request.priority as i32;
+
+        // Trust the NORMALIZED manifest capability over the requested
+        // process_position at approval time: adapters (twitch/kick/youtube/
+        // discord) declare `capabilities: "input"` in their manifests while
+        // their client config requests process_position=Preprocess, which
+        // would otherwise land them in preprocessModules (redundantly with
+        // inputs) and spam the stage-mismatch warning on every boot. When the
+        // manifest declares a known stage, that stage wins for the registration
+        // (AuthSession, module_registry, config.json). Unknown/empty
+        // capabilities keep the requested position.
+        let requested_position = position.clone();
+        let manifest_capability = discovered_registry
+            .lock()
+            .unwrap()
+            .get(&module_name)
+            .map(|m| m.manifest.capabilities.trim().to_lowercase())
+            .unwrap_or_default();
+        if !manifest_capability.is_empty() {
+            let manifest_position = normalize_capability(&manifest_capability);
+            if matches!(
+                manifest_position.as_str(),
+                "input" | "preprocess" | "inprocess" | "postprocess"
+            ) {
+                position = manifest_position;
+                log_event_broadcast(
+                    &ui_state,
+                    format!(
+                        "[{}] registered as {} (manifest capability) instead of requested {}",
+                        module_name, position, requested_position
+                    ),
+                );
+            }
+        }
 
         assigned_uuid = {
             let mods = modules.lock().unwrap();
@@ -2698,7 +2742,7 @@ where
         });
 
         config::add_module_to_config(&config_state, &module_name, &position, priority);
-        warn_stage_capability_mismatch(&module_name, &position, &discovered_registry, &ui_state);
+        warn_stage_capability_mismatch(&module_name, &discovered_registry, &ui_state);
 
         log_event_broadcast(&ui_state, format!("Approved: {} on {}", module_name, position));
         log_to_timeline(
