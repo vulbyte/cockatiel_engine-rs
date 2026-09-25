@@ -2506,6 +2506,26 @@ where
                 socket_token,
             });
         }
+
+        // Ack the handshake exactly like the PIN path does: a reconnecting
+        // client (the TUI reconnects with its persisted token + uuid) waits for
+        // a ConnectionRequestReturn before entering its read loop. Without it,
+        // the TUI's handshake never completes and it reconnects forever.
+        let response = Container {
+            version: 1,
+            auth_token: container.auth_token.clone(),
+            module_name: "cockatiel".into(),
+            module_instance_uuid7: assigned_uuid.clone(),
+            payload: Some(Payload::ConnectionRequestReturn(
+                cockatiel_protobuf::ConnectionRequestReturn {
+                    new_port: 0,
+                    module_instance_uuid7: assigned_uuid.clone(),
+                },
+            )),
+        };
+        let mut bytes = Vec::new();
+        response.encode(&mut bytes)?;
+        bounded_ws_send(&mut websocket, WsMessage::Binary(bytes), bounds.send_timeout_secs).await?;
     } else {
         // New connection: validate PIN (throttled per peer IP — 5 consecutive
         // failures lock the address out for 60s to blunt brute-force).
@@ -3605,6 +3625,10 @@ Some(Payload::ModuleControl(_)) => {
                 outbound.encode(&mut bytes)?;
 
                 if bounded_ws_send(&mut websocket, WsMessage::Binary(bytes), bounds.send_timeout_secs).await.is_err() {
+                    log_event_broadcast(&ui_state, format!(
+                        "Connection to '{}' dropped: outbound send failed/timed out ({}s)",
+                        module_name, bounds.send_timeout_secs
+                    ));
                     break;
                 }
             }
@@ -3612,6 +3636,10 @@ Some(Payload::ModuleControl(_)) => {
                 // The probe task flagged this session as unresponsive —
                 // close it so the disconnect cleanup below runs.
                 if killed.is_ok() && *kill_rx.borrow() {
+                    log_event_broadcast(&ui_state, format!(
+                        "Connection to '{}' dropped: probe flagged unresponsive",
+                        module_name
+                    ));
                     break;
                 }
             }
