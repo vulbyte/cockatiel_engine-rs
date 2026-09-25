@@ -168,12 +168,17 @@ pub fn ensure_secrets(state: &Arc<Mutex<ConfigState>>) -> String {
     let pin = pin.unwrap_or_else(|| (100000 + (Uuid::new_v4().as_u128() % 900000) as u32));
     let secret = secret.unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    // 4. Persist to `.env` (owner-only).
+    // 4. Persist to `.env` (owner-only). Secrets are generated when missing;
+    //    settings are written with their code-default so they are present and
+    //    editable in place (a real environment variable always wins at load).
     write_env_file(
         &dir,
         &[
             ("COCKATIEL_PIN", &pin.to_string()),
             ("COCKATIEL_JWT_SECRET", &secret),
+            ("COCKATIEL_BIND_IP", "127.0.0.1"),
+            ("USER_DB_HOST", "127.0.0.1"),
+            ("USER_DB_PORT", "9736"),
         ],
     );
 
