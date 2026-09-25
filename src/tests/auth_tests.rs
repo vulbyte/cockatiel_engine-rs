@@ -41,7 +41,10 @@ fn control_surface_and_trusted_roles() {
 
     assert!(is_always_trusted("cockatiel-tui"));
     assert!(is_always_trusted("cockatiel-test-runner"));
-    assert!(is_always_trusted("cockatiel-audit-viewer"));
+    // audit-viewer is NOT always-trusted: it uses the client SDK (fresh uuid
+    // per connect), so it auto-approves by name like any registered module
+    // instead of needing the pinned control-surface uuid.
+    assert!(!is_always_trusted("cockatiel-audit-viewer"));
     assert!(!is_always_trusted("twitch-adapter"));
 
     assert!(is_test_runner("cockatiel-test-runner"));

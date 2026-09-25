@@ -1154,9 +1154,12 @@ fn is_always_trusted(name: &str) -> bool {
     name == "cockatiel-tui"
         || name == "cockatiel-tui-child"
         || name == "cockatiel-test-runner"
-        // Read-only audit/display viewer — trusted so it never blocks on an
-        // approval prompt.
-        || name == "cockatiel-audit-viewer"
+    // NOTE: cockatiel-audit-viewer is intentionally NOT always-trusted. It
+    // connects via the client SDK, which performs a first-contact handshake
+    // with a fresh instance uuid on every connect — and the control-surface
+    // auto-approve now requires the pinned uuid. As a read-only viewer it
+    // doesn't need that status: it auto-approves by name like any registered
+    // module (modules.json auto_auth), so it reconnects without a prompt.
 }
 
 /// True when a socket address is on the loopback interface (127.0.0.1/::1).
@@ -1167,23 +1170,31 @@ fn is_loopback_addr(addr: &std::net::SocketAddr) -> bool {
 /// Startup remediation: tighten the engine's own secret files (`.env`,
 /// `config.json`, `modules.json`, the TLS key) to owner-only 0o600. Best-effort
 /// — a file that can't be chmodded (or doesn't exist yet) is logged, never fatal.
+///
+/// Run on the blocking pool: it touches a `std::sync::Mutex` (config_state) and
+/// does file chmods — doing that inline on an async worker can deadlock against
+/// a background task holding config_state (blocking std-Mutex locks on a tokio
+/// worker must never wait on another task on the same worker).
 fn remediate_secret_file_permissions(
     config_state: &Arc<Mutex<ConfigState>>,
     ui_state: &Arc<Mutex<EngineState>>,
 ) {
-    let dir = config_state
-        .lock()
-        .unwrap()
-        .path
-        .parent()
-        .unwrap_or(&PathBuf::from("."))
-        .to_path_buf();
-    let targets = [
-        config::env_path(&dir),
-        config_state.lock().unwrap().path.clone(),
-        config::modules_path(config_state),
-        tls::key_path(),
-    ];
+    let targets = {
+        let state = config_state.lock().unwrap();
+        let dir = state
+            .path
+            .parent()
+            .unwrap_or(&PathBuf::from("."))
+            .to_path_buf();
+        // Capture every target path under ONE brief lock; never hold the lock
+        // across the file operations below.
+        [
+            config::env_path(&dir),
+            state.path.clone(),
+            dir.join("modules.json"),
+            tls::key_path(),
+        ]
+    };
     for path in targets {
         if !path.exists() {
             continue;
@@ -1878,7 +1889,18 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
             return Err(e.into());
         }
     };
-    remediate_secret_file_permissions(&config_state, &ui_state);
+    // Do the chmod pass on the blocking pool (std-Mutex locks + file syscalls
+    // must not run on an async worker — they can deadlock with background
+    // tasks holding the same locks).
+    {
+        let config_state = Arc::clone(&config_state);
+        let ui_state = ui_state.clone();
+        tokio::task::spawn_blocking(move || {
+            remediate_secret_file_permissions(&config_state, &ui_state);
+        })
+        .await
+        .map_err(|e| format!("remediation task failed: {}", e))?;
+    }
     // Never print the actual PIN (it lives in `.env` as COCKATIEL_PIN).
     log_event_broadcast(&ui_state, format!("Listening on {}:{} (WSS) | PIN: see .env (COCKATIEL_PIN)", bind_ip, config.port));
     log_event_broadcast(&ui_state, format!("TLS certificate: {}", cert_path.display()));
