@@ -66,3 +66,50 @@ fn the_prediction_update_relay_gates_the_origin() {
         "the log line must name the rule that was violated"
     );
 }
+
+/// Extract the PollUpdate arm from the receive loop's `match container.payload`,
+/// between its own head and the following PromptResponse arm.
+fn poll_arm(src: &str) -> &str {
+    let start = src
+        .find("Some(Payload::PollUpdate(ref update)) => {")
+        .expect("the receive loop must have a PollUpdate relay arm");
+    let end = src[start..]
+        .find("Some(Payload::PromptResponse(ref resp)) => {")
+        .expect("the PollUpdate arm must end where the PromptResponse arm begins")
+        + start;
+    &src[start..end]
+}
+
+/// The PollUpdate arm mirrors the PredictionUpdate arm: same relay shape, same
+/// origin gate, same broadcast semantics. Polls are free votes, but the wire
+/// relay is identical.
+#[test]
+fn the_poll_update_arm_exists_and_mirrors_the_prediction_forward() {
+    let src = include_str!("../main.rs");
+    let arm = poll_arm(src);
+
+    assert!(arm.contains("let forward = Container {"), "the arm must build a fresh container");
+    assert!(arm.contains("version: 1,"), "the forward must carry the protocol version");
+    assert!(arm.contains("payload: Some(Payload::PollUpdate(update)),"), "the forward must carry the cloned poll update");
+    assert!(arm.contains("filter(|(n, _)| n.as_str() != module_name.as_str())"), "the forward must exclude the origin module");
+    assert!(arm.contains("sender.try_send(forward.clone())"), "the forward must be a non-blocking try_send");
+}
+
+#[test]
+fn the_poll_update_relay_gates_the_origin() {
+    let src = include_str!("../main.rs");
+    let arm = poll_arm(src);
+
+    assert!(
+        arm.contains("module_name != \"predictions\"") && arm.contains("is_control_surface"),
+        "only the predictions module or the control surface may broadcast"
+    );
+    assert!(
+        arm.contains("log_event_broadcast"),
+        "an unauthorised broadcaster must be called out"
+    );
+    assert!(
+        arm.contains("only the predictions module or TUI may broadcast"),
+        "the log line must name the rule that was violated"
+    );
+}
