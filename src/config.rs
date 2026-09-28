@@ -85,6 +85,13 @@ pub struct Config {
     /// refuse, so false is the default and the operator opts in deliberately.
     #[serde(default = "default_shutdown_on_request")]
     pub shutdown_on_request: bool,
+
+    /// The minimum role required to CREATE/RESOLVE a prediction
+    /// ("owner" | "admin" | "mod" | "user"). Defaults to "mod". The predictions
+    /// module reads ITS OWN config.json for the enforcement decision; this
+    /// field is for the display / other surfaces.
+    #[serde(default = "default_creator_role")]
+    pub prediction_creator_role: String,
 }
 
 fn default_probe_interval_secs() -> u64 {
@@ -132,6 +139,12 @@ fn default_start_paused() -> bool {
 /// [`shutdown_on_request`](Config::shutdown_on_request).
 fn default_shutdown_on_request() -> bool {
     false
+}
+
+/// The minimum role a user needs to create/resolve a prediction. Defaults to
+/// "mod". See [`prediction_creator_role`](Config::prediction_creator_role).
+fn default_creator_role() -> String {
+    "mod".to_string()
 }
 
 /// Should the engine boot with the message pipeline held?
@@ -343,7 +356,7 @@ pub fn backfill_config_defaults(state: &Arc<Mutex<ConfigState>>) {
     };
 
     let mut changed = false;
-    let defaults: [(&str, serde_json::Value); 7] = [
+    let defaults: [(&str, serde_json::Value); 8] = [
         ("max_message_bytes", serde_json::json!(default_max_message_bytes())),
         ("max_connections", serde_json::json!(default_max_connections())),
         ("handshake_timeout_secs", serde_json::json!(default_handshake_timeout_secs())),
@@ -351,6 +364,7 @@ pub fn backfill_config_defaults(state: &Arc<Mutex<ConfigState>>) {
         ("recovery_grace_secs", serde_json::json!(default_recovery_grace_secs())),
         ("start_paused", serde_json::json!(default_start_paused())),
         ("shutdown_on_request", serde_json::json!(default_shutdown_on_request())),
+        ("prediction_creator_role", serde_json::json!(default_creator_role())),
     ];
     for (key, value) in defaults {
         if obj.get(key).is_none() {
@@ -394,7 +408,8 @@ pub fn create_config(directory: PathBuf) -> Result<String, String> {
     "send_timeout_secs": 5,
     "recovery_grace_secs": 10,
     "start_paused": true,
-    "shutdown_on_request": false
+    "shutdown_on_request": false,
+    "prediction_creator_role": "mod"
 }"#
     .to_string();
 

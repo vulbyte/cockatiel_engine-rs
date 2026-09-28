@@ -2534,6 +2534,40 @@ Some(Payload::ModuleControl(_)) => {
                             let _ = sender.try_send(forward.clone());
                         }
                     }
+                    Some(Payload::PredictionUpdate(ref update)) => {
+                        // The predictions module (the brain) broadcasts a
+                        // prediction bar to every connected module so they can
+                        // display it. Only the brain — or the TUI control
+                        // surface — may do this: a random module spoofing a bar
+                        // would be indistinguishable from a real one, so the
+                        // origin is gated before the forward.
+                        if module_name != "predictions" && !is_control_surface(&module_name) {
+                            log_event_broadcast(
+                                &ui_state,
+                                format!("[PredictionUpdate] ignored from '{}': only the predictions module or TUI may broadcast", module_name),
+                            );
+                        } else {
+                            let update = update.clone();
+                            let forward = Container {
+                                version: 1,
+                                auth_token: container.auth_token.clone(),
+                                module_name: container.module_name.clone(),
+                                module_instance_uuid7: container.module_instance_uuid7.clone(),
+                                payload: Some(Payload::PredictionUpdate(update)),
+                            };
+                            let senders: Vec<tokio::sync::mpsc::Sender<Container>> = {
+                                let senders = orchestrator.module_senders.lock().await;
+                                senders
+                                    .iter()
+                                    .filter(|(n, _)| n.as_str() != module_name.as_str())
+                                    .map(|(_, s)| s.clone())
+                                    .collect()
+                            };
+                            for sender in senders {
+                                let _ = sender.try_send(forward.clone());
+                            }
+                        }
+                    }
                     Some(Payload::PromptResponse(ref resp)) => {
                         // Route the user's answer back to whoever is waiting on
                         // this prompt_id (the engine's own connection prompt, or

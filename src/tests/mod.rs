@@ -13,3 +13,4 @@ mod pause_tests;
 mod db_tests;
 mod config_tests;
 mod shutdown_tests;
+mod prediction_tests;

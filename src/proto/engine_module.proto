@@ -143,6 +143,16 @@ enum QueryOp {
   // Nothing at or below 58 moves, so no value already on the wire changes.
   QUERY_OP_ENGINE_SHUTDOWN = 60;
 
+  // ── Predictions ─────────────────────────────────────────
+  // The predictions module's read surface. The brain (the "predictions"
+  // module) reads a user's current score before placing a bet; the control
+  // surface may do the same.
+  //
+  // 70 opens a NEW decade rather than taking a number from an existing group:
+  // 61-69 is the engine-lifecycle family's growth room, and nothing at or
+  // below 60 moves, so no value already on the wire changes.
+  QUERY_OP_PREDICTION_GET_SCORE = 70;
+
   // ── Read-only SQL escape hatch ──
   // The engine's final fallback for any query that is not one of the
   // named operations above. Hard read-only boundary: only

@@ -113,6 +113,9 @@ mod tests {
         // It is reached by *not* matching anything above, so it has
         // no query_id of its own.
         (90, "QUERY_OP_SELECT_SQL", None),
+        // Predictions. The brain's read surface: a user's current score
+        // before a bet is placed. Opens the 70s decade.
+        (70, "QUERY_OP_PREDICTION_GET_SCORE", Some("prediction_get_score")),
     ];
 
     /// Every family of operation the dispatcher handles has a variant.
@@ -168,6 +171,8 @@ mod tests {
             "USERDB_BAN",
             "USERDB_TIMEOUT",
             "USERDB_ADJUST_SCORE",
+            // predictions
+            "PREDICTION_GET_SCORE",
             // read-only SQL escape hatch
             "SELECT_SQL",
         ] {
@@ -288,10 +293,17 @@ mod tests {
             QueryOp::EngineShutdown
         );
         assert_eq!(QueryOp::EngineShutdown as i32, 60);
-        for tag in (60..90).filter(|t| *t != 60) {
+        // The predictions read surface opens the 70s decade, so 70 is claimed
+        // too — the lifecycle family still has 61-69 and 71-89 to grow into.
+        assert_eq!(
+            QueryOp::try_from(70).expect("valid tag"),
+            QueryOp::PredictionGetScore
+        );
+        assert_eq!(QueryOp::PredictionGetScore as i32, 70);
+        for tag in (60..90).filter(|t| *t != 60 && *t != 70) {
             assert!(
                 QueryOp::try_from(tag).is_err(),
-                "tag {} is claimed — 61-89 is the room this family grows into",
+                "tag {} is claimed — 61-69 + 71-89 is the room this family grows into",
                 tag
             );
         }

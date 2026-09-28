@@ -46,7 +46,7 @@ fn backfill_writes_missing_keys_and_preserves_existing() {
     assert_eq!(v["port"], 9734);
     assert_eq!(v["module_approval_policy"], "auto-allow");
 
-    // The seven new keys were written at the TOP level with their defaults.
+    // The eight new keys were written at the TOP level with their defaults.
     assert_eq!(v["max_message_bytes"], 16 * 1024 * 1024);
     assert_eq!(v["max_connections"], 128);
     assert_eq!(v["handshake_timeout_secs"], 10);
@@ -56,6 +56,10 @@ fn backfill_writes_missing_keys_and_preserves_existing() {
     assert_eq!(
         v["shutdown_on_request"], false,
         "a fresh config must say the engine is NOT shuttable over the wire"
+    );
+    assert_eq!(
+        v["prediction_creator_role"], "mod",
+        "a fresh config must say who may create a prediction"
     );
 
     std::fs::remove_dir_all(&dir).ok();
@@ -75,6 +79,7 @@ fn backfill_is_a_noop_when_all_keys_present() {
         "recovery_grace_secs": 5,
         "start_paused": false,
         "shutdown_on_request": false,
+        "prediction_creator_role": "owner",
         "module_approval_policy": "auto-allow"
     }"#;
     let (state, path) = temp_state(&dir, original);
@@ -92,6 +97,7 @@ fn backfill_is_a_noop_when_all_keys_present() {
     assert_eq!(v["recovery_grace_secs"], 5);
     assert_eq!(v["start_paused"], false, "an explicit choice is never overwritten by a default");
     assert_eq!(v["shutdown_on_request"], false);
+    assert_eq!(v["prediction_creator_role"], "owner", "an explicit choice is never overwritten by a default");
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -213,5 +219,43 @@ fn engine_shutdown_is_disabled_unless_the_operator_opts_in() {
     assert!(
         template.contains("\"shutdown_on_request\": false"),
         "the generated config.json must refuse shutdown-on-request by default too"
+    );
+}
+
+// ── The prediction creator role ────────────────────────────────────────
+
+/// The minimum role required to create/resolve a prediction. Defaults to "mod".
+#[test]
+fn the_prediction_creator_role_defaults_to_mod_and_round_trips() {
+    // Absent from an existing config.json the key resolves to the default.
+    let absent: Config = serde_json::from_str(MINIMAL).unwrap();
+    assert_eq!(
+        absent.prediction_creator_role, "mod",
+        "a missing key must resolve to the mod default"
+    );
+
+    // An explicit role is honoured and survives a serde round trip (the engine
+    // rewrites config.json through `update_config`, so a field that could not be
+    // serialised back would silently reset on the first write).
+    for role in ["owner", "admin", "mod", "user"] {
+        let configured: Config =
+            serde_json::from_str(&MINIMAL.replace('}', &format!(",\"prediction_creator_role\": \"{role}\"}}")))
+                .unwrap();
+        assert_eq!(configured.prediction_creator_role, role);
+
+        let json = serde_json::to_string(&configured).unwrap();
+        assert!(
+            json.contains("prediction_creator_role"),
+            "the role must be serialised under its own key, not skipped"
+        );
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.prediction_creator_role, role, "the role must survive a serde round trip");
+    }
+
+    // A freshly generated config says so on disk, not just in code.
+    let template = include_str!("../config.rs");
+    assert!(
+        template.contains("\"prediction_creator_role\": \"mod\""),
+        "the generated config.json must default the creator role to mod too"
     );
 }

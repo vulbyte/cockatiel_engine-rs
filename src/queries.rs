@@ -235,6 +235,8 @@ pub(crate) enum QueryRoute {
     ChatReprimand,
     ChatVerifyIdentity,
     UserdbAdjustScore,
+    /// Read a user's current score. Predictions module + control surface only.
+    PredictionGetScore,
     /// Any `userdb_`-prefixed query_id, after the exact `userdb_adjust_score`
     /// match above has had its chance.
     UserdbFamily,
@@ -272,6 +274,7 @@ impl QueryRoute {
             QueryRoute::ChatReprimand => QueryOp::ChatReprimand,
             QueryRoute::ChatVerifyIdentity => QueryOp::ChatVerifyIdentity,
             QueryRoute::UserdbAdjustScore => QueryOp::UserdbAdjustScore,
+            QueryRoute::PredictionGetScore => QueryOp::PredictionGetScore,
             QueryRoute::UserdbFamily => QueryOp::Unspecified,
             QueryRoute::SetCredentials => QueryOp::SetCredentials,
             QueryRoute::AudioForMessage => QueryOp::AudioForMessage,
@@ -292,8 +295,9 @@ impl QueryRoute {
 ///   down, it would be swallowed by the family and answered by
 ///   `userdb_virtual_query`, which has no case for it and would answer
 ///   `Unknown userdb query: userdb_adjust_score` instead of applying the
-///   delta. Its own two-way gate (control surface OR `score-messages`) would
-///   also be replaced by the family's control-surface-only gate.
+///   delta. Its own three-way gate (control surface OR `score-messages` OR
+///   `predictions`) would also be replaced by the family's control-surface-only
+///   gate.
 /// * `userdb_adjust_score` must sit after `chat_verify_identity` and the
 ///   `mod_` prefix test for the same family-ordering reason: a rename that
 ///   collided with an earlier prefix would change which handler runs.
@@ -320,6 +324,7 @@ pub(crate) fn classify_query(query_id: &str) -> QueryRoute {
         // Must precede the `userdb_` prefix test below — see the doc comment.
         "userdb_adjust_score" => QueryRoute::UserdbAdjustScore,
         _ if query_id.starts_with("userdb_") => QueryRoute::UserdbFamily,
+        "prediction_get_score" => QueryRoute::PredictionGetScore,
         "set_credentials" => QueryRoute::SetCredentials,
         "audio_for_message" => QueryRoute::AudioForMessage,
         "test_archive" => QueryRoute::TestArchive,
@@ -368,8 +373,12 @@ pub(crate) fn caller_gate(route: QueryRoute, caller: &str) -> Option<&'static st
             (!is_control_surface(caller)).then_some("Audit access denied: not the TUI")
         }
         QueryRoute::UserdbAdjustScore => {
-            (!is_control_surface(caller) && caller != "score-messages")
-                .then_some("userdb_adjust_score denied: not the TUI or score-messages")
+            (!is_control_surface(caller) && caller != "score-messages" && caller != "predictions")
+                .then_some("userdb_adjust_score denied: not the TUI, score-messages, or predictions")
+        }
+        QueryRoute::PredictionGetScore => {
+            (!is_control_surface(caller) && caller != "predictions")
+                .then_some("prediction_get_score denied: not the predictions module")
         }
         QueryRoute::UserdbFamily => {
             (!is_control_surface(caller)).then_some("User database access denied: not the TUI")
@@ -745,6 +754,12 @@ async fn dispatch(
             userdb_adjust_score_virtual_query(user_db_client, sql, ui_state, module_name)
                 .await
                 .into()
+        }
+        QueryRoute::PredictionGetScore => {
+            // Read a user's current score BEFORE the predictions module
+            // places a bet. uuid-only: the brain passes the actor's
+            // `chat.user_uuid7` directly — no platform+handle resolution.
+            prediction_get_score_virtual_query(user_db_client, sql).await.into()
         }
         QueryRoute::UserdbFamily => {
             // User database is engine-internal — only the TUI
@@ -1167,7 +1182,8 @@ async fn userdb_virtual_query(
 /// inflation). Unlike `mod_commend`/`mod_reprimand` it accepts any signed delta
 /// and uses the user-db's dedicated score-only op.
 ///
-/// Gate: only the score-messages module or the TUI control surface may call it.
+/// Gate: the score-messages module, the predictions module, or the TUI control
+/// surface may call it.
 async fn userdb_adjust_score_virtual_query(
     client: &SharedUserDbClient,
     sql: &str,
@@ -1224,6 +1240,42 @@ async fn userdb_adjust_score_virtual_query(
             (false, Vec::new(), e)
         }
     }
+}
+
+/// Handle the `prediction_get_score` virtual query: read a user's CURRENT
+/// score before the predictions module places a bet.
+///
+/// The payload is uuid-only: `{ "uuid7": "<user uuid7>" }` — the brain passes
+/// the actor's `chat.user_uuid7` directly, no platform + handle resolution.
+/// On success the answer is `{ "uuid7": "...", "score": <i64> }`; a missing or
+/// unknown user is an error, in the same style as `userdb_adjust_score`.
+async fn prediction_get_score_virtual_query(
+    client: &SharedUserDbClient,
+    sql: &str,
+) -> (bool, Vec<u8>, String) {
+    let payload: serde_json::Value = match serde_json::from_str(sql) {
+        Ok(v) => v,
+        Err(e) => return (false, Vec::new(), format!("Invalid prediction_get_score payload: {}", e)),
+    };
+
+    let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
+    if uuid7.is_empty() {
+        return (false, Vec::new(), "prediction_get_score requires uuid7".to_string());
+    }
+
+    let resolved = match client.get_user(uuid7, "", "", "").await {
+        Ok(r) => r,
+        Err(e) => return (false, Vec::new(), e),
+    };
+    if !resolved.success {
+        return (false, Vec::new(), format!("User '{}' not found", uuid7));
+    }
+    let Some(user) = resolved.user else {
+        return (false, Vec::new(), format!("User '{}' not found", uuid7));
+    };
+
+    let json = serde_json::json!({ "uuid7": user.uuid7, "score": user.score }).to_string();
+    (true, json.into_bytes(), String::new())
 }
 
 /// Handle a `mod_*` virtual query from an adapter (e.g. a mod typing a command
@@ -1860,6 +1912,7 @@ mod tests {
     const TEST_RUNNER: &str = "cockatiel-test-runner";
     const SCORE_MESSAGES: &str = "score-messages";
     const TERM_CHAT: &str = "term-chat";
+    const PREDICTIONS: &str = "predictions";
     /// An ordinary adapter: authenticated, not a control surface, not the
     /// runner, not the automated scorer.
     const NORMAL: &str = "twitch-adapter";
@@ -1942,16 +1995,30 @@ mod tests {
             ("audit_approve", NORMAL, false),
             ("audit_reject", TUI, true),
             ("audit_reject", NORMAL, false),
-            // ── userdb_adjust_score: the two-way gate — the TUI OR the
-            // score-messages module. Everything else is refused.
+            // ── userdb_adjust_score: the three-way gate — the TUI, the
+            // score-messages module, OR the predictions module (the brain bets
+            // against a user's score, so it must be able to deduct/credit the
+            // same way the scorer does). Everything else is refused.
             ("userdb_adjust_score", TUI, true),
             ("userdb_adjust_score", TUI_CHILD, true),
             ("userdb_adjust_score", SCORE_MESSAGES, true),
+            ("userdb_adjust_score", PREDICTIONS, true),
             ("userdb_adjust_score", TEST_RUNNER, false),
             ("userdb_adjust_score", TERM_CHAT, false),
             ("userdb_adjust_score", NORMAL, false),
+            // ── prediction_get_score: the TUI control surface OR the
+            // predictions module (the brain reads a user's score before a bet).
+            // Everything else is refused.
+            ("prediction_get_score", TUI, true),
+            ("prediction_get_score", TUI_CHILD, true),
+            ("prediction_get_score", PREDICTIONS, true),
+            ("prediction_get_score", SCORE_MESSAGES, false),
+            ("prediction_get_score", TEST_RUNNER, false),
+            ("prediction_get_score", TERM_CHAT, false),
+            ("prediction_get_score", NORMAL, false),
+            ("prediction_get_score", "", false),
             // ── The rest of the userdb family: the TUI ONLY. score-messages is
-            // NOT special here — only adjust_score has the two-way gate.
+            // NOT special here — only adjust_score has the three-way gate.
             ("userdb_get_user", TUI, true),
             ("userdb_set_roles", TUI, true),
             ("userdb_get_user", SCORE_MESSAGES, false),
@@ -2046,7 +2113,11 @@ mod tests {
         );
         assert_eq!(
             denial("userdb_adjust_score", NORMAL),
-            Some("userdb_adjust_score denied: not the TUI or score-messages")
+            Some("userdb_adjust_score denied: not the TUI, score-messages, or predictions")
+        );
+        assert_eq!(
+            denial("prediction_get_score", NORMAL),
+            Some("prediction_get_score denied: not the predictions module")
         );
         assert_eq!(denial("set_credentials", NORMAL), Some("set_credentials denied: not the TUI"));
         // Admitted callers get no denial at all.
@@ -2055,6 +2126,8 @@ mod tests {
         assert_eq!(denial("pipeline_set_paused", TUI), None);
         assert_eq!(denial("engine_shutdown", TUI), None);
         assert_eq!(denial("engine_shutdown", TUI_CHILD), None);
+        assert_eq!(denial("prediction_get_score", PREDICTIONS), None);
+        assert_eq!(denial("prediction_get_score", TUI), None);
     }
 
     #[test]
@@ -2070,6 +2143,7 @@ mod tests {
             "audit_reject",
             "userdb_get_user",
             "userdb_adjust_score",
+            "prediction_get_score",
             "set_credentials",
             "pipeline_set_paused",
             "engine_shutdown",
@@ -2136,6 +2210,8 @@ mod tests {
         ("userdb_reprimand", QueryRoute::UserdbFamily),
         ("userdb_ban", QueryRoute::UserdbFamily),
         ("userdb_timeout", QueryRoute::UserdbFamily),
+        // Predictions read surface.
+        ("prediction_get_score", QueryRoute::PredictionGetScore),
     ];
 
     #[test]
@@ -2182,6 +2258,7 @@ mod tests {
             QueryRoute::AudioForMessage,
             QueryRoute::TestArchive,
             QueryRoute::ReadOnlySql,
+            QueryRoute::PredictionGetScore,
         ] {
             assert!(
                 reachable.contains(&route),
@@ -2229,6 +2306,7 @@ mod tests {
             (QueryRoute::ChatReprimand, QueryOp::ChatReprimand),
             (QueryRoute::ChatVerifyIdentity, QueryOp::ChatVerifyIdentity),
             (QueryRoute::UserdbAdjustScore, QueryOp::UserdbAdjustScore),
+            (QueryRoute::PredictionGetScore, QueryOp::PredictionGetScore),
             (QueryRoute::UserdbFamily, QueryOp::Unspecified),
             (QueryRoute::SetCredentials, QueryOp::SetCredentials),
             (QueryRoute::AudioForMessage, QueryOp::AudioForMessage),
@@ -2247,13 +2325,14 @@ mod tests {
         // the prefix before the exact name would route the score delta into
         // the family handler, which has no case for it and would answer
         // `Unknown userdb query: userdb_adjust_score` — and would replace the
-        // two-way (control surface OR score-messages) gate with the family's
-        // control-surface-only gate, locking score-messages out of its own op.
+        // three-way (control surface OR score-messages OR predictions) gate
+        // with the family's control-surface-only gate, locking score-messages
+        // and predictions out of their own op.
         assert_eq!(classify_query("userdb_adjust_score"), QueryRoute::UserdbAdjustScore);
         assert!(query_id_starts_with_family("userdb_adjust_score", "userdb_"));
         // And it must not be reachable by the family, whatever else changes.
         assert_ne!(classify_query("userdb_adjust_score"), QueryRoute::UserdbFamily);
-        // The two-way gate is the one that depends on it.
+        // The three-way gate is the one that depends on it.
         assert!(allows("userdb_adjust_score", SCORE_MESSAGES));
         assert!(!allows("userdb_get_user", SCORE_MESSAGES));
     }
