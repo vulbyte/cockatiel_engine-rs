@@ -246,11 +246,239 @@ pub fn save_module_credentials(
         if root.as_object().is_none() {
             root = serde_json::json!({});
         }
-        root["module_specific"] = serde_json::Value::Object(spec);
+        // MERGE, never replace. `module_specific` also holds each module's
+        // tuning knobs (timeouts, backoffs, queue sizes) which are not
+        // credentials, so overwriting the whole object with just the
+        // credential fields silently wiped every one of them on each save.
+        // Existing keys win only where the credential set doesn't mention them.
+        let mut merged: serde_json::Map<String, serde_json::Value> = root
+            .get("module_specific")
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        for (key, value) in spec {
+            merged.insert(key, value);
+        }
+        root["module_specific"] = serde_json::Value::Object(merged);
         if let Ok(pretty) = serde_json::to_string_pretty(&root) {
             let _ = crate::config::write_atomic(&path, &pretty);
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::module_manager::{CredentialField, DiscoveredModule, ModuleManifest};
+
+    /// A scratch module directory that cleans itself up, so these tests never
+    /// touch a real module's `.env` / `config.json`.
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "cockatiel-cred-test-{}-{}",
+                tag,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            Scratch(dir)
+        }
+        fn module(&self) -> DiscoveredModule {
+            // Built through serde so this test doesn't need updating whenever a
+            // field is added to ModuleManifest.
+            let manifest: ModuleManifest =
+                serde_json::from_value(serde_json::json!({ "name": "test-adapter" }))
+                    .expect("minimal manifest deserializes");
+            DiscoveredModule {
+                manifest,
+                directory: self.0.clone(),
+            }
+        }
+        fn config(&self) -> serde_json::Value {
+            serde_json::from_str(
+                &std::fs::read_to_string(self.0.join("config.json")).expect("config.json written"),
+            )
+            .expect("config.json is valid JSON")
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn secret_and_list_fields() -> Vec<CredentialField> {
+        vec![
+            CredentialField {
+                key: "bot_token".to_string(),
+                label: "Bot Token".to_string(),
+                sensitive: true,
+                list: false,
+                optional: false,
+                env: "DISCORD_BOT_TOKEN".to_string(),
+            },
+            CredentialField {
+                key: "servers".to_string(),
+                label: "Servers".to_string(),
+                sensitive: false,
+                list: true,
+                optional: false,
+                env: String::new(),
+            },
+        ]
+    }
+
+    /// A module's `module_specific` holds BOTH credentials and tuning knobs.
+    /// Saving credentials must only touch the credential keys — the knobs are
+    /// not credentials and used to be wiped on every save.
+    #[test]
+    fn saving_credentials_preserves_unrelated_tuning_knobs() {
+        let scratch = Scratch::new("preserve");
+        let module = scratch.module();
+        std::fs::write(
+            module.directory.join("config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ip": "127.0.0.1",
+                "port": 9734,
+                "module_specific": {
+                    "servers": { "*": ["*"] },
+                    "http_timeout_secs": 42,
+                    "send_worker_count": 9,
+                    "embed_sends": true,
+                    "gateway_reconnect_delay_secs": 7
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let values = HashMap::from([
+            ("servers".to_string(), "111=chan-a\n222".to_string()),
+        ]);
+        save_module_credentials(&module, &secret_and_list_fields(), &values).expect("save succeeds");
+
+        let ms = scratch.config();
+        let spec = ms.get("module_specific").expect("module_specific present");
+        // The credential was written, in the engine's array form.
+        assert_eq!(
+            spec.get("servers"),
+            Some(&serde_json::json!(["111=chan-a", "222"])),
+            "the credential itself must still be written"
+        );
+        // Every tuning knob survived — this is the regression.
+        assert_eq!(spec.get("http_timeout_secs"), Some(&serde_json::json!(42)));
+        assert_eq!(spec.get("send_worker_count"), Some(&serde_json::json!(9)));
+        assert_eq!(spec.get("embed_sends"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            spec.get("gateway_reconnect_delay_secs"),
+            Some(&serde_json::json!(7))
+        );
+        // Top-level keys are untouched too.
+        assert_eq!(ms.get("port"), Some(&serde_json::json!(9734)));
+        assert_eq!(ms.get("ip"), Some(&serde_json::json!("127.0.0.1")));
+    }
+
+    #[test]
+    fn a_credential_save_can_still_overwrite_its_own_key() {
+        // Merging must not make a credential un-editable: re-saving the same
+        // key with a new value has to win over the stale value on disk.
+        let scratch = Scratch::new("overwrite");
+        let module = scratch.module();
+        std::fs::write(
+            module.directory.join("config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "module_specific": { "servers": { "*": ["*"] }, "http_timeout_secs": 42 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let values = HashMap::from([(
+            "servers".to_string(),
+            "999=chan-z".to_string(),
+        )]);
+        save_module_credentials(&module, &secret_and_list_fields(), &values).expect("save succeeds");
+
+        let spec = scratch.config();
+        let ms = spec.get("module_specific").expect("module_specific present");
+        assert_eq!(ms.get("servers"), Some(&serde_json::json!(["999=chan-z"])));
+        assert_eq!(ms.get("http_timeout_secs"), Some(&serde_json::json!(42)));
+    }
+
+    #[test]
+    fn sensitive_credentials_go_to_env_and_never_to_config() {
+        let scratch = Scratch::new("secrets");
+        let module = scratch.module();
+        let values = HashMap::from([
+            ("bot_token".to_string(), "super-secret".to_string()),
+            ("servers".to_string(), "111".to_string()),
+        ]);
+        save_module_credentials(&module, &secret_and_list_fields(), &values).expect("save succeeds");
+
+        let env = std::fs::read_to_string(module.directory.join(".env")).expect(".env written");
+        assert!(env.contains("DISCORD_BOT_TOKEN=super-secret"), "got {:?}", env);
+        let config = std::fs::read_to_string(module.directory.join("config.json")).unwrap();
+        assert!(
+            !config.contains("super-secret"),
+            "a sensitive credential must never reach config.json"
+        );
+    }
+
+    #[test]
+    fn saving_into_a_missing_or_malformed_config_creates_a_valid_one() {
+        // No config.json at all.
+        let scratch = Scratch::new("fresh");
+        let module = scratch.module();
+        let values = HashMap::from([("servers".to_string(), "111".to_string())]);
+        save_module_credentials(&module, &secret_and_list_fields(), &values).expect("save succeeds");
+        assert_eq!(
+            scratch.config().get("module_specific").and_then(|m| m.get("servers")),
+            Some(&serde_json::json!(["111"]))
+        );
+
+        // Malformed config.json.
+        let scratch = Scratch::new("garbage");
+        let module = scratch.module();
+        std::fs::write(module.directory.join("config.json"), "{ not json").unwrap();
+        let values = HashMap::from([("servers".to_string(), "222".to_string())]);
+        save_module_credentials(&module, &secret_and_list_fields(), &values).expect("save succeeds");
+        assert_eq!(
+            scratch.config().get("module_specific").and_then(|m| m.get("servers")),
+            Some(&serde_json::json!(["222"]))
+        );
+    }
+
+    /// The Discord adapter reads `servers` as a JSON OBJECT while the engine
+    /// writes it as an ARRAY. Both shapes must survive a save/read round-trip,
+    /// or the two writers clobber each other on every cycle.
+    #[test]
+    fn credential_values_map_reads_back_both_servers_shapes() {
+        let scratch = Scratch::new("shapes");
+        let module = scratch.module();
+
+        for (label, stored) in [
+            ("object", serde_json::json!({ "*": ["*"] })),
+            ("array", serde_json::json!(["111=chan-a", "222"])),
+        ] {
+            std::fs::write(
+                module.directory.join("config.json"),
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "module_specific": { "servers": stored }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let read = credential_values_map(&module);
+            let servers = read.get("servers").expect("servers readable");
+            assert!(
+                !servers.trim().is_empty(),
+                "{} form must read back non-empty, got {:?}",
+                label,
+                servers
+            );
+        }
+    }
 }

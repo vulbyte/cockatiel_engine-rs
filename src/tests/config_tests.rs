@@ -1,7 +1,10 @@
 //! Config tests: the startup backfill writes newly-added keys into config.json
-//! with their code defaults (house convention) without disturbing existing keys.
+//! with their code defaults (house convention) without disturbing existing keys,
+//! and the engine's boot pause state resolves the way the operator asked for.
 
-use crate::config::{backfill_config_defaults, Config, ConfigState};
+use crate::config::{
+    Config, ConfigState, backfill_config_defaults, resolve_start_paused, start_paused,
+};
 use std::sync::{Arc, Mutex};
 
 /// A ConfigState pointed at a throwaway temp config.json, parsed from the given
@@ -43,12 +46,17 @@ fn backfill_writes_missing_keys_and_preserves_existing() {
     assert_eq!(v["port"], 9734);
     assert_eq!(v["module_approval_policy"], "auto-allow");
 
-    // The five new keys were written at the TOP level with their defaults.
+    // The seven new keys were written at the TOP level with their defaults.
     assert_eq!(v["max_message_bytes"], 16 * 1024 * 1024);
     assert_eq!(v["max_connections"], 128);
     assert_eq!(v["handshake_timeout_secs"], 10);
     assert_eq!(v["send_timeout_secs"], 5);
     assert_eq!(v["recovery_grace_secs"], 10);
+    assert_eq!(v["start_paused"], true, "a fresh config must be explicit about booting paused");
+    assert_eq!(
+        v["shutdown_on_request"], false,
+        "a fresh config must say the engine is NOT shuttable over the wire"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -65,6 +73,8 @@ fn backfill_is_a_noop_when_all_keys_present() {
         "handshake_timeout_secs": 3,
         "send_timeout_secs": 4,
         "recovery_grace_secs": 5,
+        "start_paused": false,
+        "shutdown_on_request": false,
         "module_approval_policy": "auto-allow"
     }"#;
     let (state, path) = temp_state(&dir, original);
@@ -80,6 +90,128 @@ fn backfill_is_a_noop_when_all_keys_present() {
     assert_eq!(v["handshake_timeout_secs"], 3);
     assert_eq!(v["send_timeout_secs"], 4);
     assert_eq!(v["recovery_grace_secs"], 5);
+    assert_eq!(v["start_paused"], false, "an explicit choice is never overwritten by a default");
+    assert_eq!(v["shutdown_on_request"], false);
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── The boot pause ─────────────────────────────────────────────────────
+
+/// A config with only the required keys — what an old config.json on disk looks
+/// like before the backfill has run.
+const MINIMAL: &str = r#"{
+    "timeline_database_location": "./test.db",
+    "timeline_database_backup_location": "./test-backup.db",
+    "port": 9734
+}"#;
+
+/// The engine boots PAUSED, and the only thing that stops it is an explicit
+/// ask. The safe direction to be wrong in is paused: a backlog of unattended
+/// messages must never be dispatched to live modules unasked.
+#[test]
+fn the_engine_boots_paused_by_default() {
+    let absent: Config = serde_json::from_str(MINIMAL).unwrap();
+    assert!(absent.start_paused, "a missing key must resolve to paused, not to running");
+    assert!(resolve_start_paused(&absent, None));
+
+    let explicit: Config = serde_json::from_str(&MINIMAL.replace('}', ",\"start_paused\": true}")).unwrap();
+    assert!(resolve_start_paused(&explicit, None));
+
+    // An operator who wants it running on every boot says so in the file.
+    let unpaused: Config = serde_json::from_str(&MINIMAL.replace('}', ",\"start_paused\": false}")).unwrap();
+    assert!(!unpaused.start_paused);
+    assert!(!resolve_start_paused(&unpaused, None));
+
+    // A freshly generated config says so on disk, not just in code.
+    let template = include_str!("../config.rs");
+    assert!(
+        template.contains("\"start_paused\": true"),
+        "the generated config.json must boot paused too"
+    );
+}
+
+/// `COCKATIEL_START_PAUSED` is the headless / CI escape hatch: the compliance
+/// test runner and any headless run set it to 0, because nothing would ever
+/// press the resume key. A real environment variable wins over the file (the
+/// same precedence every other override in the engine uses), and a junk value
+/// falls back to the file rather than guessing in either direction.
+#[test]
+fn the_auto_resume_escape_hatch_flips_the_boot_state() {
+    let paused: Config = serde_json::from_str(MINIMAL).unwrap();
+    let running: Config = serde_json::from_str(&MINIMAL.replace('}', ",\"start_paused\": false}")).unwrap();
+
+    for off in ["0", "false", "no", "off", "FALSE", " off ", "0\n"] {
+        assert!(
+            !resolve_start_paused(&paused, Some(off)),
+            "COCKATIEL_START_PAUSED={off:?} must boot running"
+        );
+        assert!(!resolve_start_paused(&running, Some(off)));
+    }
+    for on in ["1", "true", "yes", "on", "TRUE"] {
+        assert!(
+            resolve_start_paused(&running, Some(on)),
+            "COCKATIEL_START_PAUSED={on:?} must boot paused even against the file"
+        );
+        assert!(resolve_start_paused(&paused, Some(on)));
+    }
+
+    // Nothing set, or set to something meaningless, is the file's answer.
+    for junk in [None, Some(""), Some("   "), Some("maybe"), Some("2")] {
+        assert!(resolve_start_paused(&paused, junk), "an unusable value must not silently start the engine");
+        assert!(!resolve_start_paused(&running, junk));
+    }
+
+    // The live entry point reads the real environment and delegates here.
+    assert_eq!(start_paused(&paused), resolve_start_paused(&paused, std::env::var("COCKATIEL_START_PAUSED").ok().as_deref()));
+}
+
+// ── The shutdown gate ────────────────────────────────────────────────
+
+/// A shutdown request from the wire is refused unless the operator has said yes
+/// in config.json. False is the default, and it is the only safe default: a
+/// caller that merely holds a socket — or a module that has been compromised —
+/// must not be able to take the engine down, and an engine that predates the
+/// flag has to refuse.
+#[test]
+fn engine_shutdown_is_disabled_unless_the_operator_opts_in() {
+    // Absent from an existing config.json — the state almost every deployment
+    // is in — the key backfills to false.
+    let absent: Config = serde_json::from_str(MINIMAL).unwrap();
+    assert!(
+        !absent.shutdown_on_request,
+        "a missing key must resolve to disabled, not to killable"
+    );
+
+    // An explicit opt-in is honoured, and survives a serde round trip in both
+    // directions (the engine rewrites config.json through `update_config`, so a
+    // flag that could not be serialised back would silently reset on the first
+    // write).
+    let enabled: Config =
+        serde_json::from_str(&MINIMAL.replace('}', ",\"shutdown_on_request\": true}")).unwrap();
+    assert!(enabled.shutdown_on_request);
+
+    let disabled: Config =
+        serde_json::from_str(&MINIMAL.replace('}', ",\"shutdown_on_request\": false}")).unwrap();
+    assert!(!disabled.shutdown_on_request);
+
+    for config in [&absent, &enabled, &disabled] {
+        let json = serde_json::to_string(config).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.shutdown_on_request, config.shutdown_on_request,
+            "the flag must survive a serde round trip"
+        );
+        assert!(
+            json.contains("shutdown_on_request"),
+            "the flag must be serialised under its own key, not skipped"
+        );
+    }
+
+    // A freshly generated config says so on disk, not just in code.
+    let template = include_str!("../config.rs");
+    assert!(
+        template.contains("\"shutdown_on_request\": false"),
+        "the generated config.json must refuse shutdown-on-request by default too"
+    );
 }

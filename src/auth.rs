@@ -8,6 +8,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct AuthSession {
     pub module_name: String,
     pub instance_uuid7: String,
+    // Written when a session is registered, never read: the engine validates a
+    // module's token from the Container it arrives in, not from the session
+    // table. Pre-existing dead field — annotated so the lint does not surface
+    // it again the next time the query surface's HIR ordering shifts.
+    #[allow(dead_code)]
     pub auth_token: String,
     pub position: String,
     pub priority: i32,

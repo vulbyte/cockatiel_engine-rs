@@ -1,14 +1,21 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::cockatiel_protobuf;
 use crate::cockatiel_protobuf::{Container, container::Payload, ChatMessage, Command};
 use crate::command_registry::CommandRegistry;
-use crate::database::DatabaseManager;
+use crate::database::{DatabaseManager, PipelineOutcome, PipelineResult};
 
 const DEFAULT_ACK_TIMEOUT_MS: u64 = 3000;
+
+/// How often the ack-timeout sweep runs. This bounds how long a stage waits once
+/// its ack budget has expired, so it must stay well below [`DEFAULT_ACK_TIMEOUT_MS`]
+/// rather than riding on a multi-second housekeeping interval. It used to run on
+/// the 15s DB-sync loop, which quantised every timed-out stage to a 15s grid
+/// (measured p50 15s / p90 45s per message, on 15s and 30s boundaries).
+pub const TIMEOUT_SWEEP_INTERVAL: Duration = Duration::from_millis(250);
 
 fn uuid7_string_to_bytes(s: &str) -> Vec<u8> {
     s.as_bytes().to_vec()
@@ -70,6 +77,73 @@ pub(crate) async fn send_to_module(
 
 fn uuid7_string() -> Option<String> {
     Some(uuid::Uuid::now_v7().to_string())
+}
+
+/// Milliseconds since the Unix epoch — the unit the timeline row's stage
+/// timestamps use. Captured in memory as each stage finishes, because the row is
+/// written once at the end of the chain rather than once per stage.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// The dispatch a message was about to make when a pause landed, and did not.
+///
+/// A held message is NOT lost and NOT failed: its timeline row is written, its
+/// in-memory state is live, and the only thing missing is the send. Resume
+/// replays the held dispatch from the point recorded here, so the chain picks
+/// up exactly where it stopped — a module is never sent the same message twice
+/// by the replay, because the ack that produced the hold already consumed the
+/// tracker's entry for that stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldPoint {
+    /// Before the pre-process fanout: the entry gate. The row is written and
+    /// the state is live, but nothing has reached any module yet.
+    Entry,
+    /// The next in-process module has not been sent to (pre-process is done).
+    InProcess,
+    /// The post-process fanout has not happened (in-process is done).
+    PostProcess,
+}
+
+/// The engine's pause state, and the messages a pause is holding.
+///
+/// `held` is keyed by uuid7 in a `BTreeMap` so the resume order is uuid7 order,
+/// which is time order for uuid7s — the same ordering the recovery drain gets
+/// from `get_queued_uuids`, and the same ordering the messages arrived in.
+#[derive(Debug, Default)]
+struct PauseState {
+    paused: bool,
+    held: BTreeMap<String, HoldPoint>,
+}
+
+/// What a resume did, for the control surface's response and the log line.
+#[derive(Debug, Default)]
+pub struct ResumeOutcome {
+    /// Was the engine actually paused? A resume while it was already running is
+    /// a no-op and says so, rather than claiming to have drained anything.
+    pub was_paused: bool,
+    /// How many held messages are being released (see [`PipelineOrchestrator::resume`]).
+    pub resumed_messages: usize,
+    /// The post-resume timeout sweep failing. Empty on a clean resume; a
+    /// message whose replay fails later is logged, not returned.
+    pub errors: Vec<String>,
+}
+
+/// What one pass of the crash-recovery drain did with the stranded rows it
+/// found. Reported so the drain can be logged without re-querying the database.
+#[derive(Debug, Default)]
+pub struct RecoveryDrain {
+    /// How many 'queued' rows the pass looked at.
+    pub considered: usize,
+    /// How many of them this pass actually drove into the pipeline. A row the
+    /// live pipeline already owns is NOT counted here — it was correctly
+    /// skipped, and counting it would report a drain that did not happen.
+    pub claimed: usize,
+    /// `(uuid7, error)` for every row the pass could not drive.
+    pub failures: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +259,30 @@ impl AckTracker {
             .unwrap_or(false)
     }
 
+    /// Restart every pending ack's clock to now.
+    ///
+    /// Called on the resume from a pause, and it is the whole reason a pause
+    /// cannot lose a message. `sent_at` is wall-clock, so a message that was
+    /// mid-chain when the pause landed has already "spent" its ack budget by
+    /// the time the engine resumes — ten minutes paused would time out and
+    /// FAIL every message that was in flight, which is the exact opposite of
+    /// what pausing is for. Restarting the clock hands each in-flight message
+    /// its full budget from the moment processing resumes, which is what
+    /// "paused time does not count against a message" has to mean in practice.
+    ///
+    /// Paired with the gate in [`PipelineOrchestrator::handle_timeout`] that
+    /// stops the sweep entirely while paused: the entries are not advanced,
+    /// just re-based, so nothing is failed and nothing is spuriously kept
+    /// alive either.
+    pub fn restart_clocks(&mut self) {
+        let now = Instant::now();
+        for entries in self.pending.values_mut() {
+            for entry in entries.iter_mut() {
+                entry.sent_at = now;
+            }
+        }
+    }
+
     /// Test-only: inject pending entries with arbitrary `sent_at`/`timeout` so
     /// timeout semantics can be exercised deterministically without sleeping.
     #[cfg(test)]
@@ -261,6 +359,17 @@ pub struct PipelineState {
     pub audio_type: String,
     /// Which stage produced the audio: "pre" / "in" / "post".
     pub audio_stage: String,
+    /// When `pre_process` finished (its last module acked), ms since the epoch.
+    /// Captured here instead of written per stage: the row gets it with the
+    /// single terminal write, and the value is the same either way.
+    pub pre_process_completed_at: Option<i64>,
+    /// When `in_process` finished, ms since the epoch. Captured, not written.
+    pub in_process_completed_at: Option<i64>,
+    /// Every `audio_type=<mime>` marker the run produced, in order. The row
+    /// stores the content type in `flags` and the per-stage `set_audio` calls
+    /// appended a marker each time, so the terminal write has to append exactly
+    /// the same set.
+    pub audio_type_markers: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -271,6 +380,14 @@ pub struct PipelineOrchestrator {
     pub config: Arc<Mutex<PipelineConfig>>,
     pub module_senders: Arc<Mutex<HashMap<String, mpsc::Sender<Container>>>>,
     pub command_registry: Arc<std::sync::Mutex<CommandRegistry>>,
+    /// The operator pause and the messages it is holding.
+    ///
+    /// Deliberately NOT seeded from config here: the engine picks its boot
+    /// state in `main` (boots PAUSED unless the headless escape hatch says
+    /// otherwise) and sets it explicitly, so the pipeline primitive itself
+    /// starts neutral and gating is a property of a running engine, not of
+    /// constructing an orchestrator.
+    pause_state: Arc<Mutex<PauseState>>,
 }
 
 impl PipelineOrchestrator {
@@ -287,6 +404,141 @@ impl PipelineOrchestrator {
             config: Arc::new(Mutex::new(config)),
             module_senders,
             command_registry,
+            pause_state: Arc::new(Mutex::new(PauseState::default())),
+        }
+    }
+
+    // ── The pause ──────────────────────────────────────────────────────
+    //
+    // Pausing holds DISPATCHES, not messages. Ingest keeps running, the
+    // timeline row is still written, commands are still parsed: an incoming
+    // message while paused is persisted as 'queued' and joins the held set, so
+    // nothing is lost and resume is just "work through a bigger queue".
+
+    /// Is the pipeline holding every dispatch to every module?
+    pub async fn is_paused(&self) -> bool {
+        self.pause_state.lock().await.paused
+    }
+
+    /// How many messages are waiting on a resume, for the control surface.
+    pub async fn held_count(&self) -> usize {
+        self.pause_state.lock().await.held.len()
+    }
+
+    /// Hold every dispatch from now on. Returns false if already paused.
+    ///
+    /// In-flight messages are NOT touched: whatever stage a message has reached
+    /// keeps its state and its pending acks, and the ack-timeout sweep stops
+    /// (see [`Self::handle_timeout`]), so a pause can never fail a message that
+    /// was already moving. Only the NEXT dispatch of each chain is held.
+    pub async fn pause(&self) -> bool {
+        let mut state = self.pause_state.lock().await;
+        if state.paused {
+            return false;
+        }
+        state.paused = true;
+        true
+    }
+
+    /// The one gate every dispatch point asks before it touches a module's
+    /// socket. `true` means HELD — the caller must return without dispatching.
+    ///
+    /// `uuid7`/`point` are recorded so [`Self::resume`] can replay exactly the
+    /// dispatch that was skipped. One message is held at one point: the ack that
+    /// advanced it to that point consumed the tracker's entry, so no second ack
+    /// can advance the same stage and re-hold it.
+    async fn hold_if_paused(&self, uuid7: &str, point: HoldPoint) -> bool {
+        let mut state = self.pause_state.lock().await;
+        if !state.paused {
+            return false;
+        }
+        state.held.insert(uuid7.to_string(), point);
+        true
+    }
+
+    /// Release the pause and resume completely normal operation, working
+    /// through whatever accumulated while it was held. Three steps, and the
+    /// order is the point:
+    ///
+    /// 1. Every pending ack's clock restarts. A message that was mid-chain when
+    ///    the pause landed was waiting on a module that had no chance to be told
+    ///    to answer, so the wall-clock spent paused must NOT count against its
+    ///    ack budget. Without this, a ten-minute pause would time out and FAIL
+    ///    every message that was in flight — data loss caused by pausing.
+    /// 2. The timeout sweep runs, now that the engine is running again: a stage
+    ///    whose module really is gone still times out, but from a rebased clock.
+    /// 3. The held backlog is released — in a background task, in uuid7 order.
+    ///
+    /// Step 3 is detached deliberately. A ten-minute pause can accumulate a
+    /// backlog of thousands of messages, and each replay costs a database read
+    /// plus a bounded send (a full module channel costs up to a second, by
+    /// design). Doing that inline on the control surface's read loop would stall
+    /// it for long enough for the liveness probe to declare the OPERATOR'S OWN
+    /// TUI unresponsive and kill it — the resume would break the thing that
+    /// asked for it. The engine is running again before this returns; the
+    /// backlog is released behind it, and each replay re-checks the gate, so a
+    /// pause that lands again mid-release simply re-holds what it had not
+    /// reached yet.
+    ///
+    /// The caller owns the log line and the query response, so the backlog
+    /// replay logs its own failures here rather than returning them.
+    pub async fn resume(&self) -> ResumeOutcome {
+        let (was_paused, held) = {
+            let mut state = self.pause_state.lock().await;
+            let was_paused = state.paused;
+            let held: Vec<(String, HoldPoint)> = state
+                .held
+                .iter()
+                .map(|(uuid7, point)| (uuid7.clone(), *point))
+                .collect();
+            state.held.clear();
+            state.paused = false;
+            (was_paused, held)
+        };
+
+        // (1) Paused time is nobody's fault but the clock's.
+        self.ack_tracker.lock().await.restart_clocks();
+
+        // (2) The sweep, now that there is a live budget left to expire. It is
+        // in here, before the backlog, so a module that really has died still
+        // times out against a message the backlog is about to re-drive.
+        let mut errors = Vec::new();
+        if let Err(e) = self.handle_timeout().await {
+            errors.push(format!("timeout sweep failed after resume: {}", e));
+        }
+
+        // (3) Release the backlog behind the caller's back. Ordered, and one
+        // task, so the order the messages accumulated in is the order they go
+        // back out in.
+        let released = held.len();
+        if !held.is_empty() {
+            let orchestrator = self.clone();
+            tokio::spawn(async move {
+                for (uuid7, point) in &held {
+                    if let Err(e) = orchestrator.replay_hold(uuid7, *point).await {
+                        eprintln!("[pipeline] resume: could not replay {}: {}", uuid7, e);
+                    }
+                }
+            });
+        }
+
+        ResumeOutcome {
+            was_paused,
+            resumed_messages: released,
+            errors,
+        }
+    }
+
+    /// Re-issue the dispatch a pause held, from the point it was held at.
+    async fn replay_hold(
+        &self,
+        uuid7: &str,
+        point: HoldPoint,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match point {
+            HoldPoint::Entry => self.broadcast_pre_process(uuid7).await,
+            HoldPoint::InProcess => self.start_in_process(uuid7).await,
+            HoldPoint::PostProcess => self.start_post_process(uuid7).await,
         }
     }
 
@@ -336,6 +588,9 @@ impl PipelineOrchestrator {
             audio: Vec::new(),
             audio_type: String::new(),
             audio_stage: String::new(),
+            pre_process_completed_at: None,
+            in_process_completed_at: None,
+            audio_type_markers: Vec::new(),
         };
 
         if !msg.user_uuid7.is_empty() {
@@ -347,8 +602,10 @@ impl PipelineOrchestrator {
             states.insert(msg.uuid7.clone(), state);
         }
 
-        self.db.set_pipeline_status(&uuid7_bytes, "processing").await?;
-
+        // The row is claimed by the in-memory state, not by a status write: it
+        // stays 'queued' until the single terminal write at the end of the
+        // chain, and `recover_one` checks the state map to avoid re-broadcasting
+        // a message that is already in flight.
         self.broadcast_pre_process(&msg.uuid7).await?;
 
         Ok(())
@@ -357,18 +614,39 @@ impl PipelineOrchestrator {
     /// Re-process a message that was stranded in the queue: a crash between the
     /// timeline insert and the first broadcast left the row 'queued' with no
     /// live task ever going to drain it. Reloads the row, rebuilds a fresh
-    /// pipeline state, marks it 'processing' and runs it through pre-process.
+    /// pipeline state and runs it through pre-process.
     /// NOTE: a recovered message loses `channel_id`, `user_data` and the
     /// engine-parsed `command` — those are never persisted on the timeline row,
     /// so recovery cannot reconstruct them. Messages that pass through a
     /// command flag still classify on ingest (if an adapter re-sends them); a
     /// recovered row only has the stored raw message.
-    pub async fn recover_one(&self, uuid7: &str) -> Result<(), Box<dyn std::error::Error>> {
+    ///
+    /// Returns whether THIS call claimed the message. `false` means it left an
+    /// existing one alone (already in flight, or the row is no longer 'queued')
+    /// — the caller needs the distinction to report a drain honestly.
+    ///
+    /// While the pipeline is paused this claims the row and then holds at the
+    /// entry gate: recovery is not skipped, it is deferred to the resume like
+    /// any other dispatch.
+    pub async fn recover_one(&self, uuid7: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        // The claim check the database used to do. A row in flight is 'queued'
+        // now (the pipeline writes no intermediate status), so `load_queued_message`
+        // can no longer tell a live message from a stranded one — the state map
+        // is the claim registry, and a message already in it must not be
+        // re-broadcast or have its state overwritten.
+        {
+            let states = self.pipeline_states.lock().await;
+            if states.contains_key(uuid7) {
+                // Already claimed by a live pipeline — nothing to do.
+                return Ok(false);
+            }
+        }
+
         let uuid7_bytes = uuid7_string_to_bytes(uuid7);
 
         let Some(msg) = self.db.load_queued_message(&uuid7_bytes).await? else {
-            // Row missing or already claimed by a live pipeline — nothing to do.
-            return Ok(());
+            // Row missing or already driven past 'queued' by a terminal write.
+            return Ok(false);
         };
 
         let state = PipelineState {
@@ -388,6 +666,9 @@ impl PipelineOrchestrator {
             audio: Vec::new(),
             audio_type: String::new(),
             audio_stage: String::new(),
+            pre_process_completed_at: None,
+            in_process_completed_at: None,
+            audio_type_markers: Vec::new(),
         };
 
         {
@@ -395,17 +676,61 @@ impl PipelineOrchestrator {
             states.insert(uuid7.to_string(), state);
         }
 
-        self.db.set_pipeline_status(&uuid7_bytes, "processing").await?;
-
         self.broadcast_pre_process(uuid7).await?;
 
-        Ok(())
+        Ok(true)
+    }
+
+    /// ONE terminating pass of the crash-recovery drain: read the stranded
+    /// 'queued' uuids, then re-drive each of them.
+    ///
+    /// This is deliberately single-pass, and that is a correctness fix, not a
+    /// simplification. It used to loop until `get_queued_uuids` came back
+    /// empty, which was only safe while a started message moved its row to
+    /// 'processing'. It no longer does anything of the sort: a message the
+    /// pipeline owns stays 'queued' for its whole flight, because the only
+    /// status write is the terminal one
+    /// ([`DatabaseManager::write_terminal_outcome`]). So the next iteration
+    /// re-selected the row the previous one had just re-driven, `recover_one`
+    /// returned early because the message was already in `pipeline_states`, the
+    /// row was still 'queued' — and the loop spun on SELECTs against the
+    /// timeline DB forever.
+    ///
+    /// One pass is also COMPLETE, not just terminating: every stranded row is
+    /// in the snapshot this reads (rows are only ever inserted 'queued', so a
+    /// row inserted after the snapshot is a message the live pipeline owns and
+    /// drives itself), and a row this pass could not drive is handed back to
+    /// the caller to log rather than retried in a tight loop.
+    pub async fn drain_queued_once(&self) -> Result<RecoveryDrain, Box<dyn std::error::Error>> {
+        let uuids = self.db.get_queued_uuids().await?;
+        let mut drain = RecoveryDrain {
+            considered: uuids.len(),
+            ..Default::default()
+        };
+        for uuid7 in uuids {
+            match self.recover_one(&uuid7).await {
+                Ok(true) => drain.claimed += 1,
+                Ok(false) => {}
+                Err(e) => drain.failures.push((uuid7, e.to_string())),
+            }
+        }
+        Ok(drain)
     }
 
     async fn broadcast_pre_process(
         &self,
         uuid7: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // PAUSE GATE 1 of 3 — the entry gate. By the time a message reaches
+        // here its timeline row is written and its state is live, so the pause
+        // holds the CHAIN, not the message: nothing is lost, and resume replays
+        // this same fanout from `HoldPoint::Entry`. Both entries into the chain
+        // funnel through here (live ingest and crash recovery), so one gate
+        // covers both.
+        if self.hold_if_paused(uuid7, HoldPoint::Entry).await {
+            return Ok(());
+        }
+
         let state = {
             let states = self.pipeline_states.lock().await;
             states.get(uuid7).cloned()
@@ -503,6 +828,14 @@ impl PipelineOrchestrator {
         &self,
         uuid7: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // PAUSE GATE 2 of 3. Hold rather than dispatch: the message keeps its
+        // state and its `current_in_process_index`, so the replay sends it to the
+        // module it was about to reach — and the audit check, the stage stamp
+        // and the send all wait for the resume rather than half-happening.
+        if self.hold_if_paused(uuid7, HoldPoint::InProcess).await {
+            return Ok(());
+        }
+
         // Held-for-audit messages are not advanced or shown.
         if self.db.is_audited(&uuid7_string_to_bytes(uuid7)).await.unwrap_or(false) {
             return Ok(());
@@ -596,6 +929,14 @@ impl PipelineOrchestrator {
         &self,
         uuid7: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // PAUSE GATE 3 of 3 — same rule as the in-process gate: hold, keep the
+        // state, let the replay finish it. Note this also covers the
+        // no-module-connected completion below, so a message cannot reach a
+        // terminal 'complete' write while the pipeline is held.
+        if self.hold_if_paused(uuid7, HoldPoint::PostProcess).await {
+            return Ok(());
+        }
+
         // Held-for-audit messages are not advanced or shown.
         if self.db.is_audited(&uuid7_string_to_bytes(uuid7)).await.unwrap_or(false) {
             return Ok(());
@@ -676,41 +1017,95 @@ impl PipelineOrchestrator {
         Ok(())
     }
 
+    /// The accumulated result of a message's run, in the shape the single
+    /// terminal write takes.
+    ///
+    /// This IS the record while the message is in flight: the row has not been
+    /// written since the ingest INSERT, so everything the per-stage writes used
+    /// to mirror column-by-column is read straight off the state here and lands
+    /// in one statement. `post_process_completed_at` / `persisted_at` are
+    /// deliberately absent — the terminal write stamps those itself, and only
+    /// for a message that completed.
+    fn result_of(state: &PipelineState) -> PipelineResult {
+        PipelineResult {
+            // Always present: the state seeds it with the raw message, so a
+            // message no module touched still persists its text.
+            processed_message: Some(state.processed_message.clone()),
+            pre_process_completed_at: state.pre_process_completed_at,
+            in_process_completed_at: state.in_process_completed_at,
+            audio: if state.audio.is_empty() {
+                None
+            } else {
+                Some((state.audio_type.clone(), state.audio.clone()))
+            },
+            audio_type_markers: state.audio_type_markers.clone(),
+        }
+    }
+
+    /// The accumulated result for `uuid7`, leaving the state in place.
+    async fn result_snapshot(&self, uuid7: &str) -> PipelineResult {
+        let states = self.pipeline_states.lock().await;
+        states.get(uuid7).map(Self::result_of).unwrap_or_default()
+    }
+
+    /// The accumulated result for `uuid7`, dropping the in-memory state: a
+    /// terminal message is finished, so nothing more should be able to change
+    /// it. `None` when there is no state (a late duplicate from a module that
+    /// replied after the message was already terminal).
+    async fn take_result(&self, uuid7: &str) -> Option<PipelineResult> {
+        let mut states = self.pipeline_states.lock().await;
+        states.remove(uuid7).map(|s| Self::result_of(&s))
+    }
+
+    /// Stamp `pre_process_completed_at` IN MEMORY. The timestamp is carried out
+    /// by the message's single terminal write, so the database sees no
+    /// per-stage UPDATE while the message is in flight — and the value is the
+    /// same one the per-stage write used to record.
+    async fn note_pre_process_completed(&self, uuid7: &str) {
+        let now = now_ms();
+        let mut states = self.pipeline_states.lock().await;
+        if let Some(state) = states.get_mut(uuid7) {
+            state.pre_process_completed_at = Some(now);
+        }
+    }
+
+    /// [`Self::note_pre_process_completed`] for the in-process stage.
+    async fn note_in_process_completed(&self, uuid7: &str) {
+        let now = now_ms();
+        let mut states = self.pipeline_states.lock().await;
+        if let Some(state) = states.get_mut(uuid7) {
+            state.in_process_completed_at = Some(now);
+        }
+    }
+
     async fn mark_complete(
         &self,
         uuid7: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let uuid7_bytes = uuid7_string_to_bytes(uuid7);
 
-        // Held-for-audit messages stay held, not completed.
+        // Held-for-audit messages stay held, not completed. The run's
+        // accumulated result still lands on the row (the per-stage writes used
+        // to leave it there), but the hold itself is untouched: only
+        // `release_audit` may release it. The state and the pending acks are
+        // left in place, exactly as this path always did.
         if self.db.is_audited(&uuid7_bytes).await.unwrap_or(false) {
+            let held = self.result_snapshot(uuid7).await;
+            self.db
+                .write_terminal_outcome(&uuid7_bytes, &PipelineOutcome::AuditHeld, &held)
+                .await?;
             return Ok(());
         }
 
-        // Persist the final processed text (what the pipeline produced) before
-        // dropping the in-memory state. Without this, a message that no module
-        // explicitly modified completes with a NULL processed_message even
-        // though it went through the whole pipeline.
-        {
-            let states = self.pipeline_states.lock().await;
-            if let Some(state) = states.get(uuid7) {
-                self.db
-                    .set_processed_message(&uuid7_bytes, &state.processed_message)
-                    .await?;
-            }
-        }
-
-        {
-            let mut states = self.pipeline_states.lock().await;
-            states.remove(uuid7);
-        }
-
-        self.db.update_stage_completed(&uuid7_bytes, "post_process").await?;
-        // A message is only truly persisted when the whole pipeline has run;
-        // record when that happened (the `persisted_at` column is otherwise
-        // never populated for normally-completed messages).
-        self.db.update_stage_completed(&uuid7_bytes, "persisted").await?;
-        self.db.set_pipeline_status(&uuid7_bytes, "complete").await?;
+        // Take the final processed text, audio and stage timestamps out of
+        // memory (what the pipeline produced) and land them with the terminal
+        // status in ONE write. Without the processed text a message that no
+        // module explicitly modified would complete with a NULL
+        // processed_message even though it went through the whole pipeline.
+        let result = self.take_result(uuid7).await.unwrap_or_default();
+        self.db
+            .write_terminal_outcome(&uuid7_bytes, &PipelineOutcome::Complete, &result)
+            .await?;
 
         let mut ack_guard = self.ack_tracker.lock().await;
         ack_guard.ack(uuid7);
@@ -725,12 +1120,44 @@ impl PipelineOrchestrator {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let uuid7_bytes = uuid7_string_to_bytes(uuid7);
 
-        {
-            let mut states = self.pipeline_states.lock().await;
-            states.remove(uuid7);
-        }
+        // Everything the run got as far as producing lands with the failure —
+        // the per-stage writes had already mirrored it onto the row by the time
+        // the failure was recorded.
+        let result = self.take_result(uuid7).await.unwrap_or_default();
+        self.db
+            .write_terminal_outcome(&uuid7_bytes, &PipelineOutcome::Failed(error.to_string()), &result)
+            .await?;
 
-        self.db.set_error(&uuid7_bytes, error).await?;
+        let mut ack_guard = self.ack_tracker.lock().await;
+        ack_guard.ack(uuid7);
+
+        Ok(())
+    }
+
+    /// A module handed the message back marked for abandonment
+    /// (`MessageInProcess.abandon_message`). The flag has been on the wire — and
+    /// plumbed through by modules — since v1, but the engine never read it, so
+    /// the message carried on down the chain as if nothing had happened. It is a
+    /// terminal outcome now: the chain stops here, the message's pending acks are
+    /// cleared so a sibling module's late ack cannot restart it, and the row
+    /// lands a 'dropped' outcome with everything the run had produced.
+    ///
+    /// A late/duplicate abandon for a message that already reached a terminal
+    /// state is ignored: the row is the record, and only a message that is
+    /// still in flight can be abandoned.
+    async fn mark_dropped(
+        &self,
+        uuid7: &str,
+        reason: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(result) = self.take_result(uuid7).await else {
+            return Ok(());
+        };
+        let uuid7_bytes = uuid7_string_to_bytes(uuid7);
+
+        self.db
+            .write_terminal_outcome(&uuid7_bytes, &PipelineOutcome::Dropped(reason.to_string()), &result)
+            .await?;
 
         let mut ack_guard = self.ack_tracker.lock().await;
         ack_guard.ack(uuid7);
@@ -762,14 +1189,12 @@ impl PipelineOrchestrator {
         match stage.as_str() {
             "pre_process" => {
                 if !still_pending {
-                    let uuid7_bytes = uuid7_string_to_bytes(uuid7);
-                    self.db.update_stage_completed(&uuid7_bytes, "pre_process").await?;
+                    self.note_pre_process_completed(uuid7).await;
                     self.start_in_process(uuid7).await?;
                 }
             }
             "in_process" => {
-                let uuid7_bytes = uuid7_string_to_bytes(uuid7);
-                self.db.update_stage_completed(&uuid7_bytes, "in_process").await?;
+                self.note_in_process_completed(uuid7).await;
 
                 let next_index = {
                     let mut states = self.pipeline_states.lock().await;
@@ -801,6 +1226,19 @@ impl PipelineOrchestrator {
     pub async fn handle_timeout(
         &self,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // PAUSE GATE (the sweep) — and the one that decides whether pausing can
+        // ever LOSE a message. `sent_at` is wall-clock: a sweep that ran while
+        // the engine was paused would find every in-flight stage long expired
+        // and mark those messages FAILED, so a ten-minute pause would destroy
+        // exactly the messages it was meant to be holding. So the sweep does not
+        // advance at all while paused, and `resume` restarts every pending
+        // ack's clock before running it — each in-flight message then gets its
+        // FULL budget from the moment processing resumes, and one that really
+        // has a dead module still times out.
+        if self.is_paused().await {
+            return Ok(());
+        }
+
         let cfg = self.config_snapshot().await;
         let timed_out = {
             let mut ack_guard = self.ack_tracker.lock().await;
@@ -809,6 +1247,15 @@ impl PipelineOrchestrator {
 
         for entry in timed_out {
             let is_critical = cfg.critical_modules.contains(&entry.module_name);
+            // Name the stalling module: a stage waits for EVERY one of its
+            // modules, so one silent module turns every message into a timeout
+            // wait. Without this line the only symptom is "chat feels slow".
+            eprintln!(
+                "[pipeline] stage '{}' timed out waiting for '{}' after {}ms",
+                entry.stage,
+                entry.module_name,
+                entry.timeout.as_millis()
+            );
 
             if is_critical {
                 self.mark_failed(
@@ -824,13 +1271,11 @@ impl PipelineOrchestrator {
                 if !still_pending {
                     match entry.stage.as_str() {
                         "pre_process" => {
-                            let uuid7_bytes = uuid7_string_to_bytes(&entry.uuid7);
-                            self.db.update_stage_completed(&uuid7_bytes, "pre_process").await?;
+                            self.note_pre_process_completed(&entry.uuid7).await;
                             self.start_in_process(&entry.uuid7).await?;
                         }
                         "in_process" => {
-                            let uuid7_bytes = uuid7_string_to_bytes(&entry.uuid7);
-                            self.db.update_stage_completed(&uuid7_bytes, "in_process").await?;
+                            self.note_in_process_completed(&entry.uuid7).await;
 
                             let next_index = {
                                 let mut states = self.pipeline_states.lock().await;
@@ -860,9 +1305,13 @@ impl PipelineOrchestrator {
         Ok(())
     }
 
-    /// Record rendered audio for a message: persisted to the timeline (so the
-    /// web UI can retrieve it) and carried on the pipeline state so audio from
-    /// an earlier stage flows forward to post-process modules / displays.
+    /// Record rendered audio on the message: carried on the pipeline state so
+    /// audio from an earlier stage flows forward to post-process modules /
+    /// displays, and persisted to the timeline by the message's single terminal
+    /// write (so the web UI can still retrieve it). The per-stage `set_audio` —
+    /// a SELECT to read the flags back plus an UPDATE, for every stage that
+    /// produced audio — is gone; the state carries the bytes and the content
+    /// type marker until the one write at the end.
     async fn store_audio(
         &self,
         uuid7: &str,
@@ -874,15 +1323,19 @@ impl PipelineOrchestrator {
             return Ok(());
         }
         let mime = if audio_type.is_empty() { "audio/mpeg" } else { audio_type };
-        {
-            let mut states = self.pipeline_states.lock().await;
-            if let Some(state) = states.get_mut(uuid7) {
-                state.audio = audio.to_vec();
-                state.audio_type = mime.to_string();
-                state.audio_stage = stage.to_string();
+        let mut states = self.pipeline_states.lock().await;
+        if let Some(state) = states.get_mut(uuid7) {
+            state.audio = audio.to_vec();
+            state.audio_type = mime.to_string();
+            state.audio_stage = stage.to_string();
+            // `set_audio` appended `audio_type=<mime>` to the row's flags on
+            // every call and skipped a marker already there; record the same
+            // markers so the terminal write appends the same flags string.
+            let marker = format!("audio_type={}", mime);
+            if !state.audio_type_markers.contains(&marker) {
+                state.audio_type_markers.push(marker);
             }
         }
-        self.db.set_audio(&uuid7_string_to_bytes(uuid7), mime, audio).await?;
         Ok(())
     }
 
@@ -921,12 +1374,10 @@ impl PipelineOrchestrator {
                 {
                     let mut states = self.pipeline_states.lock().await;
                     if let Some(state) = states.get_mut(&msg.message_uuid7) {
-                        state.processed_message = processed.clone();
+                        state.processed_message = processed;
                     }
                 }
 
-                let uuid7_bytes = uuid7_string_to_bytes(&msg.message_uuid7);
-                self.db.set_processed_message(&uuid7_bytes, &processed).await?;
                 self.store_audio(&msg.message_uuid7, "pre", &msg.audio_type, &msg.audio).await?;
                 self.handle_ack(&msg.message_uuid7, &container.module_name).await?;
                 Ok(true)
@@ -943,9 +1394,18 @@ impl PipelineOrchestrator {
                     }
                 }
 
-                let uuid7_bytes = uuid7_string_to_bytes(&msg.message_uuid7);
-                self.db.set_processed_message(&uuid7_bytes, &msg.processed_message).await?;
                 self.store_audio(&msg.message_uuid7, "in", &msg.audio_type, &msg.audio).await?;
+
+                // The module handed the message back marked for abandonment: the
+                // chain ends here instead of continuing to the next stage.
+                if msg.abandon_message {
+                    self.mark_dropped(
+                        &msg.message_uuid7,
+                        &format!("abandoned by module '{}'", container.module_name),
+                    ).await?;
+                    return Ok(true);
+                }
+
                 self.handle_ack(&msg.message_uuid7, &container.module_name).await?;
                 Ok(true)
             }
@@ -961,8 +1421,6 @@ impl PipelineOrchestrator {
                     }
                 }
 
-                let uuid7_bytes = uuid7_string_to_bytes(&msg.message_uuid7);
-                self.db.set_processed_message(&uuid7_bytes, &msg.processed_message).await?;
                 self.store_audio(&msg.message_uuid7, "post", &msg.audio_type, &msg.audio).await?;
                 self.handle_ack(&msg.message_uuid7, &container.module_name).await?;
                 Ok(true)
@@ -976,5 +1434,187 @@ impl PipelineOrchestrator {
             }
             _ => Ok(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod timeout_sweep_tests {
+    use super::*;
+
+    /// The sweep bounds how long a stage waits AFTER its ack budget expires.
+    /// It used to ride on the 15s DB-sync interval, so a stage that fell back to
+    /// the timeout path was quantised to a 15s grid — measured on the real
+    /// timeline DB as p50 15s / p90 45s per message, with the deltas landing on
+    /// exactly 15s and 30s.
+    #[test]
+    fn the_sweep_interval_is_far_below_the_ack_timeout() {
+        let sweep = super::TIMEOUT_SWEEP_INTERVAL;
+        let ack = Duration::from_millis(DEFAULT_ACK_TIMEOUT_MS);
+        assert!(
+            sweep < ack,
+            "sweep {:?} must be well under the {:?} ack budget",
+            sweep,
+            ack
+        );
+        // And an order of magnitude under the 15s housekeeping loop it replaced.
+        assert!(
+            sweep * 10 < Duration::from_secs(15),
+            "sweep {:?} is not meaningfully tighter than the old 15s loop",
+            sweep
+        );
+    }
+
+    /// A stage waits for EVERY module it was sent to, so a timed-out entry must
+    /// only advance the message when nothing else is still pending.
+    #[test]
+    fn a_timed_out_stage_does_not_advance_while_others_are_pending() {
+        let mut tracker = AckTracker::new();
+        // One entry already expired, one still live.
+        tracker.inject(
+            "uuid-1".to_string(),
+            vec![
+                PendingAck {
+                    uuid7: "uuid-1".into(),
+                    stage: "pre_process".into(),
+                    module_name: "slow".into(),
+                    sent_at: Instant::now() - Duration::from_secs(10),
+                    timeout: Duration::from_millis(1),
+                },
+                PendingAck {
+                    uuid7: "uuid-1".into(),
+                    stage: "pre_process".into(),
+                    module_name: "live".into(),
+                    sent_at: Instant::now(),
+                    timeout: Duration::from_secs(30),
+                },
+            ],
+        );
+        let timed_out = tracker.check_timeouts();
+        assert_eq!(timed_out.len(), 1, "only the expired entry times out");
+        assert_eq!(timed_out[0].module_name, "slow");
+        assert!(
+            tracker.has_pending("uuid-1"),
+            "the message must NOT be considered acked while 'live' is still pending"
+        );
+
+        // Once the survivor acks, the message is free to advance.
+        assert_eq!(tracker.ack_module("uuid-1", "live"), Some("pre_process".into()));
+        assert!(!tracker.has_pending("uuid-1"));
+    }
+
+    /// The diagnostic must name the module and stage, otherwise a stall is
+    /// indistinguishable from "chat is just slow".
+    #[test]
+    fn a_timeout_names_the_stalling_module() {
+        let mut tracker = AckTracker::new();
+        tracker.track(
+            "uuid-2".to_string(),
+            "post_process".into(),
+            "tts-service".into(),
+            0,
+        );
+        let timed_out = tracker.check_timeouts();
+        assert_eq!(timed_out.len(), 1);
+        let e = &timed_out[0];
+        assert_eq!(e.module_name, "tts-service");
+        assert_eq!(e.stage, "post_process");
+    }
+
+    /// A pending ack ages on WALL-CLOCK, so an entry that predates a long pause
+    /// is "expired" the instant the engine resumes — which would fail every
+    /// message that was in flight, i.e. turn a pause into data loss. The
+    /// rebase is what makes paused time not count, and it must not become a
+    /// blanket amnesty: a budget that really does expire afterwards still times
+    /// out.
+    #[test]
+    fn restarting_the_clocks_forgives_the_paused_interval_and_nothing_more() {
+        let aged = || PendingAck {
+            uuid7: "uuid-3".into(),
+            stage: "in_process".into(),
+            module_name: "mid".into(),
+            // Ten minutes ago — a pause, not a slow module.
+            sent_at: Instant::now() - Duration::from_secs(600),
+            timeout: Duration::from_secs(3),
+        };
+
+        // Without the rebase, the ten minutes are charged to the module.
+        let mut unrebased = AckTracker::new();
+        unrebased.inject("uuid-3".to_string(), vec![aged()]);
+        assert_eq!(
+            unrebased.check_timeouts().len(),
+            1,
+            "an un-rebased entry is expired by the wall-clock it sat through"
+        );
+
+        // With it, the message is back in credit for a full budget.
+        let mut rebased = AckTracker::new();
+        rebased.inject("uuid-3".to_string(), vec![aged()]);
+        rebased.restart_clocks();
+        assert!(
+            rebased.check_timeouts().is_empty(),
+            "the paused interval must not count against the message"
+        );
+        assert!(rebased.has_pending("uuid-3"), "the stage is still waiting, not reaped");
+
+        // ...and a budget that really does expire from the rebase point still
+        // does, so the rebase is a hand-back of credit, not an amnesty.
+        rebased.track(
+            "uuid-3".to_string(),
+            "post_process".into(),
+            "tts".into(),
+            0,
+        );
+        let timed_out = rebased.check_timeouts();
+        assert_eq!(timed_out.len(), 1);
+        assert_eq!(timed_out[0].stage, "post_process");
+    }
+}
+
+#[cfg(test)]
+mod timeout_wiring_tests {
+    /// The sweep constant and the diagnostic are both correct in isolation, but
+    /// the latency only improves if the engine actually USES them. Assert the
+    /// wiring structurally — the alternative is a green suite while a 15s
+    /// quantisation is still in production.
+    #[test]
+    fn the_engine_runs_the_sweep_on_the_tight_interval() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("crate::pipeline::TIMEOUT_SWEEP_INTERVAL"),
+            "the sweep task must use the tight interval, not a literal"
+        );
+        // And the 15s DB-sync loop must NOT be doing the sweeping any more.
+        let sync_start = src.find("let mut interval = tokio::time::interval(sync_interval);")
+            .expect("sync loop not found");
+        let sweep_start = src.find("crate::pipeline::TIMEOUT_SWEEP_INTERVAL")
+            .expect("sweep task not found");
+        assert!(
+            sweep_start < sync_start,
+            "the dedicated sweep task must be spawned before the sync loop"
+        );
+        // Exactly one handle_timeout call site, and it is the tight one.
+        assert_eq!(
+            src.matches("orchestrator.handle_timeout()").count(),
+            1,
+            "handle_timeout must have exactly one call site (the tight sweep)"
+        );
+    }
+
+    #[test]
+    fn a_timeout_is_logged_with_its_module_and_stage() {
+        let src = include_str!("pipeline.rs");
+        let start = src.find("pub async fn handle_timeout(")
+            .expect("handle_timeout not found");
+        let end = start + src[start..].find("\n    pub async fn ")
+            .unwrap_or(src[start..].len());
+        let body = &src[start..end];
+        assert!(
+            body.contains("entry.module_name") && body.contains("entry.stage"),
+            "the timeout log must name the stalling module and the stage"
+        );
+        assert!(
+            body.contains("timed out waiting for"),
+            "the timeout log should say what it is reporting"
+        );
     }
 }

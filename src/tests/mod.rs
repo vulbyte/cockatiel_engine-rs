@@ -5,8 +5,11 @@
 
 mod auth_tests;
 mod command_tests;
+mod ingest_fetch_tests;
 mod sql_tests;
 mod ack_tests;
 mod pipeline_tests;
+mod pause_tests;
 mod db_tests;
 mod config_tests;
+mod shutdown_tests;

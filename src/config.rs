@@ -66,6 +66,25 @@ pub struct Config {
     /// 'queued' messages from the timeline DB. Defaults to 10.
     #[serde(default = "default_recovery_grace_secs")]
     pub recovery_grace_secs: u64,
+
+    /// Whether the engine starts with the message pipeline PAUSED. When true
+    /// (the default) the engine ingests, persists and parses commands normally
+    /// but dispatches nothing to any module until the control surface resumes
+    /// it; queued messages accumulate and are replayed on resume, so nothing is
+    /// lost. Overridden by `COCKATIEL_START_PAUSED` — see [`start_paused`].
+    #[serde(default = "default_start_paused")]
+    pub start_paused: bool,
+
+    /// Whether the engine honours an `engine_shutdown` request from the control
+    /// surface (the TUI). Defaults to false.
+    ///
+    /// The engine decides for itself whether to go down: shutting the engine
+    /// stops ingest, the pipeline and every connected module, so it must never
+    /// happen because something that merely holds a socket asked nicely — or
+    /// asked maliciously. An engine that has never heard of this feature has to
+    /// refuse, so false is the default and the operator opts in deliberately.
+    #[serde(default = "default_shutdown_on_request")]
+    pub shutdown_on_request: bool,
 }
 
 fn default_probe_interval_secs() -> u64 {
@@ -102,6 +121,48 @@ fn default_send_timeout_secs() -> u64 {
 
 fn default_recovery_grace_secs() -> u64 {
     10
+}
+
+/// The engine boots PAUSED. See [`start_paused`].
+fn default_start_paused() -> bool {
+    true
+}
+
+/// Engine shutdown is DISABLED until an operator opts in. See
+/// [`shutdown_on_request`](Config::shutdown_on_request).
+fn default_shutdown_on_request() -> bool {
+    false
+}
+
+/// Should the engine boot with the message pipeline held?
+///
+/// Paused is the default, and it is the safe direction to be wrong in: a
+/// backlog of unattended messages must never be dispatched to live modules
+/// without an operator asking for it. Nothing is lost while paused — every
+/// message is written to the timeline as 'queued' and replayed on resume.
+///
+/// `COCKATIEL_START_PAUSED` overrides the config value, following the same
+/// precedence as every other environment override in the engine (a real
+/// environment variable wins over the file, and `load_env_file` has already
+/// pulled any `.env` key into the environment by the time this is read). It is
+/// the headless / CI escape hatch: set it to `0` (or `false`) to boot running,
+/// because nothing would ever press the resume key. An unparseable value falls
+/// back to the config value rather than guessing in either direction.
+pub fn start_paused(config: &Config) -> bool {
+    resolve_start_paused(config, env::var("COCKATIEL_START_PAUSED").ok().as_deref())
+}
+
+/// [`start_paused`] with the environment value passed in, so the precedence and
+/// the parsing are testable without mutating the process environment.
+pub fn resolve_start_paused(config: &Config, env_value: Option<&str>) -> bool {
+    // Trimmed and lowercased, so `0`, `FALSE` and ` off ` all mean the same
+    // thing — a value that is merely mis-cased must not fall through to the
+    // default and boot the engine paused for a headless run that asked to run.
+    match env_value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("0") | Some("false") | Some("no") | Some("off") => false,
+        Some("1") | Some("true") | Some("yes") | Some("on") => true,
+        _ => config.start_paused,
+    }
 }
 
 pub struct ConfigState {
@@ -282,12 +343,14 @@ pub fn backfill_config_defaults(state: &Arc<Mutex<ConfigState>>) {
     };
 
     let mut changed = false;
-    let defaults: [(&str, serde_json::Value); 5] = [
+    let defaults: [(&str, serde_json::Value); 7] = [
         ("max_message_bytes", serde_json::json!(default_max_message_bytes())),
         ("max_connections", serde_json::json!(default_max_connections())),
         ("handshake_timeout_secs", serde_json::json!(default_handshake_timeout_secs())),
         ("send_timeout_secs", serde_json::json!(default_send_timeout_secs())),
         ("recovery_grace_secs", serde_json::json!(default_recovery_grace_secs())),
+        ("start_paused", serde_json::json!(default_start_paused())),
+        ("shutdown_on_request", serde_json::json!(default_shutdown_on_request())),
     ];
     for (key, value) in defaults {
         if obj.get(key).is_none() {
@@ -329,7 +392,9 @@ pub fn create_config(directory: PathBuf) -> Result<String, String> {
     "max_connections": 128,
     "handshake_timeout_secs": 10,
     "send_timeout_secs": 5,
-    "recovery_grace_secs": 10
+    "recovery_grace_secs": 10,
+    "start_paused": true,
+    "shutdown_on_request": false
 }"#
     .to_string();
 

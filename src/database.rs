@@ -59,10 +59,101 @@ pub struct QueuedMessage {
     pub user_uuid7: String,
 }
 
+/// The terminal state a timeline row ends in.
+///
+/// A message's `pipeline_status` is written exactly ONCE, at the end of its
+/// chain, by [`DatabaseManager::write_terminal_outcome`]. Between the ingest
+/// INSERT ('queued') and that write the row is never touched again: while a
+/// message is in flight the in-memory pipeline state and [`crate::pipeline::AckTracker`]
+/// are the source of truth, and the database learns the outcome in one
+/// round-trip instead of a dozen per-stage UPDATEs against the same row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipelineOutcome {
+    /// The whole chain ran: `pipeline_status = 'complete'`.
+    Complete,
+    /// The message failed: `pipeline_status = 'failed'` + the reason in
+    /// `error_message`. (A module erroring is not this — that is logged and
+    /// recorded against the module, and the message is left to finish.)
+    Failed(String),
+    /// The chain was abandoned before it finished: `pipeline_status = 'dropped'`
+    /// + the reason in `error_message`.
+    Dropped(String),
+    /// Take the hold: `pipeline_status = 'audit'` with the reason in `flags`
+    /// (the column the audit prompt and `list_audit` read the reason back from).
+    Audit(String),
+    /// The row is ALREADY held: land the run's accumulated result on it and
+    /// leave the hold alone — `pipeline_status` is not written at all and the
+    /// reason already in `flags` is untouched. The pipeline reaches this when a
+    /// message an operator is holding finishes its chain: the data the
+    /// per-stage writes used to leave behind still lands, the hold does not get
+    /// released.
+    AuditHeld,
+}
+
+impl PipelineOutcome {
+    /// The `pipeline_status` this outcome lands the row on, or `None` when the
+    /// outcome deliberately leaves the status column alone.
+    pub fn status(&self) -> Option<&'static str> {
+        match self {
+            Self::Complete => Some("complete"),
+            Self::Failed(_) => Some("failed"),
+            Self::Dropped(_) => Some("dropped"),
+            Self::Audit(_) => Some("audit"),
+            Self::AuditHeld => None,
+        }
+    }
+
+    /// The `error_message` this outcome carries, or `None` to leave the column
+    /// exactly as it is — a completed or held message has no error.
+    fn error(&self) -> Option<&str> {
+        match self {
+            Self::Failed(e) | Self::Dropped(e) => Some(e),
+            Self::Complete | Self::Audit(_) | Self::AuditHeld => None,
+        }
+    }
+}
+
+/// Everything a message's run accumulated, gathered in memory while the message
+/// is in flight and handed to [`DatabaseManager::write_terminal_outcome`] once at
+/// the end. This is what the per-stage writes used to mirror into the row one
+/// column at a time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PipelineResult {
+    /// The final processed text. `None` leaves `processed_message` alone.
+    pub processed_message: Option<String>,
+    /// When `pre_process` finished (its last module acked), ms since the epoch.
+    pub pre_process_completed_at: Option<i64>,
+    /// When `in_process` finished, ms since the epoch.
+    pub in_process_completed_at: Option<i64>,
+    /// Rendered audio: `(content type, bytes)`. `None` — or empty bytes —
+    /// means the message carries no audio, and the row's existing `data_blob`
+    /// and audio marker in `flags` are left untouched rather than clobbered.
+    pub audio: Option<(String, Vec<u8>)>,
+    /// Every `audio_type=<mime>` marker the run produced, in the order the
+    /// stage writes used to append them. A message that rendered audio at two
+    /// stages carries both markers, exactly as the per-stage `set_audio` calls
+    /// left them in `flags`.
+    pub audio_type_markers: Vec<String>,
+}
+
+/// Append `clause = ?N` to a SET list, binding `value` as the Nth parameter.
+fn push_set(sets: &mut Vec<String>, args: &mut Vec<Value>, clause: &str, value: Value) {
+    sets.push(format!("{} = ?{}", clause, args.len() + 1));
+    args.push(value);
+}
+
 #[derive(Debug, Clone)]
 pub struct DatabaseManager {
     config: DatabaseConfig,
     local: Arc<Mutex<Option<turso::Connection>>>,
+    /// Counts the calls this manager makes into the database layer. Test-only:
+    /// the whole point of the consolidated write is how much a message costs, and
+    /// the turso driver exposes no statement hook to count them from the outside
+    /// — so every method takes its connection through [`Self::locked`] and the
+    /// tests read the delta. (One call == one `locked()`; `set_audio` is two SQL
+    /// statements under one call.) Compiled out of non-test builds entirely.
+    #[cfg(test)]
+    round_trips: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl DatabaseManager {
@@ -70,7 +161,30 @@ impl DatabaseManager {
         Self {
             config,
             local: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            round_trips: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// The one door every call into the database goes through, so the tests can
+    /// count them.
+    #[cfg(test)]
+    async fn locked(&self) -> tokio::sync::MutexGuard<'_, Option<turso::Connection>> {
+        self.round_trips
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.local.lock().await
+    }
+
+    #[cfg(not(test))]
+    async fn locked(&self) -> tokio::sync::MutexGuard<'_, Option<turso::Connection>> {
+        self.local.lock().await
+    }
+
+    /// Test-only: read the call count and reset it to zero, so a test can measure
+    /// exactly what happened between two points.
+    #[cfg(test)]
+    pub fn take_round_trips(&self) -> usize {
+        self.round_trips.swap(0, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// True when a backup DB path is configured (and thus a backup is usable).
@@ -132,7 +246,7 @@ impl DatabaseManager {
         };
 
         {
-            let mut local = self.local.lock().await;
+            let mut local = self.locked().await;
             *local = Some(conn);
         }
 
@@ -166,7 +280,7 @@ impl DatabaseManager {
     /// connection (even clones), so we discard it and reopen the DB file.
     pub async fn reopen_local(&self) -> Result<(), Box<dyn std::error::Error>> {
         let fresh = Self::open_local(&self.config.local_path).await?;
-        let mut local = self.local.lock().await;
+        let mut local = self.locked().await;
         *local = Some(fresh);
         Ok(())
     }
@@ -188,7 +302,7 @@ impl DatabaseManager {
         command: &str,
         flags: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         conn.execute(
@@ -209,6 +323,126 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// The one write that ENDS a message: the final processed text, the audio,
+    /// the stage-completion timestamps and the terminal status all land in a
+    /// single round-trip. This replaces the twelve writes (fourteen calls into
+    /// this layer — `set_audio` is two statements) the pipeline used to issue
+    /// against the same row for one message through all three stages:
+    /// `set_pipeline_status` at the start, `set_processed_message` / `set_audio` /
+    /// `update_stage_completed` per stage, then the completion tail. The row ends
+    /// up with exactly the same columns and values, it just stops being rewritten
+    /// while the message is in flight.
+    ///
+    /// Two rules keep that equivalence:
+    ///
+    /// * A column the run never produced is left OUT of the SET list rather than
+    ///   bound as NULL — so a message with no audio keeps whatever `data_blob` /
+    ///   `flags` the row already had instead of being clobbered with empties.
+    /// * `post_process_completed_at` / `persisted_at` are stamped by this write
+    ///   and only for [`PipelineOutcome::Complete`]: they mean "the whole
+    ///   pipeline ran", so a failed, dropped or held message must not get them —
+    ///   exactly the contract the two `update_stage_completed` calls at the end
+    ///   of the old completion path had.
+    ///
+    /// A row held for audit is never moved to 'complete'. The hold is the
+    /// operator's queue item and only `release_audit` may release it, so a
+    /// pipeline that finishes a held message must not publish it behind the
+    /// operator's back; every other outcome lands exactly as it always did.
+    pub async fn write_terminal_outcome(
+        &self,
+        uuid7: &[u8],
+        outcome: &PipelineOutcome,
+        result: &PipelineResult,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let now = Self::now_ms();
+        let mut sets: Vec<String> = Vec::new();
+        let mut args: Vec<Value> = Vec::new();
+
+        // The terminal status. `AuditHeld` deliberately writes no status at all:
+        // the row is already held and stays exactly as it is.
+        if let Some(status) = outcome.status() {
+            push_set(
+                &mut sets,
+                &mut args,
+                "pipeline_status",
+                Value::Text(status.to_string()),
+            );
+        }
+        if let Some(error) = outcome.error() {
+            push_set(&mut sets, &mut args, "error_message", Value::Text(error.to_string()));
+        }
+
+        // What the run produced. `None` means "the run never got here".
+        if let Some(processed) = &result.processed_message {
+            push_set(
+                &mut sets,
+                &mut args,
+                "processed_message",
+                Value::Text(processed.clone()),
+            );
+        }
+        if let Some(ts) = result.pre_process_completed_at {
+            push_set(&mut sets, &mut args, "pre_process_completed_at", Value::Integer(ts));
+        }
+        if let Some(ts) = result.in_process_completed_at {
+            push_set(&mut sets, &mut args, "in_process_completed_at", Value::Integer(ts));
+        }
+        if matches!(outcome, PipelineOutcome::Complete) {
+            push_set(&mut sets, &mut args, "post_process_completed_at", Value::Integer(now));
+            push_set(&mut sets, &mut args, "persisted_at", Value::Integer(now));
+        }
+
+        // Audio: the bytes go in `data_blob` and the content type rides in
+        // `flags` as `audio_type=<mime>`. Appending to the row's own flags —
+        // rather than re-deriving the whole string in memory — is what lets one
+        // statement serve a normal row and a HELD one, whose `flags` column is
+        // the operator's hold reason and must survive. The join reproduces
+        // `set_audio`'s output exactly, empty-flags case included.
+        let audio = result
+            .audio
+            .as_ref()
+            .filter(|(_, bytes)| !bytes.is_empty() && !result.audio_type_markers.is_empty());
+        match audio {
+            Some((_, bytes)) => {
+                push_set(&mut sets, &mut args, "data_blob", Value::Blob(bytes.clone()));
+                let joined = args.len() + 1;
+                sets.push(format!(
+                    "flags = CASE WHEN flags IS NULL OR flags = '' THEN ?{joined} ELSE flags || ',' || ?{joined} END"
+                ));
+                args.push(Value::Text(result.audio_type_markers.join(",")));
+            }
+            None => {
+                if let PipelineOutcome::Audit(reason) = outcome {
+                    push_set(&mut sets, &mut args, "flags", Value::Text(reason.clone()));
+                }
+            }
+        }
+
+        // Nothing to say — an `AuditHeld` write for a row whose in-memory state
+        // is already gone. A bare `SET` is not a statement, and the row needs no
+        // change, so don't spend a round-trip on it.
+        if sets.is_empty() {
+            return Ok(());
+        }
+
+        let uuid_arg = args.len() + 1;
+        args.push(Value::Blob(uuid7.to_vec()));
+        let mut sql = format!(
+            "UPDATE timeline_events SET {} WHERE uuid7 = ?{}",
+            sets.join(", "),
+            uuid_arg
+        );
+        if matches!(outcome, PipelineOutcome::Complete) {
+            sql.push_str(" AND pipeline_status <> 'audit'");
+        }
+
+        let conn = self.locked().await;
+        let conn = conn.as_ref().ok_or("Local database not initialized")?;
+        conn.execute(&sql, args).await?;
+
+        Ok(())
+    }
+
     /// Insert a timeline archival event that is already 'complete' and marked
     /// as synced, so the message-pipeline queue and the remote sync never touch
     /// it. Used for module lifecycle logging and outbound platform messages
@@ -223,7 +457,7 @@ impl DatabaseManager {
         raw_message: &str,
         flags: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         let uuid7 = Uuid::now_v7().as_bytes().to_vec();
@@ -261,7 +495,7 @@ impl DatabaseManager {
         };
 
         let now = Self::now_ms();
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         let sql = format!("UPDATE timeline_events SET {} = ?1 WHERE uuid7 = ?2", field);
@@ -275,7 +509,7 @@ impl DatabaseManager {
         uuid7: &[u8],
         status: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         conn.execute(
@@ -291,7 +525,7 @@ impl DatabaseManager {
         uuid7: &[u8],
         error: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         conn.execute(
@@ -307,7 +541,7 @@ impl DatabaseManager {
         uuid7: &[u8],
         processed: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         conn.execute(
@@ -323,7 +557,7 @@ impl DatabaseManager {
         uuid7: &[u8],
         user_uuid: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         conn.execute(
@@ -339,7 +573,7 @@ impl DatabaseManager {
         uuid7: &[u8],
         data: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         conn.execute(
@@ -355,7 +589,7 @@ impl DatabaseManager {
         uuid7: &[u8],
         flags: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         conn.execute(
@@ -375,7 +609,7 @@ impl DatabaseManager {
         audio_type: &str,
         audio: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         // Append the content type to any existing flags.
@@ -411,7 +645,7 @@ impl DatabaseManager {
         &self,
         uuid7: &[u8],
     ) -> Result<Option<(String, Vec<u8>)>, Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         let mut rows = conn.query(
@@ -441,7 +675,7 @@ impl DatabaseManager {
         uuid7: &[u8],
         command: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         conn.execute(
@@ -456,7 +690,7 @@ impl DatabaseManager {
         &self,
         uuid7s: &[Vec<u8>],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
         let now = Self::now_ms();
 
@@ -473,7 +707,7 @@ impl DatabaseManager {
     pub async fn get_next_queued(
         &self,
     ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         let mut rows = conn.query(
@@ -492,7 +726,7 @@ impl DatabaseManager {
     pub async fn get_incomplete(
         &self,
     ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         let mut rows = conn.query(
@@ -512,7 +746,7 @@ impl DatabaseManager {
     pub async fn get_unsynced_count(
         &self,
     ) -> Result<i64, Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         let mut rows = conn.query(
@@ -532,7 +766,7 @@ impl DatabaseManager {
         &self,
         uuid7: &[u8],
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         let mut rows = conn.query(
@@ -595,7 +829,7 @@ impl DatabaseManager {
         // poison the shared mutex and brick the timeline DB. The clone is a
         // cheap shared handle (turso::Connection is Clone).
         let conn = {
-            let guard = self.local.lock().await;
+            let guard = self.locked().await;
             guard.as_ref().ok_or("Local database not initialized")?.clone()
         };
         let mut stmt = conn.prepare(sql).await?;
@@ -635,12 +869,26 @@ impl DatabaseManager {
         run.await.map_err(|e: Box<dyn std::error::Error>| e.to_string())
     }
 
-    /// Mark every 'processing' row as failed with the given reason. Called on
-    /// restart: mid-flight messages can never complete (the process that was
-    /// running them is gone), so they must not be left 'processing' forever.
-    /// Returns the number of rows updated.
+    /// Mark every 'processing' row as failed with the given reason. Returns the
+    /// number of rows updated.
+    ///
+    /// NOTHING THIS ENGINE WRITES IS EVER 'processing' ANY MORE, so this sweep
+    /// has no rows of its own to act on: a message is inserted 'queued' and
+    /// stays 'queued' until the single terminal write at the end of its chain
+    /// (see [`DatabaseManager::write_terminal_outcome`]), because the in-memory
+    /// pipeline state — not `pipeline_status` — is what marks a message as in
+    /// flight. It is kept, deliberately and harmlessly, for the one case it can
+    /// still serve: rows stranded in 'processing' by an engine build that
+    /// predates the consolidation. Those can never be resumed (the recovery
+    /// drain only re-drives 'queued' rows), so failing them is the right
+    /// outcome — and matching on 'processing' means it can never touch a row
+    /// the current engine owns.
+    ///
+    /// It is NOT the crash-recovery path any more. A message that was mid-flight
+    /// when the engine died is still 'queued' and is replayed to completion by
+    /// `get_queued_uuids` + `recover_one`, which now claims rows in memory.
     pub async fn mark_all_processing_as_failed(&self, reason: &str) -> Result<u64, Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         let result = conn.execute(
@@ -652,10 +900,15 @@ impl DatabaseManager {
     }
 
     /// Load a queued row's content by uuid7, if it is still `pipeline_status =
-    /// 'queued'`. Returns None when the row is missing or already claimed by a
-    /// live pipeline (moved off 'queued').
+    /// 'queued'`. Returns None when the row is missing or has already been
+    /// driven past 'queued' by a terminal write.
+    ///
+    /// NOTE: a message that is IN FLIGHT is 'queued' too now (the pipeline
+    /// writes no intermediate status), so this is no longer the "is a live
+    /// pipeline running this?" check it used to be — callers must pair it with
+    /// the in-memory claim (`recover_one` does, via `pipeline_states`).
     pub async fn load_queued_message(&self, uuid7: &[u8]) -> Result<Option<QueuedMessage>, Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         let mut rows = conn.query(
@@ -690,7 +943,7 @@ impl DatabaseManager {
     /// `FromValue for Vec<u8>` only accepts BLOB and `String` only TEXT, so
     /// neither alone is safe) — use `get_value` and decode both.
     pub async fn get_queued_uuids(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         let mut rows = conn.query(
@@ -719,7 +972,7 @@ impl DatabaseManager {
     /// Re-write those rows as BLOB so all byte-keyed queries (status updates,
     /// stage completion, recovery) work on them. Returns rows normalized.
     pub async fn normalize_uuid_storage(&self) -> Result<u64, Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
         let mut rows = conn.query(
@@ -749,24 +1002,29 @@ impl DatabaseManager {
     // ── Audit (held-for-review messages) ───────────────────────────────
 
     /// Hold a message for human review: status 'audit', reason stored in flags.
+    ///
+    /// A hold is a terminal outcome like any other, so it goes through the same
+    /// single write — with an EMPTY result, because taking a hold must not touch
+    /// any of the columns the pipeline accumulates. The statement is identical
+    /// to the one this used to issue (`pipeline_status = 'audit'`, `flags` =
+    /// reason) and is still awaited inline by the caller: it has to land before
+    /// the flagging module's ack is processed.
     pub async fn mark_audit(
         &self,
         uuid7: &[u8],
         reason: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
-        let conn = conn.as_ref().ok_or("Local database not initialized")?;
-        conn.execute(
-            "UPDATE timeline_events SET pipeline_status = 'audit', flags = ?1 WHERE uuid7 = ?2",
-            turso::params![reason, uuid7],
+        self.write_terminal_outcome(
+            uuid7,
+            &PipelineOutcome::Audit(reason.to_string()),
+            &PipelineResult::default(),
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Whether a message is currently held for audit.
     pub async fn is_audited(&self, uuid7: &[u8]) -> Result<bool, Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
         let mut rows = conn
             .query(
@@ -782,7 +1040,7 @@ impl DatabaseManager {
         &self,
         uuid7: &[u8],
     ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
         let mut rows = conn
             .query(
@@ -813,7 +1071,7 @@ impl DatabaseManager {
         limit: i32,
         offset: i32,
     ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
         let limit = if limit <= 0 { 100 } else { limit };
         let offset = if offset < 0 { 0 } else { offset };
@@ -854,7 +1112,7 @@ impl DatabaseManager {
         uuid7: &[u8],
         approve: bool,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
         if approve {
             conn.execute(
@@ -885,7 +1143,7 @@ impl DatabaseManager {
             return Ok(0);
         }
 
-        let conn = self.local.lock().await;
+        let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
         // Merge the WAL so the copy is authoritative — but only when a -wal
         // file actually exists for the local DB (checkpointing a missing WAL
@@ -917,7 +1175,7 @@ impl DatabaseManager {
     /// Force the local SQLite write-ahead log to merge into the main file and
     /// truncate. Called periodically and when the WAL exceeds ~5 MB.
     pub async fn checkpoint_wal(&self) {
-        if let Some(conn) = self.local.lock().await.as_ref().map(|c| c.clone()) {
+        if let Some(conn) = self.locked().await.as_ref().map(|c| c.clone()) {
             if let Ok(mut stmt) = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await {
                 while let Ok(Some(_)) = stmt.next().await {}
             }

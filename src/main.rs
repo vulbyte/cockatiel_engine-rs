@@ -46,35 +46,34 @@ mod database;
 use database::{DatabaseConfig, DatabaseManager};
 
 mod credentials;
-use credentials::{
-    credential_values_map, is_config_complete, save_module_credentials,
-    validate_credential_fields,
-};
 
 mod pipeline;
 use pipeline::{PipelineConfig, PipelineOrchestrator, SendOutcome};
 
+/* QUERY SURFACE */
+mod queries;
+use queries::{QueryContext, SharedShutdown, ShutdownStage};
+
 mod user_db_client;
-use user_db_client::{SharedUserDbClient, UserDbClient, userdb_response_to_json};
+use user_db_client::{SharedUserDbClient, UserDbClient};
 
 /* PROTOBUF STUFF */
 pub use cockatiel_proto::proto as cockatiel_protobuf;
 
-use cockatiel_protobuf::{
-    Container, container::Payload, ProcessPosition, DatabaseQueryResult, Prompt, PromptType, Log,
-    ChatMessage, Command, DatabaseQuery, MessageAck, MessagePreProcess, Shutdown, AuthVerify,
-};
+use cockatiel_protobuf::{Container, container::Payload, ProcessPosition, Prompt, PromptType, Log};
+
+mod engine_module;
 
 /// Where a PromptResponse should be routed. The engine's own prompts (module
 /// connection approval) wait on a oneshot; prompts originating from a module
 /// are forwarded back to that module's connection.
-enum PromptSink {
+pub(crate) enum PromptSink {
     Engine(oneshot::Sender<bool>),
     /// A module-originated prompt: (origin module name, response channel).
     Module(String, tokio::sync::mpsc::Sender<Container>),
 }
 
-type SharedPromptRoutes = Arc<Mutex<HashMap<String, PromptSink>>>;
+pub(crate) type SharedPromptRoutes = Arc<Mutex<HashMap<String, PromptSink>>>;
 
 /// The outcome of asking the user via a broadcast prompt.
 enum PromptOutcome {
@@ -349,25 +348,122 @@ fn classify_command(raw: &str, registry: &CommandRegistry) -> CommandAction {
     CommandAction::None
 }
 
+/// What the ingest-side command handling did to a message. The caller uses
+/// this to decide whether the user-db lookup is warranted at all, so it must
+/// distinguish "a registered command was attached to the message" from every
+/// other case — see [`should_fetch_user_data`].
+///
+/// `!help` and the unknown-command apology are reported as
+/// [`IngestCommandOutcome::EngineHandled`], NOT `Attached`, even though both
+/// consume the message. Both are entirely engine-local replies that are built
+/// from the command registry and the raw identifier already on the message
+/// (the apology falls back to `chat.user_uuid7` precisely for the case where
+/// `user_data` is absent), and neither forwards the message to a module. The
+/// fetch condition in the ingest path is specifically about a *registered
+/// command being attached*, so neither earns a user-db round-trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestCommandOutcome {
+    /// A registered command was attached to `chat.command`; the pipeline
+    /// routes it to its owning module (plus any catch-alls).
+    Attached,
+    /// Nothing was attached: either no command at all, or the engine handled
+    /// the message itself (`!help` / the unknown-command apology).
+    EngineHandled,
+}
+
+impl IngestCommandOutcome {
+    /// Did a *registered* command get attached to the message? The one bit the
+    /// fetch decision reads.
+    pub fn command_attached(self) -> bool {
+        matches!(self, Self::Attached)
+    }
+}
+
+/// Should the engine spend two WebSocket round-trips to the user database
+/// (`get_user` + `read_user_value` for `name_color`) on this message?
+///
+/// `enrich_chat_user` is the single most expensive thing on the ingest path and
+/// the overwhelming majority of chat traffic never looks at the result, so the
+/// lookup is gated on something downstream actually consuming `user_data`.
+///
+/// Fetch if and only if one of the three conditions holds:
+///
+/// 1. `command_attached` — a *registered* command was attached to the message.
+///    Command modules (reprimand, commend, tts, …) need the actor's roles,
+///    score and canonical id to authorise the action and attribute the rating,
+///    so the lookup is mandatory on this path. This is why the ingest arm
+///    classifies the command BEFORE asking this question.
+/// 2. a catch-all module is registered — `CommandRegistry::catch_alls()` is
+///    exactly the set of modules that registered an EMPTY `Commands` list, and
+///    those receive EVERY message regardless of routing, so any of them may
+///    read `user_data`.
+/// 3. a post-process (output display) module is configured AND connected.
+///    This condition is NOT padding. The display modules (`term-chat`,
+///    `cockatiel-audit-viewer`) never register a `Commands` payload at all, so
+///    they are completely invisible to the command registry and only receive
+///    messages through the pipeline's post-process stage fanout driven by the
+///    config. Without this condition every ordinary (non-command) chat message
+///    would reach each display with `user_data == None` and lose its rank /
+///    name-colour / score styling — a real regression.
+///
+///    Liveness matters for the same reason the lookup does: a display that is
+///    configured but not connected reads nothing, so there is nothing to pay
+///    for. `connected` is the live-sender view of the configured list (a sender
+///    slot whose channel is already closed means the module is gone, which is
+///    the same test `send_to_module` applies), so a dead display in the config
+///    does not hold the hot path open.
+pub fn should_fetch_user_data(
+    command_attached: bool,
+    registry: &CommandRegistry,
+    cfg: &PipelineConfig,
+    connected: &[String],
+) -> bool {
+    command_attached
+        || !registry.catch_alls().is_empty()
+        || cfg
+            .post_process_modules
+            .iter()
+            .any(|name| connected.iter().any(|live| live == name))
+}
+
+/// Snapshot of the module names that are currently connected with a live
+/// outbound channel. This is the liveness input to [`should_fetch_user_data`].
+async fn connected_module_names(
+    senders: &Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<Container>>>>,
+) -> Vec<String> {
+    let senders = senders.lock().await;
+    senders
+        .iter()
+        .filter(|(_, tx)| !tx.is_closed())
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 /// Parse a raw chat message for registered commands and act:
 /// - a known command is attached to `chat.command` (the pipeline routes it);
 /// - `!help` lists every registered command back to the chat;
 /// - an unregistered command under a flag whose owner set
 ///   `alert_on_unknown_command` gets the apology reply.
+///
+/// Returns what it did — the ingest path needs the `Attached` / not-`Attached`
+/// distinction to decide whether to fetch user data, so classification has to
+/// complete before the fetch decision is made.
 pub async fn handle_command_on_ingest(
     chat: &mut cockatiel_protobuf::ChatMessage,
     registry: &Arc<Mutex<CommandRegistry>>,
     orchestrator: &PipelineOrchestrator,
     ui_state: &Arc<Mutex<EngineState>>,
-) {
+) -> IngestCommandOutcome {
     let action = {
         let reg = registry.lock().unwrap();
         classify_command(&chat.raw_message, &reg)
     }; // guard dropped here — before any await.
 
+    let mut outcome = IngestCommandOutcome::EngineHandled;
     match action {
         CommandAction::Attach(cmd) => {
             chat.command = Some(cmd);
+            outcome = IngestCommandOutcome::Attached;
         }
         CommandAction::Help => {
             let reply = {
@@ -403,6 +499,7 @@ pub async fn handle_command_on_ingest(
         }
         CommandAction::None => {}
     }
+    outcome
 }
 
 /// Send an engine-originated reply to a platform's adapters (no actor check —
@@ -534,645 +631,6 @@ pub async fn enrich_chat_user(
     });
 }
 
-/// Handle a `test_run` virtual query from the TUI. The SQL field carries a JSON
-/// payload: { "suite": "chain"|"modules"|"all", "module": "name?", "iterations": n }.
-/// Spawns the compliance test runner, captures its output, and returns it.
-pub async fn run_test_suite(
-    sql: &str,
-    ui_state: &Arc<Mutex<EngineState>>,
-    engine_pin: u32,
-) -> (bool, Vec<u8>, String) {
-    let payload: serde_json::Value = match serde_json::from_str(sql) {
-        Ok(v) => v,
-        Err(e) => return (false, Vec::new(), format!("Invalid test_run payload: {}", e)),
-    };
-
-    let suite = payload.get("suite").and_then(|v| v.as_str()).unwrap_or("all");
-    let module = payload.get("module").and_then(|v| v.as_str()).unwrap_or("");
-    let iterations = payload.get("iterations").and_then(|v| v.as_i64()).unwrap_or(100);
-
-    let mut args = vec!["--suite".to_string(), suite.to_string()];
-    if !module.is_empty() {
-        args.push("--module".to_string());
-        args.push(module.to_string());
-    }
-    args.push("--iterations".to_string());
-    args.push(iterations.to_string());
-    args.push("--json".to_string());
-
-    // Locate the runner binary relative to the engine's working directory.
-    let engine_dir = env::current_dir().unwrap_or_default();
-    let runner_dir = engine_dir.parent().unwrap_or(&engine_dir).join("cockatiel_test_runner-rs");
-    let runner_bin = runner_dir.join("target").join("release").join("cockatiel-test-runner");
-    let runner_bin = if runner_bin.exists() {
-        runner_bin
-    } else {
-        runner_dir.join("target").join("debug").join("cockatiel-test-runner")
-    };
-
-    if !runner_bin.exists() {
-        return (
-            false,
-            Vec::new(),
-            format!("test-runner binary not found at {}", runner_bin.display()),
-        );
-    }
-
-    log_event(ui_state, format!("[test] running suite '{}' (module: '{}', n={})", suite, module, iterations));
-
-    let output = match tokio::time::timeout(
-        Duration::from_secs(300),
-        tokio::process::Command::new(&runner_bin)
-            .args(&args)
-            .current_dir(runner_dir)
-            .env("COCKATIEL_PIN", engine_pin.to_string())
-            .output(),
-    )
-    .await
-    {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => return (false, Vec::new(), format!("failed to spawn test runner: {}", e)),
-        Err(_) => return (false, Vec::new(), "test runner timed out after 300s".to_string()),
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    // Surface progress lines as engine logs so the TUI shows them live.
-    for line in stdout.lines() {
-        log_event(ui_state, format!("[test] {}", line));
-    }
-    if !stderr.trim().is_empty() {
-        log_event(ui_state, format!("[test] stderr: {}", stderr.trim()));
-    }
-
-    let exit_ok = output.status.success();
-    (exit_ok, stdout.into_bytes(), if exit_ok { String::new() } else { stderr })
-}
-
-/// Handle a `userdb_*` virtual query from the TUI. The SQL field carries a JSON
-/// payload specific to each operation. Only the engine's control surface (TUI)
-/// may reach the user database.
-pub async fn userdb_virtual_query(
-    client: &SharedUserDbClient,
-    query_id: &str,
-    sql: &str,
-    ui_state: &Arc<Mutex<EngineState>>,
-    requester: &str,
-    peer_loopback: bool,
-) -> (bool, Vec<u8>, String) {
-    let payload: serde_json::Value = match serde_json::from_str(sql) {
-        Ok(v) => v,
-        Err(e) => return (false, Vec::new(), format!("Invalid userdb payload: {}", e)),
-    };
-
-    let outcome = match query_id {
-        "userdb_add_user" => {
-            let username = payload.get("username").and_then(|v| v.as_str()).unwrap_or("");
-            let channel = parse_channel_ref(payload.get("channel"));
-            client.add_user(username, channel.as_ref()).await
-        }
-        "userdb_delete_user" => {
-            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let actor = payload.get("actor_uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let role = userdb_actor_perm(peer_loopback, payload.get("actor_role").and_then(|v| v.as_str()).unwrap_or("user"));
-            client.delete_user(uuid7, actor, &role).await
-        }
-        "userdb_add_score" => {
-            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let delta = payload.get("delta").and_then(|v| v.as_i64()).unwrap_or(1);
-            let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-            client.add_score(uuid7, delta, reason).await
-        }
-        "userdb_remove_score" => {
-            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let delta = payload.get("delta").and_then(|v| v.as_i64()).unwrap_or(1);
-            let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-            client.remove_score(uuid7, delta, reason).await
-        }
-        "userdb_add_channel" => {
-            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let channel = parse_channel_ref(payload.get("channel"));
-            client.add_channel(uuid7, channel.as_ref()).await
-        }
-        "userdb_remove_channel" => {
-            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
-            let channel_id = payload.get("channel_id").and_then(|v| v.as_str()).unwrap_or("");
-            client.remove_channel(uuid7, platform, channel_id).await
-        }
-        "userdb_get_user" => {
-            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
-            let channel_id = payload.get("channel_id").and_then(|v| v.as_str()).unwrap_or("");
-            let handle = payload.get("handle").and_then(|v| v.as_str()).unwrap_or("");
-            client.get_user(uuid7, platform, channel_id, handle).await
-        }
-        "userdb_list_users" => {
-            let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
-            let limit = payload.get("limit").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
-            let offset = payload.get("offset").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-            client.list_users(platform, limit, offset).await
-        }
-        "userdb_update_flags" => {
-            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let flags = payload.get("flags").and_then(|v| v.as_str()).unwrap_or("{}");
-            client.update_flags(uuid7, flags).await
-        }
-        "userdb_set_roles" => {
-            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let actor = payload.get("actor_uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let role = userdb_actor_perm(peer_loopback, payload.get("actor_role").and_then(|v| v.as_str()).unwrap_or("user"));
-            let sponsor = payload.get("is_sponsor").and_then(|v| v.as_bool()).unwrap_or(false);
-            let mod_ = payload.get("is_moderator").and_then(|v| v.as_bool()).unwrap_or(false);
-            let admin = payload.get("is_admin").and_then(|v| v.as_bool()).unwrap_or(false);
-            let owner = payload.get("is_owner").and_then(|v| v.as_bool()).unwrap_or(false);
-            client.set_roles(uuid7, actor, &role, sponsor, mod_, admin, owner).await
-        }
-        "userdb_read_user_value" => {
-            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let key = payload.get("key").and_then(|v| v.as_str()).unwrap_or("");
-            client.read_user_value(uuid7, key).await
-        }
-        "userdb_write_user_value" => {
-            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let key = payload.get("key").and_then(|v| v.as_str()).unwrap_or("");
-            let value = payload.get("value").and_then(|v| v.as_str()).unwrap_or("");
-            client.write_user_value(uuid7, key, value).await
-        }
-        "userdb_delete_user_value" => {
-            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let key = payload.get("key").and_then(|v| v.as_str()).unwrap_or("");
-            client.delete_user_value(uuid7, key).await
-        }
-        "userdb_list_user_values" => {
-            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            client.list_user_values(uuid7).await
-        }
-        // Mod commands: map to user DB operations.
-        "userdb_commendation" => {
-            // { uuid7, reason? } → +1 score (commendation)
-            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-            client.add_score(uuid7, 1, reason).await
-        }
-        "userdb_reprimand" => {
-            // { uuid7, reason? } → -1 score (reprimand)
-            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-            client.remove_score(uuid7, 1, reason).await
-        }
-        "userdb_ban" => {
-            // { uuid7, reason? } → set banned flag value
-            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis().to_string())
-                .unwrap_or_default();
-            let flag = serde_json::json!({ "banned": true, "reason": reason, "at": now }).to_string();
-            client.write_user_value(uuid7, "ban", &flag).await
-        }
-        "userdb_timeout" => {
-            // { uuid7, duration_secs, reason? } → set timeout value with expiry
-            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-            let duration_secs = payload.get("duration_secs").and_then(|v| v.as_i64()).unwrap_or(300);
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or_default();
-            let expires = now_ms + (duration_secs as u128 * 1000);
-            let flag = serde_json::json!({
-                "timed_out": true,
-                "reason": reason,
-                "expires_at_ms": expires,
-            }).to_string();
-            client.write_user_value(uuid7, "timeout", &flag).await
-        }
-        _ => return (false, Vec::new(), format!("Unknown userdb query: {}", query_id)),
-    };
-
-    match outcome {
-        Ok(resp) => {
-            let json = userdb_response_to_json(&resp);
-            (resp.success, json.into_bytes(), if resp.success { String::new() } else { resp.error.clone() })
-        }
-        Err(e) => {
-            log_event(ui_state, format!("[{}] UserDB error: {}", requester, e));
-            (false, Vec::new(), e)
-        }
-    }
-}
-
-/// Handle the `userdb_adjust_score` virtual query: apply a REAL arbitrary delta
-/// to a user's `score` (no ±1 clamp, no user-db rating cooldown, no counter
-/// inflation). Unlike `mod_commend`/`mod_reprimand` it accepts any signed delta
-/// and uses the user-db's dedicated score-only op.
-///
-/// Gate: only the score-messages module or the TUI control surface may call it.
-pub async fn userdb_adjust_score_virtual_query(
-    client: &SharedUserDbClient,
-    sql: &str,
-    ui_state: &Arc<Mutex<EngineState>>,
-    requester: &str,
-) -> (bool, Vec<u8>, String) {
-    let payload: serde_json::Value = match serde_json::from_str(sql) {
-        Ok(v) => v,
-        Err(e) => return (false, Vec::new(), format!("Invalid userdb_adjust_score payload: {}", e)),
-    };
-
-    let delta = payload.get("delta").and_then(|v| v.as_i64()).unwrap_or(0);
-    let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("userdb_adjust_score");
-
-    // Resolve the target user: prefer an explicit uuid7, else by (platform, handle).
-    let explicit_uuid = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-    let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
-    let handle = payload.get("handle").and_then(|v| v.as_str()).unwrap_or("");
-
-    let uuid7 = if !explicit_uuid.is_empty() {
-        explicit_uuid.to_string()
-    } else if !platform.is_empty() && !handle.is_empty() {
-        let resolved = match client.get_user("", platform, handle, handle).await {
-            Ok(r) => r,
-            Err(e) => return (false, Vec::new(), e),
-        };
-        if !resolved.success {
-            log_event(ui_state, format!("[{}] userdb_adjust_score: target '{}' not found on '{}'", requester, handle, platform));
-            return (false, Vec::new(), format!("User '{}' not found on {}", handle, platform));
-        }
-        let Some(user) = resolved.user else {
-            return (false, Vec::new(), format!("User '{}' not found on {}", handle, platform));
-        };
-        user.uuid7
-    } else {
-        return (false, Vec::new(), "userdb_adjust_score requires uuid7 or platform + handle".to_string());
-    };
-
-    if delta == 0 {
-        let json = serde_json::json!({ "success": true, "uuid7": uuid7, "delta": 0 }).to_string();
-        return (true, json.into_bytes(), String::new());
-    }
-
-    let outcome = client.adjust_score_only(&uuid7, delta, reason).await;
-
-    match outcome {
-        Ok(resp) => {
-            log_event(ui_state, format!("[{}] userdb_adjust_score {} by {} -> {}", requester, delta, requester, uuid7));
-            let json = userdb_response_to_json(&resp);
-            (resp.success, json.into_bytes(), if resp.success { String::new() } else { resp.error.clone() })
-        }
-        Err(e) => {
-            log_event(ui_state, format!("[{}] userdb_adjust_score error: {}", requester, e));
-            (false, Vec::new(), e)
-        }
-    }
-}
-
-/// Handle a `mod_*` virtual query from an adapter (e.g. a mod typing a command
-/// in chat). The adapter identifies the target by platform + handle; the engine
-/// resolves the user DB record and applies the action.
-/// Query IDs: mod_commend, mod_reprimand, mod_ban, mod_timeout.
-///
-/// The actor (the human triggering the action) MUST be verified against the
-/// user database before any privileged action runs; a missing or unauthorized
-/// actor is rejected. The only exception is the SYSTEM path: the automated
-/// scorer module ("score-messages") applies ±1 score deltas (mod_commend /
-/// mod_reprimand) without a human actor.
-pub async fn mod_virtual_query(
-    client: &SharedUserDbClient,
-    query_id: &str,
-    sql: &str,
-    ui_state: &Arc<Mutex<EngineState>>,
-    requester: &str,
-) -> (bool, Vec<u8>, String) {
-    let payload: serde_json::Value = match serde_json::from_str(sql) {
-        Ok(v) => v,
-        Err(e) => return (false, Vec::new(), format!("Invalid mod payload: {}", e)),
-    };
-
-    // ── Actor verification ──────────────────────────────────────────────
-    // The optional `actor` object is { "platform", "handle", "uuid7" }.
-    let actor = payload.get("actor").filter(|a| !a.is_null());
-    let (actor_uuid7, actor_handle) = match actor {
-        Some(actor) => {
-            let actor_uuid = actor.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let actor_platform = actor.get("platform").and_then(|v| v.as_str()).unwrap_or("");
-            let actor_handle = actor.get("handle").and_then(|v| v.as_str()).unwrap_or("");
-            // Prefer a uuid7; otherwise resolve by (platform, handle).
-            let resolved = if !actor_uuid.is_empty() {
-                client.get_user(actor_uuid, "", "", "").await
-            } else {
-                client.get_user("", actor_platform, actor_handle, actor_handle).await
-            };
-            let resolved = match resolved {
-                Ok(r) => r,
-                Err(e) => return (false, Vec::new(), format!("Actor lookup failed: {}", e)),
-            };
-            let Some(user) = resolved.user else {
-                let actor_where = if actor_platform.is_empty() { String::new() } else { format!(" on {}", actor_platform) };
-                log_event(
-                    ui_state,
-                    format!("[{}] {} denied: actor '{}{}' not found in user DB", requester, query_id, actor_handle, actor_where),
-                );
-                return (false, Vec::new(), "permission denied: actor is not a moderator/admin/owner".to_string());
-            };
-            if !(user.is_moderator || user.is_admin || user.is_owner) {
-                log_event(
-                    ui_state,
-                    format!("[{}] {} denied: actor '{}' lacks a mod/admin/owner role", requester, query_id, user.username),
-                );
-                return (false, Vec::new(), "permission denied: actor is not a moderator/admin/owner".to_string());
-            }
-            (user.uuid7, user.username)
-        }
-        None => {
-            // SYSTEM path: the automated scorer applies ±1 score deltas for
-            // every message. No other mod_* action may run without an actor.
-            if !matches!(query_id, "mod_commend" | "mod_reprimand") || requester != "score-messages" {
-                log_event(
-                    ui_state,
-                    format!("[{}] {} denied: missing actor (module '{}')", requester, query_id, requester),
-                );
-                return (false, Vec::new(), "permission denied: missing actor".to_string());
-            }
-            (String::new(), format!("system:{}", requester))
-        }
-    };
-
-    let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
-    let handle = payload.get("handle").and_then(|v| v.as_str()).unwrap_or("");
-    let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-    let duration_secs = payload.get("duration_secs").and_then(|v| v.as_i64()).unwrap_or(300);
-
-    // Resolve the target user: prefer an explicit uuid7, else by (platform, handle).
-    let explicit_uuid = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-    let uuid7 = if !explicit_uuid.is_empty() {
-        explicit_uuid.to_string()
-    } else if !platform.is_empty() && !handle.is_empty() {
-        let resolved = match client.get_user("", platform, handle, handle).await {
-            Ok(r) => r,
-            Err(e) => return (false, Vec::new(), e),
-        };
-        if !resolved.success {
-            log_event(ui_state, format!("[{}] mod: target '{}' not found on '{}'", requester, handle, platform));
-            return (false, Vec::new(), format!("User '{}' not found on {}", handle, platform));
-        }
-        let Some(user) = resolved.user else {
-            return (false, Vec::new(), format!("User '{}' not found on {}", handle, platform));
-        };
-        user.uuid7
-    } else {
-        return (false, Vec::new(), "mod query requires uuid7 or platform + handle".to_string());
-    };
-
-    let outcome = match query_id {
-        "mod_commend" => client.add_score(&uuid7, 1, reason).await,
-        "mod_reprimand" => client.remove_score(&uuid7, 1, reason).await,
-        "mod_ban" => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis().to_string())
-                .unwrap_or_default();
-            let flag = serde_json::json!({ "banned": true, "reason": reason, "at": now }).to_string();
-            client.write_user_value(&uuid7, "ban", &flag).await
-        }
-        "mod_timeout" => {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or_default();
-            let expires = now_ms + (duration_secs as u128 * 1000);
-            let flag = serde_json::json!({
-                "timed_out": true,
-                "reason": reason,
-                "expires_at_ms": expires,
-            }).to_string();
-            client.write_user_value(&uuid7, "timeout", &flag).await
-        }
-        _ => return (false, Vec::new(), format!("Unknown mod query: {}", query_id)),
-    };
-
-    match outcome {
-        Ok(resp) => {
-            log_event(
-                ui_state,
-                format!("[{}] {} by {} -> {} (actor={})", requester, query_id, actor_handle, handle, actor_uuid7),
-            );
-            let json = userdb_response_to_json(&resp);
-            (resp.success, json.into_bytes(), if resp.success { String::new() } else { resp.error.clone() })
-        }
-        Err(e) => {
-            log_event(ui_state, format!("[{}] Mod command error: {}", requester, e));
-            (false, Vec::new(), e)
-        }
-    }
-}
-
-/// Handle a `chat_commend` / `chat_reprimand` virtual query from the commend /
-/// reprimand command modules. Unlike `mod_*`, the actor does NOT need mod
-/// status — any verified user may rate another user. The user-db enforces the
-/// 24h reprimand cooldown atomically (rating_history); a denial returns
-/// success=false with the cooldown reason.
-pub async fn chat_rating_virtual_query(
-    client: &SharedUserDbClient,
-    query_id: &str,
-    sql: &str,
-    ui_state: &Arc<Mutex<EngineState>>,
-    requester: &str,
-) -> (bool, Vec<u8>, String) {
-    // Gate to the two dedicated modules so no random module can fake ratings.
-    let expected = if query_id == "chat_commend" { "commend" } else { "reprimand" };
-    if requester != expected {
-        log_event(
-            ui_state,
-            format!("[{}] {} denied: requester '{}' is not the '{}' module", requester, query_id, requester, expected),
-        );
-        return (false, Vec::new(), format!("{} denied: not the '{}' module", query_id, expected));
-    }
-
-    let payload: serde_json::Value = match serde_json::from_str(sql) {
-        Ok(v) => v,
-        Err(e) => return (false, Vec::new(), format!("Invalid rating payload: {}", e)),
-    };
-
-    // Actor (the giver) — resolve + require existence (ANY role is fine).
-    let actor = payload.get("actor").filter(|a| !a.is_null());
-    let Some(actor) = actor else {
-        return (false, Vec::new(), "rating requires an actor".to_string());
-    };
-    let actor_uuid = actor.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-    let actor_platform = actor.get("platform").and_then(|v| v.as_str()).unwrap_or("");
-    let actor_handle = actor.get("handle").and_then(|v| v.as_str()).unwrap_or("");
-    let giver_uuid7 = if !actor_uuid.is_empty() {
-        actor_uuid.to_string()
-    } else if !actor_platform.is_empty() && !actor_handle.is_empty() {
-        match client.get_user("", actor_platform, actor_handle, actor_handle).await {
-            Ok(resp) if resp.success && resp.user.is_some() => resp.user.unwrap().uuid7,
-            Ok(_) => {
-                log_event(ui_state, format!("[{}] rating denied: giver '{}' not found", requester, actor_handle));
-                return (false, Vec::new(), format!("giver '{}' not found on {}", actor_handle, actor_platform));
-            }
-            Err(e) => return (false, Vec::new(), format!("giver lookup failed: {}", e)),
-        }
-    } else {
-        return (false, Vec::new(), "rating actor requires uuid7 or platform+handle".to_string());
-    };
-
-    // Target (the recipient) — resolve by uuid7 or platform + handle.
-    let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
-    let handle = payload.get("handle").and_then(|v| v.as_str()).unwrap_or("");
-    let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-    let explicit_uuid = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-    let recipient_uuid7 = if !explicit_uuid.is_empty() {
-        explicit_uuid.to_string()
-    } else if !platform.is_empty() && !handle.is_empty() {
-        match client.get_user("", platform, handle, handle).await {
-            Ok(resp) if resp.success && resp.user.is_some() => resp.user.unwrap().uuid7,
-            Ok(_) => {
-                log_event(ui_state, format!("[{}] rating denied: target '{}' not found", requester, handle));
-                return (false, Vec::new(), format!("target '{}' not found on {}", handle, platform));
-            }
-            Err(e) => return (false, Vec::new(), format!("target lookup failed: {}", e)),
-        }
-    } else {
-        return (false, Vec::new(), "rating requires uuid7 or platform+handle".to_string());
-    };
-
-    if recipient_uuid7 == giver_uuid7 {
-        return (false, Vec::new(), "you cannot rate yourself".to_string());
-    }
-
-    let is_commendation = query_id == "chat_commend";
-    match client
-        .rate_user(&giver_uuid7, &recipient_uuid7, is_commendation, platform, handle, reason)
-        .await
-    {
-        Ok(resp) => {
-            if resp.success {
-                log_event(ui_state, format!("[{}] {} applied to '{}'", requester, query_id, handle));
-                (true, resp.message.into_bytes(), String::new())
-            } else {
-                // Cooldown denial — surface the reason to the module (it logs it).
-                let err = if resp.error.is_empty() { resp.message } else { resp.error };
-                log_event(ui_state, format!("[{}] {} denied: {}", requester, query_id, err));
-                (false, Vec::new(), err)
-            }
-        }
-        Err(e) => (false, Vec::new(), format!("rating failed: {}", e)),
-    }
-}
-
-/// Handle a `chat_verify_identity` virtual query from the terminal chat module.
-/// This is the identity bootstrap / write-through path: term-chat sends the
-/// platform identity it just authenticated and the roles the platform vouches
-/// for. The engine creates-or-finds the user and elevates their roles to the
-/// union of existing + verified roles (ELEVATE, never revoke).
-pub async fn chat_verify_identity_virtual_query(
-    client: &SharedUserDbClient,
-    sql: &str,
-    ui_state: &Arc<Mutex<EngineState>>,
-    module_name: &str,
-) -> (bool, Vec<u8>, String) {
-    if module_name != "term-chat" {
-        log_event(ui_state, format!("[{}] chat_verify_identity denied: not term-chat", module_name));
-        return (false, Vec::new(), "access denied: not term-chat".to_string());
-    }
-
-    let payload: serde_json::Value = match serde_json::from_str(sql) {
-        Ok(v) => v,
-        Err(e) => return (false, Vec::new(), format!("Invalid chat_verify_identity payload: {}", e)),
-    };
-
-    let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
-    let handle = payload.get("handle").and_then(|v| v.as_str()).unwrap_or("");
-
-    // Create-or-find the user keyed by channel (the service already does
-    // find-by-channel and returns the existing record).
-    let channel = parse_channel_ref(Some(&serde_json::json!({
-        "platform": platform,
-        "channel_id": "",
-        "handle": handle,
-    })));
-    let add_resp = match client.add_user(handle, channel.as_ref()).await {
-        Ok(r) => r,
-        Err(e) => {
-            log_event(ui_state, format!("[{}] chat_verify_identity userdb error: {}", module_name, e));
-            return (false, Vec::new(), e);
-        }
-    };
-    if !add_resp.success {
-        return (false, Vec::new(), add_resp.error.clone());
-    }
-    let Some(user) = add_resp.user else {
-        return (false, Vec::new(), "chat_verify_identity: no user returned".to_string());
-    };
-
-    // term-chat asserts its platform-verified roles as booleans under
-    // `verified_roles`. The engine must NOT union those onto the stored record
-    // (that can never revoke — and a self-asserted login_kick handle would
-    // stick elevated roles onto the matching stored user forever). Set each
-    // role EXACTLY from the claim so a role that is no longer asserted is
-    // revoked (straight assignment, never AND/OR with the stored value).
-    // When the payload carries no verified_roles at all, preserve the stored
-    // roles (previous behavior) but surface a warning — the claim is untrusted.
-    let verified_roles = payload.get("verified_roles");
-    let (is_sponsor, is_moderator, is_admin, is_owner) = match verified_roles {
-        Some(verified) if verified.is_object() => (
-            verified.get("is_sponsor").and_then(|v| v.as_bool()).unwrap_or(false),
-            verified.get("is_moderator").and_then(|v| v.as_bool()).unwrap_or(false),
-            verified.get("is_admin").and_then(|v| v.as_bool()).unwrap_or(false),
-            verified.get("is_owner").and_then(|v| v.as_bool()).unwrap_or(false),
-        ),
-        _ => {
-            log_event(
-                ui_state,
-                format!(
-                    "[{}] chat_verify_identity: payload for '{}' on '{}' carries no verified_roles — preserving stored roles (unverified claim)",
-                    module_name, handle, platform
-                ),
-            );
-            (user.is_sponsor, user.is_moderator, user.is_admin, user.is_owner)
-        }
-    };
-
-    let set_resp = match client
-        .set_roles(&user.uuid7, "", "owner", is_sponsor, is_moderator, is_admin, is_owner)
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            log_event(ui_state, format!("[{}] chat_verify_identity set_roles error: {}", module_name, e));
-            return (false, Vec::new(), e);
-        }
-    };
-    if !set_resp.success {
-        return (false, Vec::new(), set_resp.error.clone());
-    }
-
-    log_event(
-        ui_state,
-        format!("[{}] verified identity: {} on {} (mod={})", module_name, handle, platform, is_moderator),
-    );
-
-    let json = userdb_response_to_json(&set_resp);
-    (true, json.into_bytes(), String::new())
-}
-
-fn parse_channel_ref(value: Option<&serde_json::Value>) -> Option<user_db_client::proto::ChannelRef> {
-    let Some(value) = value else {
-        return None;
-    };
-    if value.is_null() {
-        return None;
-    }
-    Some(user_db_client::proto::ChannelRef {
-        platform: value.get("platform").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        channel_id: value.get("channel_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        handle: value.get("handle").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-    })
-}
-
 /// The TUI control surface is always trusted — otherwise it would block its
 /// own connection waiting on a prompt it is supposed to show. The compliance
 /// test runner is also trusted so it can run without an interactive prompt.
@@ -1240,7 +698,7 @@ fn remediate_secret_file_permissions(
 /// connection must supply a valid actor (the remote TUI-login flow is a
 /// separate, deferred task). The actor name-trust and control-surface gating
 /// are unchanged.
-fn userdb_actor_perm(peer_loopback: bool, actor_role: &str) -> String {
+pub(crate) fn userdb_actor_perm(peer_loopback: bool, actor_role: &str) -> String {
     if peer_loopback {
         "owner".to_string()
     } else {
@@ -1251,7 +709,7 @@ fn userdb_actor_perm(peer_loopback: bool, actor_role: &str) -> String {
 /// The TUI (or a detached TUI sub-window) is the operator's control surface:
 /// it may run tests, inspect/release held-audit messages, and access the user
 /// database. The name is bound to the session's JWT, so this check is sound.
-fn is_control_surface(name: &str) -> bool {
+pub(crate) fn is_control_surface(name: &str) -> bool {
     name == "cockatiel-tui" || name == "cockatiel-tui-child"
 }
 
@@ -1260,12 +718,12 @@ fn is_control_surface(name: &str) -> bool {
 /// adapter client ids/secrets to drive its OAuth login flows) may see them;
 /// every other module gets the structural list with `credential_values`
 /// redacted, so one module cannot dump another module's secrets.
-fn may_read_other_credentials(name: &str) -> bool {
+pub(crate) fn may_read_other_credentials(name: &str) -> bool {
     is_control_surface(name) || name == "term-chat"
 }
 
 /// The compliance test-runner may archive test results to the timeline.
-fn is_test_runner(name: &str) -> bool {
+pub(crate) fn is_test_runner(name: &str) -> bool {
     name == "cockatiel-test-runner"
 }
 
@@ -1821,6 +1279,25 @@ cockatiel
         cmd_registry.clone(),
     );
 
+    // Boot PAUSED. The engine accepts module connections, ingests messages,
+    // parses commands and writes the timeline exactly as it normally would, but
+    // dispatches nothing to any module until the operator resumes it — so a
+    // restart (or a boot with a backlog) can never let unattended messages
+    // flood the modules. Nothing is lost while paused: every message is
+    // persisted as 'queued' and replayed on resume.
+    //
+    // Headless runs — the compliance test runner, CI — must set
+    // COCKATIEL_START_PAUSED=0 (or `start_paused: false` in config.json),
+    // because nothing would ever press the resume key. The state is read ONCE,
+    // here: pausing is an operator action, not a setting, so the config poll
+    // task below deliberately does not touch it.
+    if config::start_paused(&config) {
+        orchestrator.pause().await;
+        log_event_broadcast(&ui_state, "Pipeline: paused at startup — messages are queued but nothing is dispatched (resume from the TUI)");
+    } else {
+        log_event_broadcast(&ui_state, "Pipeline: running (COCKATIEL_START_PAUSED is off)");
+    }
+
     // Normalize any TEXT-stored uuid7 rows to BLOB (all keyed queries bind
     // bytes; a BLOB param never equals a TEXT column in SQLite). Do this
     // before the recovery drain so stranded rows are found and progressed.
@@ -1852,6 +1329,28 @@ cockatiel
         // drops back below.
         let warn_floor: u64 = 5 * 1024 * 1024;
         let mut db_warned = false;
+        // Pipeline ack-timeout sweep, on its OWN tight interval.
+        //
+        // This used to ride along on the 15s DB-sync loop, which quantised every
+        // stage that had to fall back on the timeout path to a 15s grid: measured
+        // on the real timeline DB, a message spent p50 15s / p90 45s waiting for
+        // `pre_process_completed_at` -> `persisted_at`, and the deltas landed on
+        // exactly 15s and 30s boundaries. A module that misses its ack now waits
+        // only the ack timeout plus at most one sweep tick.
+        {
+            let orchestrator = orchestrator.clone();
+            let mut interval = tokio::time::interval(crate::pipeline::TIMEOUT_SWEEP_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tokio::spawn(async move {
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = orchestrator.handle_timeout().await {
+                        eprintln!("[Pipeline] Timeout check error: {}", e);
+                    }
+                }
+            });
+        }
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(sync_interval);
             let mut ticks_since_checkpoint = 0u32;
@@ -1868,9 +1367,6 @@ cockatiel
                 if db.wal_size() > WAL_CHECKPOINT_MB || ticks_since_checkpoint >= 4 {
                     ticks_since_checkpoint = 0;
                     db.checkpoint_wal().await;
-                }
-                if let Err(e) = orchestrator.handle_timeout().await {
-                    eprintln!("[Pipeline] Timeout check error: {}", e);
                 }
                 // Local DB size warning (5 MB floor, 95% of target).
                 let size = db.db_size_bytes();
@@ -1898,29 +1394,31 @@ cockatiel
     // inserted but never broadcast — e.g. a crash between insert and start).
     // Waits `recovery_grace_secs` so a live pipeline can claim them first; the
     // get_config read happens once, before the task, not inside the loop.
+    //
+    // ONE PASS, deliberately. This used to loop until `get_queued_uuids` came
+    // back empty, which was only safe while a started message moved its row to
+    // 'processing'. Nothing writes that status any more — a message the
+    // pipeline owns stays 'queued' for its whole flight, since the terminal
+    // write is the only one — so the loop re-selected the row it had just
+    // re-driven, `recover_one` returned early because the message was already
+    // in `pipeline_states`, the row was still 'queued', and the loop spun on
+    // SELECTs against the timeline DB forever. One pass drains every stranded
+    // row: all of them are in the snapshot, and a row inserted after it is one
+    // the live pipeline owns and drives itself.
     {
-        let db = db.clone();
         let orchestrator = orchestrator.clone();
         let ui_state = ui_state.clone();
         let grace = config::get_config(&config_state).recovery_grace_secs;
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(grace)).await;
-            loop {
-                let uuids = match db.get_queued_uuids().await {
-                    Ok(u) => u,
-                    Err(e) => {
-                        log_event_broadcast(&ui_state, format!("Recovery error: {}", e));
-                        break;
+            match orchestrator.drain_queued_once().await {
+                Ok(drain) => {
+                    for (uuid, error) in drain.failures {
+                        log_event_broadcast(&ui_state, format!("Recovery failed for {}: {}", uuid, error));
                     }
-                };
-                if uuids.is_empty() {
-                    break;
+                    log_event_broadcast(&ui_state, format!("Recovery: drained {} stranded 'queued' message(s) of {}", drain.claimed, drain.considered));
                 }
-                for s in uuids {
-                    if let Err(e) = orchestrator.recover_one(&s).await {
-                        log_event_broadcast(&ui_state, format!("Recovery failed for {}: {}", s, e));
-                    }
-                }
+                Err(e) => log_event_broadcast(&ui_state, format!("Recovery error: {}", e)),
             }
         });
     }
@@ -1979,6 +1477,13 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
 
     let prompt_routes: SharedPromptRoutes = Arc::new(Mutex::new(HashMap::new()));
 
+    // Control-surface shutdown signal. Parked at Idle until an accepted
+    // `engine_shutdown` request moves it to Requested; the accept loop below
+    // watches for that and, once the answer has reached the TUI's socket
+    // (Answered), exits cleanly. The two-stage handoff is what guarantees the
+    // TUI is told "yes" before the process goes away — see `queries::ShutdownSignal`.
+    let shutdown = queries::ShutdownSignal::new();
+
     // Per-IP failed-PIN throttle (5 strikes -> 60s lockout).
     let pin_gate = PinGate::default();
 
@@ -1996,8 +1501,34 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
     // before the (expensive) TLS handshake instead of piling up.
     let conn_sem = Arc::new(tokio::sync::Semaphore::new(bounds.max_connections));
 
+    // A control-surface shutdown request breaks this loop. `accept()` is
+    // cancel-safe and the watch receiver only resolves on a NEW value, so losing
+    // the race to an incoming connection costs nothing.
+    let mut shutdown_stage = shutdown.subscribe();
+    let mut watching_shutdown = true;
     loop {
-        let (stream, address) = listener.accept().await?;
+        let accepted = tokio::select! {
+            changed = shutdown_stage.changed(), if watching_shutdown => {
+                match changed {
+                    // Any stage past Idle releases the exit.
+                    Ok(()) if *shutdown_stage.borrow_and_update() != ShutdownStage::Idle => {
+                        log_event_broadcast(
+                            &ui_state,
+                            "[engine] shutdown requested by the control surface — closing the listener",
+                        );
+                        break;
+                    }
+                    // The signal's owner is gone, so it can never report
+                    // anything again: stop watching rather than spin on the
+                    // error this returns immediately and forever.
+                    Err(_) => watching_shutdown = false,
+                    Ok(()) => {}
+                }
+                continue;
+            }
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, address) = accepted?;
         // Refuse above the connection ceiling — drop the socket outright.
         let permit = match conn_sem.clone().try_acquire_owned() {
             Ok(p) => p,
@@ -2028,6 +1559,7 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
         let kill_map = Arc::clone(&kill_map);
         let cmd_registry = Arc::clone(&cmd_registry);
         let pin_gate = pin_gate.clone();
+        let shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move {
             // The permit is held for the connection's lifetime (dropping it
             // frees a slot in the connection ceiling).
@@ -2061,6 +1593,7 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
                         prompt_routes,
                         kill_map,
                         cmd_registry,
+                        shutdown,
                     )
                     .await
                     {
@@ -2077,277 +1610,34 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
             }
         });
     }
-}
 
-/// Read-only SQL boundary for the `DatabaseQuery` fallback. Strips leading
-/// whitespace and `--`/`/* */` comment lines, then requires the statement to
-/// begin with SELECT / EXPLAIN. Any other statement (INSERT, UPDATE, DELETE,
-/// DROP, ALTER, CREATE, PRAGMA, WITH, ...) is denied — modules can only read
-/// the timeline, never write to it through arbitrary SQL. A `WITH` block is not
-/// allowed up front because a `WITH x AS (...) INSERT/DELETE/...` CTE can smuggle
-/// a write through; as defense-in-depth the whole statement is also tokenized
-/// and rejected if any write keyword appears anywhere in it.
-fn is_read_only_sql(sql: &str) -> bool {
-    let mut s = sql.trim_start();
-    loop {
-        if let Some(rest) = s.strip_prefix("--") {
-            // Skip the whole comment line (not just the `--`).
-            s = match rest.find('\n') {
-                Some(end) => rest[end + 1..].trim_start(),
-                None => return false,
-            };
-            continue;
-        }
-        if let Some(rest) = s.strip_prefix("/*") {
-            match rest.find("*/") {
-                Some(end) => s = rest[end + 2..].trim_start(),
-                None => return false,
-            }
-            continue;
-        }
-        break;
+    // ── Graceful exit ─────────────────────────────────────────────────────
+    // The listener is closed, so nothing new can connect; the connection tasks
+    // still hold their sockets. Wait for the answer to the shutdown request to
+    // be confirmed on the wire before the process goes away — the 5s bound is a
+    // backstop, not the plan: the answer is normally written in the very next
+    // loop iteration of the connection that asked.
+    if tokio::time::timeout(Duration::from_secs(5), shutdown.wait_answered())
+        .await
+        .is_err()
+    {
+        log_event_broadcast(
+            &ui_state,
+            "WARN: shutdown: the response could not be confirmed on the socket within 5s — exiting anyway",
+        );
     }
-    // Leading keyword.
-    let mut kw = String::new();
-    for c in s.chars() {
-        if c.is_ascii_alphabetic() {
-            kw.push(c);
-        } else {
-            break;
-        }
-    }
-    // Reject multi-statement injection: a `;` outside string literals means a
-    // second statement (e.g. `SELECT 1; DROP TABLE …`) — never let it through.
-    let mut in_string = false;
-    let mut quote = ' ';
-    for c in s.chars() {
-        if in_string {
-            if c == quote {
-                in_string = false;
-            }
-            continue;
-        }
-        match c {
-            '\'' | '"' => {
-                in_string = true;
-                quote = c;
-            }
-            ';' => return false,
-            _ => {}
-        }
-    }
-    if !matches!(kw.to_ascii_uppercase().as_str(), "SELECT" | "EXPLAIN") {
-        return false;
-    }
-    // Defense-in-depth: a write keyword ANYWHERE in the statement is fatal
-    // (catches CTE-smuggled writes and anything the leading-keyword gate
-    // missed). Tokenize on any non-alphanumeric char and compare lowercased.
-    // Tokens inside a string literal are SKIPPED so a query like
-    // `WHERE name = 'delete'` isn't a false positive — the literal is data,
-    // not a statement.
-    const WRITE_TOKENS: &[&str] = &[
-        "insert",
-        "update",
-        "delete",
-        "replace",
-        "alter",
-        "drop",
-        "attach",
-        "vacuum",
-        "pragma",
-        "create",
-    ];
-    let mut in_string = false;
-    let mut quote = ' ';
-    let mut token = String::new();
-    for c in s.chars() {
-        if in_string {
-            if c == quote {
-                in_string = false;
-            }
-            continue;
-        }
-        match c {
-            '\'' | '"' => {
-                in_string = true;
-                quote = c;
-            }
-            c if c.is_ascii_alphanumeric() => token.push(c),
-            _ => {
-                if WRITE_TOKENS.contains(&token.to_ascii_lowercase().as_str()) {
-                    return false;
-                }
-                token.clear();
-            }
-        }
-    }
-    if WRITE_TOKENS.contains(&token.to_ascii_lowercase().as_str()) {
-        return false;
-    }
-    true
-}
-
-/// Run a module-supplied SQL query in a contained task so a turso/Limbo
-/// "not yet implemented" panic (e.g. `EXISTS`/subqueries the translator can't
-/// build) surfaces as a query error instead of killing the connection task.
-/// The engine's timeline DB uses the turso/Limbo driver, which panics on
-/// some SQL constructs — the read-only boundary protects writes, this protects
-/// the process from a panic.
-pub async fn guarded_execute_query(
-    db: &DatabaseManager,
-    sql: &str,
-) -> Result<String, String> {
-    let sql = sql.to_string();
-    let db = db.clone();
-    let spawn_db = db.clone();
-    let query_fut = async move { spawn_db.execute_query(&sql).await };
-    // Bound the query: a hung (not panicking) turso call must not block the
-    // calling module's read loop forever (a wedged read loop can't answer the
-    // engine's own AuthVerify probe and gets killed).
-    match tokio::time::timeout(Duration::from_secs(10), tokio::spawn(query_fut)).await {
-        Ok(Ok(Ok(json))) => Ok(json),
-        Ok(Ok(Err(e))) => Err(format!("{}", e)),
-        Ok(Err(join)) => {
-            // A panicking query poisons the turso connection — reopen a fresh
-            // one so the timeline DB stays usable.
-            let reopened = db.reopen_local().await;
-            match reopened {
-                Ok(()) => Err(format!("query panicked (unsupported SQL?); database reopened: {}", join)),
-                Err(re) => Err(format!("query panicked ({}); reopen failed: {}", join, re)),
-            }
-        }
-        Err(_) => Err("query timed out after 10s".to_string()),
-    }
-}
-
-/// Build a Container payload of the requested probe type. `payload_json`
-/// carries optional fields (e.g. a log line, a SQL string). Unknown types
-/// yield None (the probe is skipped).
-fn build_probe_payload(ptype: &str, json: &serde_json::Value) -> Option<Payload> {
-    match ptype {
-        "auth_verify" => Some(Payload::AuthVerify(AuthVerify { cur_auth: String::new() })),
-        "log" => Some(Payload::Log(Log {
-            log: json.get("log").and_then(|v| v.as_str()).unwrap_or("test probe").to_string(),
-            blob: vec![],
-        })),
-        "database_query" => Some(Payload::DatabaseQuery(DatabaseQuery {
-            query_id: json.get("query_id").and_then(|v| v.as_str()).unwrap_or("probe").to_string(),
-            sql: json.get("sql").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            params: vec![],
-        })),
-        "message_pre_process" => Some(Payload::MessagePreProcess(MessagePreProcess {
-            message_uuid7: String::new(),
-            raw_message: Some(ChatMessage {
-                platform: json.get("platform").and_then(|v| v.as_str()).unwrap_or("test").to_string(),
-                raw_data: vec![],
-                raw_message: json.get("raw_message").and_then(|v| v.as_str()).unwrap_or("probe").to_string(),
-                user_uuid7: String::new(),
-                command: None,
-                user_data: None,
-                channel_id: String::new(),
-            }),
-            audio: Vec::new(),
-            audio_type: String::new(),
-        })),
-        "prompt" => Some(Payload::Prompt(Prompt {
-            prompt_id_uuid7: Uuid::now_v7().to_string(),
-            prompt: json.get("prompt").and_then(|v| v.as_str()).unwrap_or("test probe").to_string(),
-            details: json.get("details").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            yes_dialog: String::new(),
-            no_dialog: String::new(),
-            timeout: 30,
-            origin: "cockatiel".to_string(),
-            origin_uuid7: String::new(),
-            instructions: String::new(),
-            link: String::new(),
-            input_label: String::new(),
-            prompt_type: 0,
-        })),
-        "shutdown" => Some(Payload::Shutdown(Shutdown { reason: "test probe".to_string() })),
-        "message_ack" => Some(Payload::MessageAck(MessageAck {
-            message_uuid7: json.get("message_uuid7").and_then(|v| v.as_str()).unwrap_or("probe").to_string(),
-        })),
-        "command_payload" => Some(Payload::CommandPayload(Command {
-            command_name: json.get("command").and_then(|v| v.as_str()).unwrap_or("probe").to_string(),
-            command_flag: json.get("flag").and_then(|v| v.as_str()).unwrap_or("!").to_string(),
-            command_description: String::new(),
-            command_flags: vec![],
-        })),
-        _ => None,
-    }
-}
-
-/// `test_probe` virtual query: send a payload of the requested type to ONE
-/// module's connection and measure the round-trip (the module's session
-/// `last_activity` advancing proves a response). Returns
-/// `{ module, type, responded, latency_ms }`.
-pub async fn handle_test_probe(
-    sql: &str,
-    orchestrator: &PipelineOrchestrator,
-    auth_store: &AuthStore,
-    ui_state: &Arc<Mutex<EngineState>>,
-) -> Result<String, String> {
-    let payload: serde_json::Value =
-        serde_json::from_str(sql).map_err(|e| format!("Invalid test_probe payload: {}", e))?;
-    let module = payload.get("module").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let ptype = payload.get("type").and_then(|v| v.as_str()).unwrap_or("log").to_string();
-    let pjson = payload.get("payload_json").cloned().unwrap_or_else(|| serde_json::json!({}));
-    if module.is_empty() {
-        return Err("test_probe requires a module".to_string());
-    }
-
-    let (instance_uuid, last_activity) = auth_store
-        .find_by_module(&module)
-        .ok_or_else(|| format!("module '{}' not connected", module))?;
-
-    let probe_payload = build_probe_payload(&ptype, &pjson);
-    let container = Container {
-        version: 1,
-        auth_token: String::new(),
-        module_name: "cockatiel".into(),
-        module_instance_uuid7: instance_uuid.clone(),
-        payload: probe_payload,
-    };
-    let mut buf = Vec::new();
-    container
-        .encode(&mut buf)
-        .map_err(|e| format!("probe encode failed: {}", e))?;
-
-    let sent = crate::pipeline::send_to_module(&orchestrator.module_senders, &module, container, "test_probe").await;
-    if !matches!(sent, SendOutcome::Sent) {
-        return Err(format!("module '{}' has no sender", module));
-    }
-
-    let now_ms = || -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0)
-    };
-    let sent_at = now_ms();
-    let mut responded = false;
-    let mut latency = 0i64;
-    for _ in 0..200 {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        if let Some((_, la)) = auth_store.find_by_module(&module)
-            && la > last_activity
-        {
-            responded = true;
-            latency = now_ms().saturating_sub(sent_at);
-            break;
-        }
-    }
+    // Written as an ordinary shutdown, not a crash: the TUI supervisor sees a
+    // clean exit status, and its own restart policy (not this one) decides
+    // whether the engine comes back.
     log_event_broadcast(
-        ui_state,
-        format!("[test_probe] '{}' <- {} responded={} latency={}ms", module, ptype, responded, latency),
+        &ui_state,
+        "[engine] shutdown complete — exiting cleanly (a restart comes back paused; nothing is lost while paused)",
     );
-    Ok(serde_json::json!({
-        "module": module,
-        "type": ptype,
-        "responded": responded,
-        "latency_ms": latency,
-    })
-    .to_string())
+    println!("[Cockatiel] engine shutdown: exiting cleanly");
+    // `exit`, not a `return`: unwinding the runtime would tear down the turso
+    // connection and every spawned task, and a panic in a Drop on the way out
+    // would turn a clean exit into a non-zero one.
+    std::process::exit(0);
 }
 
 /// Monotonic id identifying the socket a session is currently bound to. A
@@ -2391,6 +1681,7 @@ async fn handle_connection<S>(
     prompt_routes: SharedPromptRoutes,
     kill_map: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
     cmd_registry: Arc<Mutex<CommandRegistry>>,
+    shutdown: SharedShutdown,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -2853,6 +2144,12 @@ let mut bytes = Vec::new();
         }
     }
 
+    // Set once this connection has queued the answer to an accepted
+    // `engine_shutdown` request. The answer is, by construction, the next
+    // container this socket writes, so the outbound arm can hand the exit back
+    // to the main loop at exactly the moment the TUI has the response in hand.
+    let mut shutdown_flush = false;
+
     loop {
         tokio::select! {
             incoming = websocket.next() => {
@@ -2920,24 +2217,47 @@ let mut bytes = Vec::new();
                         // to do — last_activity was refreshed.
                     }
                     Some(Payload::MessagePreProcess(ref msg)) => {
-                        // Enrich the chat message with user data from the user DB
-                        // (if the adapter supplied a user identifier).
                         let mut enriched = msg.clone();
                         if let Some(chat) = enriched.raw_message.as_mut() {
-                            enrich_chat_user(&user_db_client, chat).await;
-                            // Command parsing: if the raw message starts with a
-                            // registered flag, attach the parsed Command (with
-                            // flag values) so the pipeline routes it to the
+                            // Command parsing FIRST: if the raw message starts
+                            // with a registered flag, attach the parsed Command
+                            // (with flag values) so the pipeline routes it to the
                             // owning module (+ catch-alls). Unknown commands on
                             // an alerting flag get the apology reply; `!help`
-                            // lists every registered command.
-                            handle_command_on_ingest(
+                            // lists every registered command. This has to
+                            // complete before the user-data fetch below, because
+                            // whether a command was attached is an input to the
+                            // decision of whether to fetch at all.
+                            let command_outcome = handle_command_on_ingest(
                                 chat,
                                 &cmd_registry,
                                 &orchestrator,
                                 &ui_state,
                             )
                             .await;
+                            // Then enrich the chat message with user data from
+                            // the user DB (if the adapter supplied a user
+                            // identifier) — but only when something downstream
+                            // will actually consume it, since the lookup costs
+                            // two WebSocket round-trips. A plain message that
+                            // no catch-all, command module or connected display
+                            // cares about is left with `user_data == None`.
+                            // Every guard is dropped before the enrich await:
+                            // a std MutexGuard must never be held across one.
+                            let connected = connected_module_names(&orchestrator.module_senders).await;
+                            let fetch = {
+                                let cfg = orchestrator.config.lock().await;
+                                let reg = cmd_registry.lock().unwrap();
+                                should_fetch_user_data(
+                                    command_outcome.command_attached(),
+                                    &reg,
+                                    &cfg,
+                                    &connected,
+                                )
+                            };
+                            if fetch {
+                                enrich_chat_user(&user_db_client, chat).await;
+                            }
                         }
                         let enriched_container = Container {
                             version: container.version,
@@ -2969,372 +2289,58 @@ let mut bytes = Vec::new();
                         log_to_timeline(&db, "module_error", &module_name, &err.log).await;
                     }
                     Some(Payload::DatabaseQuery(ref query)) => {
-                        // Virtual queries — engine metadata, not database
-                        let (success, result_blob, error_msg) = if query.query_id == "db_status" {
-                            // Backup status for the timeline + user database, so
-                            // the UI can warn the operator about data-loss risk.
-                            let userdb_backup = std::env::var("USER_DB_BACKUP_PATH")
-                                .map(|p| !p.trim().is_empty())
-                                .unwrap_or(false);
-                            let status = serde_json::json!({
-                                "timeline_backup": db.backup_configured(),
-                                "userdb_backup": userdb_backup,
-                                "timeline_db_size_bytes": db.db_size_bytes(),
-                                "timeline_db_target_mb": db.target_mb(),
-                            });
-                            (true, status.to_string().into_bytes(), String::new())
-                        } else if query.query_id == "module_list" {
-                            let sessions = auth_store.values();
-                            // Modules with an unanswered prompt are waiting on
-                            // the operator (e.g. a setup/credential question) —
-                            // expose it so UIs and the test harness can tell a
-                            // connected-but-stuck module apart from an idle one.
-                            let pending_prompts: std::collections::HashSet<String> = prompt_routes
-                                .lock()
-                                .unwrap()
-                                .values()
-                                .filter_map(|sink| match sink {
-                                    PromptSink::Module(origin, _) => Some(origin.clone()),
-                                    PromptSink::Engine(_) => None,
-                                })
-                                .collect();
-                            let registered = module_registry.values();
-
-                            // Merge by module name: discovered (manifests on disk) +
-                            // registered (persisted modules.json) + live sessions.
-                            let mut entries: HashMap<String, serde_json::Value> = HashMap::new();
-
-                            // 1. Discovered modules — what the engine can find on disk
-                            // `credential_values` contains `.env` secrets; only the
-                            // TUI control surface and term-chat (OAuth login) may see
-                            // them. Other modules get the structural list redacted.
-                            let expose_creds = may_read_other_credentials(&module_name);
-                            for (name, discovered) in discovered_registry.lock().unwrap().iter() {
-                                let cred_values = credential_values_map(discovered);
-                                let config_complete =
-                                    is_config_complete(&discovered.manifest.credentials, &cred_values);
-                                let exposed_values = if expose_creds {
-                                    cred_values
-                                } else {
-                                    std::collections::HashMap::new()
-                                };
-                                entries.insert(
-                                    name.clone(),
-                                    serde_json::json!({
-                                        "name": name,
-                                        "description": discovered.manifest.description,
-                                        "uuid7": null,
-                                        "position": "unknown",
-                                        "priority": null,
-                                        "autostart": discovered.manifest.autostart,
-                                        "connected_at": null,
-                                        "shutdown_at": null,
-                                        "credentials": discovered.manifest.credentials,
-                                        "directory": discovered.directory.to_string_lossy().to_string(),
-                                        "credential_values": exposed_values,
-                                        "config_complete": config_complete,
-                                    }),
-                                );
-                            }
-
-                            // 2. Registered modules — persisted knowledge from modules.json
-                            for m in &registered {
-                                let entry = entries
-                                    .entry(m.name.clone())
-                                    .or_insert_with(|| serde_json::json!({
-                                        "name": m.name,
-                                        "uuid7": null,
-                                        "position": "unknown",
-                                        "priority": null,
-                                        "autostart": null,
-                                        "connected_at": null,
-                                        "shutdown_at": null,
-                                    }));
-                                entry["uuid7"] = serde_json::json!(m.instance_uuid7);
-                                entry["position"] = serde_json::json!(m.position);
-                                entry["priority"] = serde_json::json!(m.priority);
-                            }
-
-                            // 3. Live sessions — overlay current state on top.
-                            // Shutdown sessions (disconnected but cleanup not
-                            // yet finished) are NOT live: they must not appear
-                            // as connected (that made UIs probe a dead module
-                            // and restart it).
-                            for s in sessions.iter().filter(|s| s.shutdown_at.is_none()) {
-                                let entry = entries
-                                    .entry(s.module_name.clone())
-                                    .or_insert_with(|| serde_json::json!({
-                                        "name": s.module_name,
-                                        "uuid7": null,
-                                        "position": "unknown",
-                                        "priority": null,
-                                        "autostart": null,
-                                        "connected_at": null,
-                                        "shutdown_at": null,
-                                    }));
-                                entry["uuid7"] = serde_json::json!(s.instance_uuid7);
-                                entry["position"] = serde_json::json!(s.position);
-                                entry["priority"] = serde_json::json!(s.priority);
-                                entry["connected_at"] = serde_json::json!(s.connected_at);
-                                entry["shutdown_at"] = serde_json::json!(s.shutdown_at);
-                                entry["alive"] = serde_json::json!(!s.unresponsive);
-                                entry["last_seen"] = serde_json::json!(s.last_activity_ms);
-                                entry["pending_prompt"] =
-                                    serde_json::json!(pending_prompts.contains(&s.module_name));
-                            }
-
-                            let mut list: Vec<serde_json::Value> = entries.into_values().collect();
-                            list.sort_by(|a, b| {
-                                a.get("name")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .cmp(b.get("name").and_then(|v| v.as_str()).unwrap_or(""))
-                            });
-                            let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string());
-                            (true, json.into_bytes(), String::new())
-                        } else if query.query_id == "engine_info" {
-                            let config = get_config(&config_state);
-                            // The PIN is the master key for first connections — only
-                            // the TUI control surface may read it. Other callers get
-                            // connection metadata only.
-                            let pin = if is_control_surface(&module_name) {
-                                serde_json::json!(config::get_pin(&config_state))
-                            } else {
-                                serde_json::Value::Null
-                            };
-                            let json = serde_json::json!({
-                                "port": config.port,
-                                "pin": pin,
-                                "timeline_database_location": config.timeline_database_location,
-                            }).to_string();
-                            (true, json.into_bytes(), String::new())
-                        } else if query.query_id == "test_run" {
-                            // Compliance test runner — TUI-only gate, mirrors userdb.
-                            if !is_control_surface(&module_name) {
-                                (false, Vec::new(), "Test runner access denied: not the TUI".to_string())
-                            } else {
-                                let engine_pin = config::get_pin(&config_state);
-                                run_test_suite(&query.sql, &ui_state, engine_pin).await
-                            }
-                        } else if query.query_id == "test_probe" {
-                            // Per-module probe: the engine sends a payload of the
-                            // requested type to one module's connection and
-                            // measures the round-trip. TUI/test-runner gated.
-                            if !is_control_surface(&module_name) && !is_test_runner(&module_name) {
-                                (false, Vec::new(), "test_probe denied: not the TUI/test-runner".to_string())
-                            } else {
-                                let probe = handle_test_probe(
-                                    &query.sql,
-                                    &orchestrator,
-                                    &auth_store,
-                                    &ui_state,
-                                ).await;
-                                match probe {
-                                    Ok(json) => (true, json.into_bytes(), String::new()),
-                                    Err(e) => (false, Vec::new(), e),
-                                }
-                            }
-                        } else if query.query_id == "audit_list" {
-                            // List held-for-audit messages. TUI-only.
-                            if !is_control_surface(&module_name) {
-                                (false, Vec::new(), "Audit access denied: not the TUI".to_string())
-                            } else {
-                                let payload: serde_json::Value = serde_json::from_str(&query.sql).unwrap_or(serde_json::json!({}));
-                                let limit = payload.get("limit").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
-                                let offset = payload.get("offset").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                                match db.list_audit(limit, offset).await {
-                                    Ok(items) => {
-                                        let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
-                                        (true, json.into_bytes(), String::new())
-                                    }
-                                    Err(e) => (false, Vec::new(), format!("audit_list failed: {}", e)),
-                                }
-                            }
-                        } else if query.query_id == "audit_approve" || query.query_id == "audit_reject" {
-                            // Approve (resubmit as normal) or reject an audited message. TUI-only.
-                            if !is_control_surface(&module_name) {
-                                (false, Vec::new(), "Audit access denied: not the TUI".to_string())
-                            } else {
-                                let payload: serde_json::Value = serde_json::from_str(&query.sql).unwrap_or(serde_json::json!({}));
-                                let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-                                if uuid7.is_empty() {
-                                    (false, Vec::new(), "audit action requires uuid7".to_string())
-                                } else {
-                                    let approve = query.query_id == "audit_approve";
-                                    match db.release_audit(uuid7.as_bytes(), approve).await {
-                                        Ok(_) => {
-                                            let json = serde_json::json!({ "uuid7": uuid7, "released": approve }).to_string();
-                                            (true, json.into_bytes(), String::new())
-                                        }
-                                        Err(e) => (false, Vec::new(), format!("audit action failed: {}", e)),
-                                    }
-                                }
-                            }
-                        } else if query.query_id.starts_with("mod_") {
-                            // Mod commands from adapters: resolve the target user
-                            // by platform + handle, then apply the action. The
-                            // actor (human trigger) is verified first.
-                            mod_virtual_query(&user_db_client, &query.query_id, &query.sql, &ui_state, &module_name).await
-                        } else if query.query_id == "chat_commend" || query.query_id == "chat_reprimand" {
-                            // Chat-command ratings (commend/reprimand modules):
-                            // ANY verified user may rate another user (no mod
-                            // status required). The 24h reprimand cooldown is
-                            // enforced in the user-db rating_history.
-                            chat_rating_virtual_query(&user_db_client, &query.query_id, &query.sql, &ui_state, &module_name).await
-                        } else if query.query_id == "chat_verify_identity" {
-                            // Identity bootstrap / write-through — term-chat only.
-                            chat_verify_identity_virtual_query(&user_db_client, &query.sql, &ui_state, &module_name).await
-                        } else if query.query_id == "userdb_adjust_score" {
-                            // Real arbitrary score delta for the score-messages
-                            // module (no ±1 clamp, no user-db rating cooldown).
-                            // The TUI control surface may also call it.
-                            if !is_control_surface(&module_name) && module_name != "score-messages" {
-                                (false, Vec::new(), "userdb_adjust_score denied: not the TUI or score-messages".to_string())
-                            } else {
-                                userdb_adjust_score_virtual_query(&user_db_client, &query.sql, &ui_state, &module_name).await
-                            }
-                        } else if query.query_id.starts_with("userdb_") {
-                            // User database is engine-internal — only the TUI
-                            // control surface may access it. Modules are denied.
-                            if !is_control_surface(&module_name) {
-                                (false, Vec::new(), "User database access denied: not the TUI".to_string())
-                            } else {
-                                userdb_virtual_query(&user_db_client, &query.query_id, &query.sql, &ui_state, &module_name, peer_loopback).await
-                            }
-                        } else if query.query_id == "set_credentials" {
-                            // Writing credentials to another module's `.env` /
-                            // `config.json` is a control-surface operation — only
-                            // the TUI may do it. Otherwise any authenticated module
-                            // could rewrite any other module's secrets.
-                            if !is_control_surface(&module_name) {
-                                (false, Vec::new(), "set_credentials denied: not the TUI".to_string())
-                            } else {
-                            // Expects JSON: { "module_name": "...", "values": { "key": "value", ... } }
-                            let mut result = (false, Vec::new(), "Failed to parse set_credentials payload".to_string());
-                            if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&query.sql) {
-                                let module_name = payload.get("module_name").and_then(|v| v.as_str()).unwrap_or("");
-                                let values: HashMap<String, String> = payload
-                                    .get("values")
-                                    .and_then(|v| v.as_object())
-                                    .map(|obj| {
-                                        obj.iter()
-                                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-
-                                let found = discovered_registry.lock().unwrap().get(module_name).cloned();
-                                match found {
-                                    Some(module) => {
-                                        let fields = module.manifest.credentials.clone();
-                                        match validate_credential_fields(&fields, &values) {
-                                            Ok(()) => {
-                                                match save_module_credentials(&module, &fields, &values) {
-                                                    Ok(()) => {
-                                                        log_event_broadcast(&ui_state, format!("[{}] Credentials updated for '{}'", module_name, module_name));
-                                                        // The TUI supervisor owns process lifecycle — it restarts the
-                                                        // module after this query so the new config is picked up.
-                                                        result = (true, serde_json::json!({"success": true, "message": format!("Credentials saved for '{}'", module_name)}).to_string().into_bytes(), String::new());
-                                                    }
-                                                    Err(e) => result = (false, Vec::new(), e),
-                                                }
-                                            }
-                                            Err(e) => result = (false, Vec::new(), e),
-                                        }
-                                    }
-                                    None => result = (false, Vec::new(), format!("Unknown module: {}", module_name)),
-                                }
-                            }
-                            result
-                            }
-                        } else if query.query_id == "audio_for_message" {
-                            // Fetch a message's rendered audio (raw bytes) so
-                            // displays can play it. Any module may read it.
-                            let payload: serde_json::Value =
-                                serde_json::from_str(&query.sql).unwrap_or(serde_json::json!({}));
-                            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-                            if uuid7.is_empty() {
-                                (false, Vec::new(), "audio_for_message requires uuid7".to_string())
-                            } else {
-                                match db.get_audio(uuid7.as_bytes()).await {
-                                    Ok(Some((_audio_type, bytes))) => {
-                                        (true, bytes, String::new())
-                                    }
-                                    Ok(None) => (true, Vec::new(), String::new()),
-                                    Err(e) => (false, Vec::new(), format!("audio_for_message failed: {}", e)),
-                                }
-                            }
-                        } else if query.query_id == "test_archive" {
-                            // Compliance-test archival — test-runner only. The
-                            // engine inserts archival rows via its own method
-                            // (insert_archival_event) rather than allowing raw
-                            // INSERTs through the SQL fallback.
-                            if !is_test_runner(&module_name) {
-                                (false, Vec::new(), "test_archive access denied: not the test runner".to_string())
-                            } else {
-                                let payload: serde_json::Value =
-                                    serde_json::from_str(&query.sql).unwrap_or(serde_json::json!({}));
-                                let batch_uuid =
-                                    payload.get("batch_uuid").and_then(|v| v.as_str()).unwrap_or("test");
-                                let mut inserted = 0u64;
-                                let mut error = String::new();
-                                if let Some(entries) = payload.get("entries").and_then(|v| v.as_array()) {
-                                    for e in entries {
-                                        let json = e.get("json").and_then(|v| v.as_str()).unwrap_or("");
-                                        if json.is_empty() {
-                                            continue;
-                                        }
-                                        match db
-                                            .insert_archival_event("test", "test_archive", json, &format!("test-runner|{}", batch_uuid))
-                                            .await
-                                        {
-                                            Ok(()) => inserted += 1,
-                                            Err(e) => {
-                                                error = format!("{}", e);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                if error.is_empty() {
-                                    let out = serde_json::json!({ "inserted": inserted }).to_string();
-                                    (true, out.into_bytes(), String::new())
-                                } else {
-                                    (false, Vec::new(), format!("test_archive failed after {} inserts: {}", inserted, error))
-                                }
-                            }
-                        } else {
-                            // Regular database query — hard read-only boundary.
-                            // Only SELECT/EXPLAIN may run; any write must
-                            // go through the engine's own methods or a
-                            // dedicated virtual query.
-                            if is_read_only_sql(&query.sql) {
-                                match guarded_execute_query(&db, &query.sql).await {
-                                    Ok(json) => (true, json.into_bytes(), String::new()),
-                                    Err(e) => {
-                                        let msg = format!("{}", e);
-                                        log_event_broadcast(&ui_state, format!("[{}] Query error: {}", module_name, msg));
-                                        (false, Vec::new(), msg)
-                                    }
-                                }
-                            } else {
-                                (false, Vec::new(), "Denied: only read-only SQL (SELECT/EXPLAIN) is allowed via DatabaseQuery — use a dedicated virtual query for writes".to_string())
-                            }
+                        // The query surface, its gates and its response
+                        // envelope all live in `queries`; this arm only lends
+                        // it the connection's ambient state and ships the answer
+                        // back on the same 1s bound it always used.
+                        let was_requested = shutdown.stage() == ShutdownStage::Requested;
+                        let ctx = QueryContext {
+                            db: &db,
+                            auth_store: &auth_store,
+                            orchestrator: &orchestrator,
+                            ui_state: &ui_state,
+                            user_db_client: &user_db_client,
+                            config_state: &config_state,
+                            module_registry: &module_registry,
+                            discovered_registry: &discovered_registry,
+                            prompt_routes: &prompt_routes,
+                            module_name: &module_name,
+                            instance_uuid7: &instance_uuid7,
+                            tx: &tx,
+                            shutdown: &shutdown,
+                            peer_loopback,
                         };
-                        let response = Container {
-                            version: 1,
-                            auth_token: container.auth_token.clone(),
-                            module_name: "cockatiel".into(),
-                            module_instance_uuid7: instance_uuid7.clone(),
-                            payload: Some(Payload::DatabaseQueryResult(DatabaseQueryResult {
-                                query_id: query.query_id.clone(),
-                                success,
-                                error: error_msg,
-                                result_blob,
-                            })),
-                        };
-                        if tokio::time::timeout(Duration::from_millis(1000), tx.send(response)).await.is_err() {
-                            log_event_broadcast(&ui_state, format!("[{}] dropped query response (outbound full)", module_name));
+                        let outcome =
+                            queries::handle_query(&ctx, &query.query_id, &query.sql).await;
+                        // Did THIS query raise a shutdown request? Reading the
+                        // signal either side of the call is what makes the
+                        // answer below unambiguous: a concurrent request on
+                        // another socket cannot claim this connection's write.
+                        let answered_with_shutdown =
+                            !was_requested && shutdown.stage() == ShutdownStage::Requested;
+                        let queued = queries::send_query_response(
+                            &ctx,
+                            &container.auth_token,
+                            &query.query_id,
+                            outcome,
+                        )
+                        .await;
+                        // Armed only now — AFTER the answer is on the channel.
+                        // The channel is FIFO and the answer was queued before
+                        // this point, so the very next frame this socket writes
+                        // IS the answer, whatever the log-broadcast task has
+                        // enqueued around it. The outbound arm below completes
+                        // the handoff once that write lands; the main loop is
+                        // holding the exit until it does.
+                        shutdown_flush = answered_with_shutdown && queued;
+                        if answered_with_shutdown && !queued {
+                            // The answer could not even be queued (the outbound
+                            // channel is wedged — `send_query_response` has
+                            // already logged the drop). There is nothing to
+                            // write and nothing to wait for, so release the
+                            // exit rather than leaving the engine running after
+                            // it accepted the request.
+                            shutdown.mark_answered();
                         }
                     }
 Some(Payload::SendToPlatforms(send)) => {
@@ -3631,6 +2637,15 @@ Some(Payload::ModuleControl(_)) => {
                     ));
                     break;
                 }
+
+                // The write landed. If this frame was the answer to an accepted
+                // shutdown request, the caller now knows — release the process
+                // exit. (FIFO ordering guarantees this is that answer: it was
+                // queued before the flush was armed.)
+                if shutdown_flush {
+                    shutdown_flush = false;
+                    shutdown.mark_answered();
+                }
             }
             killed = kill_rx.changed() => {
                 // The probe task flagged this session as unresponsive —
@@ -3648,6 +2663,13 @@ Some(Payload::ModuleControl(_)) => {
 
     // Unregister the kill switch.
     kill_map.lock().await.remove(&instance_uuid7);
+
+    // The socket is gone with a shutdown answer still unflushed (send failure,
+    // peer hang-up, …). No answer can ever reach that caller now, so the main
+    // loop must not keep waiting for one: release the exit here instead.
+    if shutdown_flush {
+        shutdown.mark_answered();
+    }
 
     // Drop any prompt routes whose origin module just disconnected (their
     // outbound channel is now closed). Without this, unanswered module prompts

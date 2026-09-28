@@ -1,7 +1,7 @@
 //! Read-only SQL boundary tests: the engine's `DatabaseQuery` only permits
 //! SELECT/EXPLAIN for modules; every write construct must be rejected.
 
-use crate::is_read_only_sql;
+use crate::queries::is_read_only_sql;
 
 #[test]
 fn read_only_queries_pass() {
