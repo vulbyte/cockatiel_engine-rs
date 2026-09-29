@@ -559,6 +559,9 @@ async fn dispatch(
             crate::config::refresh_config(config_state);
             let config = get_config(config_state);
             let sessions = auth_store.values();
+            // Rolling per-module processing averages (ms), for the TUI's ms
+            // column. Snapshot once so every entry reads the same numbers.
+            let module_timings = orchestrator.module_timings.lock().await.all_avgs();
             // Modules with an unanswered prompt are waiting on
             // the operator (e.g. a setup/credential question) —
             // expose it so UIs and the test harness can tell a
@@ -600,6 +603,7 @@ async fn dispatch(
                         "position": "unknown",
                         "priority": null,
                         "autostart": discovered.manifest.autostart,
+                        "avg_ms": module_timings.get(name.as_str()).copied(),
                         "connected_at": null,
                         "shutdown_at": null,
                         "credentials": discovered.manifest.credentials,
@@ -620,10 +624,12 @@ async fn dispatch(
                         "position": "unknown",
                         "priority": null,
                         "autostart": null,
+                        "avg_ms": null,
                         "connected_at": null,
                         "shutdown_at": null,
                     }));
                 entry["uuid7"] = serde_json::json!(m.instance_uuid7);
+                entry["avg_ms"] = module_timings.get(m.name.as_str()).copied().map(|v| serde_json::json!(v)).unwrap_or(serde_json::Value::Null);
                 // Position comes from the CONFIG ordering lists, not the
                 // connect-time registration in modules.json — an operator stage
                 // move rewrites config.json and must be what a UI reports, even
@@ -649,10 +655,12 @@ async fn dispatch(
                         "position": "unknown",
                         "priority": null,
                         "autostart": null,
+                        "avg_ms": null,
                         "connected_at": null,
                         "shutdown_at": null,
                     }));
                 entry["uuid7"] = serde_json::json!(s.instance_uuid7);
+                entry["avg_ms"] = module_timings.get(s.module_name.as_str()).copied().map(|v| serde_json::json!(v)).unwrap_or(serde_json::Value::Null);
                 entry["position"] = serde_json::json!(module_position_from_config(&config, &s.module_name).unwrap_or_else(|| s.position.clone()));
                 entry["priority"] = serde_json::json!(s.priority);
                 entry["connected_at"] = serde_json::json!(s.connected_at);

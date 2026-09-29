@@ -169,6 +169,71 @@ pub struct PendingAck {
     pub timeout: Duration,
 }
 
+/// A module's rolling per-message processing latency.
+///
+/// The last `WINDOW` samples are kept so the reported average reflects the
+/// module's CURRENT speed (an operator watching the modules window sees a
+/// slowdown within a few messages and can kill the offender) rather than a
+/// since-boot mean. `Window` is 8: the engine's ack timeout is 3s, so 8
+/// messages is a small enough window to stay responsive to a regression while
+/// still smoothing single-message jitter.
+#[derive(Debug, Clone, Default)]
+pub struct ModuleTiming {
+    /// The most recent samples, oldest first, capped at [`WINDOW`].
+    samples: Vec<f64>,
+    /// The average of the current samples (ms). Kept so a zero-sample module
+    /// still reports a definite 0 rather than a blank.
+    pub avg_ms: f64,
+}
+
+impl ModuleTiming {
+    /// How many recent messages make up the rolling average.
+    pub const WINDOW: usize = 8;
+
+    /// Record one message's processing time (ms). Keeps only the last
+    /// [`WINDOW`] samples and re-derives the average.
+    pub fn record(&mut self, elapsed_ms: f64) {
+        self.samples.push(elapsed_ms);
+        if self.samples.len() > Self::WINDOW {
+            let overflow = self.samples.len() - Self::WINDOW;
+            self.samples.drain(0..overflow);
+        }
+        let sum: f64 = self.samples.iter().sum();
+        self.avg_ms = sum / self.samples.len() as f64;
+    }
+}
+
+/// Per-module rolling latencies, keyed by module name.
+#[derive(Debug, Clone, Default)]
+pub struct ModuleTimings {
+    by_module: HashMap<String, ModuleTiming>,
+}
+
+impl ModuleTimings {
+    /// Record a processing time for `module_name`, creating its window on first
+    /// use.
+    pub fn record(&mut self, module_name: &str, elapsed_ms: f64) {
+        self.by_module
+            .entry(module_name.to_string())
+            .or_default()
+            .record(elapsed_ms);
+    }
+
+    /// The current rolling average (ms) for `module_name`, or `None` if the
+    /// module has not completed a message yet.
+    pub fn avg_ms(&self, module_name: &str) -> Option<f64> {
+        self.by_module.get(module_name).map(|t| t.avg_ms)
+    }
+
+    /// Snapshot of every recorded module's current average (ms).
+    pub fn all_avgs(&self) -> HashMap<String, f64> {
+        self.by_module
+            .iter()
+            .map(|(n, t)| (n.clone(), t.avg_ms))
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AckTracker {
     pending: HashMap<String, Vec<PendingAck>>,
@@ -205,15 +270,16 @@ impl AckTracker {
 
     /// Remove ONLY the acking module's pending entry for `uuid7` (a stage with
     /// several modules must wait for ALL of them to ack, not advance on the
-    /// first). Returns the stage that was acked, if this module had a pending
-    /// ack for the message.
-    pub fn ack_module(&mut self, uuid7: &str, module_name: &str) -> Option<String> {
-        let stage = {
+    /// first). Returns the stage that was acked AND the processing duration
+    /// (ms since the send) — the duration is what feeds the module's rolling
+    /// latency average. `None` if this module had no pending ack for the message.
+    pub fn ack_module(&mut self, uuid7: &str, module_name: &str) -> Option<(String, f64)> {
+        let now = Instant::now();
+        let (stage, elapsed_ms) = {
             let entries = self.pending.get(uuid7)?;
-            entries
-                .iter()
-                .find(|e| e.module_name == module_name)
-                .map(|e| e.stage.clone())?
+            let entry = entries.iter().find(|e| e.module_name == module_name)?;
+            let elapsed_ms = now.duration_since(entry.sent_at).as_secs_f64() * 1000.0;
+            (entry.stage.clone(), elapsed_ms)
         };
         if let Some(entries) = self.pending.get_mut(uuid7) {
             entries.retain(|e| e.module_name != module_name);
@@ -221,7 +287,7 @@ impl AckTracker {
                 self.pending.remove(uuid7);
             }
         }
-        Some(stage)
+        Some((stage, elapsed_ms))
     }
 
     pub fn check_timeouts(&mut self) -> Vec<PendingAck> {
@@ -388,6 +454,10 @@ pub struct PipelineOrchestrator {
     /// starts neutral and gating is a property of a running engine, not of
     /// constructing an orchestrator.
     pause_state: Arc<Mutex<PauseState>>,
+    /// Rolling per-module processing latencies, fed by `handle_ack` and read by
+    /// `module_list` (the TUI's 2s poll) to show each module's current average
+    /// time and the per-stage sums.
+    pub module_timings: Arc<Mutex<ModuleTimings>>,
 }
 
 impl PipelineOrchestrator {
@@ -405,6 +475,7 @@ impl PipelineOrchestrator {
             module_senders,
             command_registry,
             pause_state: Arc::new(Mutex::new(PauseState::default())),
+            module_timings: Arc::new(Mutex::new(ModuleTimings::default())),
         }
     }
 
@@ -1176,10 +1247,16 @@ impl PipelineOrchestrator {
             ack_guard.ack_module(uuid7, module_name)
         };
 
-        let stage = match completed_stage {
-            Some(s) => s,
+        let (stage, elapsed_ms) = match completed_stage {
+            Some(v) => v,
             None => return Ok(()),
         };
+
+        // Feed the module's rolling latency average — this is the data the TUI
+        // shows as each module's current ms. Only count real completed
+        // messages (an ack is the module saying "done"), so the average is
+        // purely how long a module takes on the messages it actually handled.
+        self.module_timings.lock().await.record(module_name, elapsed_ms);
 
         let still_pending = {
             let ack_guard = self.ack_tracker.lock().await;
@@ -1498,7 +1575,7 @@ mod timeout_sweep_tests {
         );
 
         // Once the survivor acks, the message is free to advance.
-        assert_eq!(tracker.ack_module("uuid-1", "live"), Some("pre_process".into()));
+        assert_eq!(tracker.ack_module("uuid-1", "live").map(|(s, _)| s), Some("pre_process".into()));
         assert!(!tracker.has_pending("uuid-1"));
     }
 
@@ -1616,5 +1693,36 @@ mod timeout_wiring_tests {
             body.contains("timed out waiting for"),
             "the timeout log should say what it is reporting"
         );
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    #[test]
+    fn module_timing_rolls_over_to_the_last_8_samples() {
+        let mut t = ModuleTiming::default();
+        // 12 messages: 1..=12. The window is 8, so the average must be of
+        // 5..=12 (sum 68 / 8 = 8.5), not the since-start mean.
+        for i in 1..=12 {
+            t.record(i as f64);
+        }
+        assert_eq!(t.samples.len(), ModuleTiming::WINDOW);
+        assert!((t.avg_ms - 8.5).abs() < 1e-9, "avg was {}", t.avg_ms);
+    }
+
+    #[test]
+    fn module_timings_track_per_module() {
+        let mut ts = ModuleTimings::default();
+        assert_eq!(ts.avg_ms("alpha"), None, "no sample yet");
+        ts.record("alpha", 10.0);
+        ts.record("alpha", 20.0);
+        ts.record("bravo", 100.0);
+        assert!((ts.avg_ms("alpha").unwrap() - 15.0).abs() < 1e-9);
+        assert!((ts.avg_ms("bravo").unwrap() - 100.0).abs() < 1e-9);
+        let all = ts.all_avgs();
+        assert_eq!(all.len(), 2);
+        assert!((all["alpha"] - 15.0).abs() < 1e-9);
     }
 }

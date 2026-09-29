@@ -16,7 +16,7 @@ fn stage_advances_only_when_all_recipients_ack() {
 
     // One recipient acks — the stage must NOT advance while module-b is pending.
     let stage = tracker.ack_module(&uuid, "module-a");
-    assert_eq!(stage.as_deref(), Some("preprocess"));
+    assert_eq!(stage.map(|(s, _)| s), Some("preprocess".to_string()));
     assert!(
         tracker.has_pending(&uuid),
         "must not advance early while module-b has not acked"
@@ -24,7 +24,7 @@ fn stage_advances_only_when_all_recipients_ack() {
 
     // All recipients ack → nothing pending → the stage may advance.
     let stage = tracker.ack_module(&uuid, "module-b");
-    assert_eq!(stage.as_deref(), Some("preprocess"));
+    assert_eq!(stage.map(|(s, _)| s), Some("preprocess".to_string()));
     assert!(!tracker.has_pending(&uuid));
 }
 
@@ -37,7 +37,7 @@ fn ack_module_ignores_unknown_recipients_and_is_idempotent() {
     assert_eq!(tracker.ack_module("u2", "module-other"), None);
     assert!(tracker.has_pending("u2"));
 
-    assert_eq!(tracker.ack_module("u2", "module-a"), Some("preprocess".to_string()));
+    assert_eq!(tracker.ack_module("u2", "module-a").map(|(s, _)| s), Some("preprocess".to_string()));
     assert!(!tracker.has_pending("u2"));
 
     // Acking again after removal is a no-op.
