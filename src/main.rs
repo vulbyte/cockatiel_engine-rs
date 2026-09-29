@@ -1279,15 +1279,24 @@ cockatiel
         cmd_registry.clone(),
     );
 
-    // Wire the module cost gates (price / min_rank from the discovered
+    // Wire the module gates (authority / rank / price from the discovered
     // manifests) and the user database into the orchestrator, so a user must
-    // pay a priced module's cost and meet its rank requirement for the module
-    // to run on their message.
+    // meet the module's authority + rank and pay its price for the module to
+    // run on their message.
     {
-        let gates: std::collections::HashMap<String, (u64, i64)> = {
+        let gates: std::collections::HashMap<String, crate::pipeline::ModuleGate> = {
             let reg = discovered_registry.lock().unwrap();
             reg.iter()
-                .map(|(name, m)| (name.clone(), (m.manifest.price, m.manifest.min_rank)))
+                .map(|(name, m)| {
+                    (
+                        name.clone(),
+                        crate::pipeline::ModuleGate {
+                            authority: m.manifest.authority,
+                            min_rank: m.manifest.min_rank,
+                            price: m.manifest.price,
+                        },
+                    )
+                })
                 .collect()
         };
         orchestrator.set_module_gates(gates);

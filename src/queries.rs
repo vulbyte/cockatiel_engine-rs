@@ -622,6 +622,7 @@ async fn dispatch(
                         "autostart": current_autostart(discovered),
                         "price": discovered.manifest.price,
                         "min_rank": discovered.manifest.min_rank,
+                        "authority": discovered.manifest.authority,
                         "avg_ms": module_timings.get(name.as_str()).copied(),
                         "connected_at": null,
                         "shutdown_at": null,
@@ -2928,6 +2929,7 @@ fn current_autostart_reads_the_live_manifest_not_the_discovery_snapshot() {
             probe_response_secs: 0,
             price: 0,
             min_rank: 0,
+            authority: crate::module_manager::default_authority(),
         },
         directory: dir.clone(),
     };

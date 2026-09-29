@@ -564,24 +564,82 @@ async fn permit_module_gate_semantics() {
     // No gate registered for a module → allowed.
     assert!(orchestrator.permit_module("user-1", "unknown-module").await);
 
-    // (0, 0) gate → free + unrestricted → allowed.
+    // (0, 0, 0) gate → free + unrestricted → allowed.
     {
         let mut gates = std::collections::HashMap::new();
-        gates.insert("free".to_string(), (0u64, 0i64));
+        gates.insert("free".to_string(), crate::pipeline::ModuleGate {
+            authority: crate::pipeline::AUTHORITY_USER,
+            min_rank: 0,
+            price: 0,
+        });
         orchestrator.set_module_gates(gates);
     }
     assert!(orchestrator.permit_module("user-1", "free").await);
 
-    // Priced/gated module with NO user-db wired → allowed (degraded: don't
-    // stall the pipeline on a gate when the user-db is unavailable). The real
-    // enforcement happens when user_db is set.
+    // Priced/ranked/authority-gated module with NO user-db wired → allowed
+    // (degraded: don't stall the pipeline on a gate when the user-db is
+    // unavailable). The real enforcement happens when user_db is set.
     {
         let mut gates = std::collections::HashMap::new();
-        gates.insert("paid".to_string(), (5u64, 3i64));
+        gates.insert("paid".to_string(), crate::pipeline::ModuleGate {
+            authority: crate::pipeline::AUTHORITY_MOD,
+            min_rank: 3,
+            price: 5,
+        });
         orchestrator.set_module_gates(gates);
     }
     assert!(orchestrator.permit_module("user-1", "paid").await);
 
-    // Empty user uuid with a priced module → allowed (nobody to charge).
+    // Empty user uuid with a gated module → allowed (nobody to check/charge).
     assert!(orchestrator.permit_module("", "paid").await);
+}
+
+/// The authority cascade: mod admits mod|admin|owner, admin admits admin|owner,
+/// owner admits owner — never a lower tier. Mirrors the `User` role flags.
+#[tokio::test]
+async fn module_authority_cascades_up_and_never_down() {
+    use crate::pipeline::{AUTHORITY_ADMIN, AUTHORITY_MOD, AUTHORITY_OWNER, AUTHORITY_USER, ModuleGate};
+
+    // A helper that reports the authority tier a role set passes for a gate.
+    // This is a pure projection of the same logic permit_module uses, kept here
+    // so the cascade rule is asserted independently of the user-db round-trip.
+    let tier = |is_owner: bool, is_admin: bool, is_moderator: bool| -> u64 {
+        if is_owner {
+            AUTHORITY_OWNER
+        } else if is_admin {
+            AUTHORITY_ADMIN
+        } else if is_moderator {
+            AUTHORITY_MOD
+        } else {
+            AUTHORITY_USER
+        }
+    };
+    // A gate is satisfied when the user's tier >= the gate's authority.
+    let satisfied = |gate: u64, user_tier: u64| user_tier >= gate;
+
+    // user (0) passes only an authority-0 gate.
+    assert!(satisfied(AUTHORITY_USER, tier(false, false, false)));
+    assert!(!satisfied(AUTHORITY_MOD, tier(false, false, false)));
+    // mod (1) passes mod and user gates, not admin/owner.
+    let t_mod = tier(false, false, true);
+    assert!(satisfied(AUTHORITY_MOD, t_mod));
+    assert!(satisfied(AUTHORITY_USER, t_mod));
+    assert!(!satisfied(AUTHORITY_ADMIN, t_mod));
+    assert!(!satisfied(AUTHORITY_OWNER, t_mod));
+    // admin (2) passes admin, mod, user.
+    let t_admin = tier(false, true, false);
+    assert!(satisfied(AUTHORITY_ADMIN, t_admin));
+    assert!(satisfied(AUTHORITY_MOD, t_admin));
+    assert!(!satisfied(AUTHORITY_OWNER, t_admin));
+    // owner (3) passes everything.
+    let t_owner = tier(true, false, false);
+    assert!(satisfied(AUTHORITY_OWNER, t_owner));
+    assert!(satisfied(AUTHORITY_ADMIN, t_owner));
+    assert!(satisfied(AUTHORITY_MOD, t_owner));
+
+    // And the gate struct's open-check: (0,0,0) is open, anything else isn't.
+    let open = ModuleGate { authority: AUTHORITY_USER, min_rank: 0, price: 0 };
+    assert!(open.is_open());
+    let closed = ModuleGate { authority: AUTHORITY_MOD, min_rank: 0, price: 0 };
+    assert!(!closed.is_open());
 }

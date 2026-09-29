@@ -91,6 +91,22 @@ pub struct ModuleManifest {
     /// run on their message. 0 = no rank requirement.
     #[serde(default)]
     pub min_rank: i64,
+
+    /// The minimum authority (role) a user needs for the module to run on
+    /// their message. Cascades UP: 0=user (no gate), 1=mod (mod|admin|owner),
+    /// 2=admin (admin|owner), 3=owner. A missing field defaults to MOD — new
+    /// modules are mod-gated by default; existing modules opt down to `user`
+    /// (0) explicitly. This keeps the safe default (a random new module can't
+    /// run for every viewer) while letting an operator open a module up.
+    #[serde(default = "default_authority")]
+    pub authority: u64,
+}
+
+/// The default authority for a module with no explicit `authority` field: MOD
+/// (1). New modules are mod-gated by default; existing modules explicitly set
+/// `authority: 0` (user) to stay open.
+pub fn default_authority() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone)]
