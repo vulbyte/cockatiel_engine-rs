@@ -480,6 +480,19 @@ pub fn get_config(state: &Arc<Mutex<ConfigState>>) -> Config {
     state.config.clone()
 }
 
+/// Force `get_config` to re-read the file on its next call, bypassing the
+/// size gate.
+///
+/// The size gate exists so the message hot path never pays a file read when
+/// nothing changed — but a rewrite that happens to land on the SAME byte
+/// length is invisible to it. The config-poll task rewrites ordering lists at
+/// runtime (the TUI's Shift+up/down stage moves), and a same-size reorder must
+/// not be silently ignored, so the poll calls this before reading.
+pub fn refresh_config(state: &Arc<Mutex<ConfigState>>) {
+    let mut state = state.lock().unwrap();
+    state.last_size = u64::MAX;
+}
+
 pub async fn verify_config() -> Result<(String, PathBuf), Box<dyn std::error::Error>> {
     for path in ["../config.json"] {
         if let Ok(content) = get_file(path) {

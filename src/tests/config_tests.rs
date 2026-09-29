@@ -259,3 +259,47 @@ fn the_prediction_creator_role_defaults_to_mod_and_round_trips() {
         "the generated config.json must default the creator role to mod too"
     );
 }
+#[test]
+fn refresh_config_picks_up_a_same_size_rewrite_the_size_gate_would_miss() {
+    // The size gate skips a rewrite that lands on the SAME byte length — which
+    // is exactly what a TUI stage move can produce (swap two names of equal
+    // length). refresh_config must force the re-read regardless.
+    let dir = std::env::temp_dir().join(format!("cockatiel-refresh-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.json");
+    // "aaa" vs "bbb": both length-3, so swapping them keeps the file size.
+    // The two timeline fields are required (no serde default), so include them.
+    let original = r#"{"timeline_database_location":"./t.db","timeline_database_backup_location":"./t-backup.db","port":9734,"preprocessModules":[{"name":"aaa","priority":100}],"inprocessModules":[{"name":"bbb","priority":100}]}"#;
+    std::fs::write(&path, original).unwrap();
+    // Build the state by hand: `temp_state` also requires `port`; this manual
+    // construction only needs what get_config touches (the ordering lists).
+    let config: Config = serde_json::from_str(original).unwrap();
+    let state = Arc::new(Mutex::new(ConfigState {
+        path: path.clone(),
+        last_size: original.len() as u64,
+        config,
+        pin: 0,
+        jwt_secret: String::new(),
+    }));
+
+    use crate::config::get_config;
+    // First read caches size + content.
+    let c1 = get_config(&state);
+    assert_eq!(c1.preprocess_modules[0].name, "aaa");
+
+    // Rewrite the SAME SIZE file, swapping the two names.
+    let swapped = r#"{"timeline_database_location":"./t.db","timeline_database_backup_location":"./t-backup.db","port":9734,"preprocessModules":[{"name":"bbb","priority":100}],"inprocessModules":[{"name":"aaa","priority":100}]}"#;
+    assert_eq!(original.len(), swapped.len(), "the swap must not change file size");
+    std::fs::write(&path, swapped).unwrap();
+
+    // Without refresh, the size gate hides the change.
+    let c2 = get_config(&state);
+    assert_eq!(c2.preprocess_modules[0].name, "aaa", "the size gate must skip a same-size rewrite");
+
+    // With refresh, the new order is read.
+    crate::config::refresh_config(&state);
+    let c3 = get_config(&state);
+    assert_eq!(c3.preprocess_modules[0].name, "bbb", "refresh_config must force the re-read");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

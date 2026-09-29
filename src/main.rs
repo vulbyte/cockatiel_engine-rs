@@ -1432,6 +1432,11 @@ cockatiel
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
             loop {
                 interval.tick().await;
+                // Bypass the size gate: a TUI stage move can rewrite the
+                // ordering lists to the SAME byte length, and the gate would
+                // silently skip that. Force a re-read every poll so ordering
+                // changes apply live without a restart.
+                config::refresh_config(&config_state);
                 let config = get_config(&config_state);
                 let updated = PipelineConfig {
                     pre_process_modules: config.preprocess_modules.iter().map(|m| m.name.clone()).collect(),

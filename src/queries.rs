@@ -38,7 +38,7 @@ use crate::cockatiel_protobuf::{
     AuthVerify, ChatMessage, Command, Container, DatabaseQuery, DatabaseQueryResult, Log,
     MessageAck, MessagePreProcess, Prompt, Shutdown, container::Payload,
 };
-use crate::config::{ConfigState, get_config};
+use crate::config::{Config, ConfigState, get_config};
 use crate::credentials::{
     credential_values_map, is_config_complete, save_module_credentials, validate_credential_fields,
 };
@@ -515,6 +515,11 @@ async fn dispatch(
             QueryOutcome::success(status.to_string().into_bytes())
         }
         QueryRoute::ModuleList => {
+            // The config's ordering lists are the AUTHORITATIVE position — the
+            // TUI rewrites them at runtime (Shift+up/down stage moves), so a
+            // module's reported stage must follow config.json, not the stage it
+            // happened to connect on.
+            let config = get_config(config_state);
             let sessions = auth_store.values();
             // Modules with an unanswered prompt are waiting on
             // the operator (e.g. a setup/credential question) —
@@ -603,7 +608,7 @@ async fn dispatch(
                         "shutdown_at": null,
                     }));
                 entry["uuid7"] = serde_json::json!(s.instance_uuid7);
-                entry["position"] = serde_json::json!(s.position);
+                entry["position"] = serde_json::json!(module_position_from_config(&config, &s.module_name).unwrap_or_else(|| s.position.clone()));
                 entry["priority"] = serde_json::json!(s.priority);
                 entry["connected_at"] = serde_json::json!(s.connected_at);
                 entry["shutdown_at"] = serde_json::json!(s.shutdown_at);
@@ -1620,6 +1625,26 @@ fn parse_channel_ref(value: Option<&serde_json::Value>) -> Option<crate::user_db
         channel_id: value.get("channel_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         handle: value.get("handle").and_then(|v| v.as_str()).unwrap_or("").to_string(),
     })
+}
+
+/// The pipeline stage a module currently sits in, per the engine's `config.json`
+/// ordering lists — the AUTHORITATIVE position, because the TUI rewrites those
+/// lists at runtime to move modules between stages.
+///
+/// Returns `None` when the module is not in any ordering list (e.g. a remote or
+/// unregistered module); callers fall back to the module's connect-time stage.
+fn module_position_from_config(config: &Config, name: &str) -> Option<String> {
+    if config.preprocess_modules.iter().any(|m| m.name == name) {
+        Some("preprocess".to_string())
+    } else if config.inprocess_modules.iter().any(|m| m.name == name) {
+        Some("inprocess".to_string())
+    } else if config.postprocess_modules.iter().any(|m| m.name == name) {
+        Some("postprocess".to_string())
+    } else if config.inputs.iter().any(|m| m.name == name) {
+        Some("input".to_string())
+    } else {
+        None
+    }
 }
 
 /// Read-only SQL boundary for the `DatabaseQuery` fallback. Strips leading
@@ -2751,4 +2776,27 @@ mod tests {
         assert!(outcome.result_blob.is_empty());
         assert_eq!(outcome.error, "");
     }
+}
+
+#[test]
+fn module_position_from_config_uses_the_ordering_lists() {
+    // The engine config's ordering lists are the AUTHORITATIVE position — the
+    // TUI rewrites them at runtime, so a connected module's reported stage must
+    // follow config.json, not the stage it connected on. This is what stops the
+    // TUI's stage-move view from resetting on the next module_list poll.
+    let config: Config = serde_json::from_str(r#"{
+        "timeline_database_location": "./t.db",
+        "timeline_database_backup_location": "./b.db",
+        "port": 9734,
+        "inputs": [{"name":"twitch","priority":100}],
+        "preprocessModules": [{"name":"clip","priority":100}],
+        "inprocessModules": [{"name":"ban","priority":100}],
+        "postprocessModules": [{"name":"tts","priority":100}]
+    }"#).unwrap();
+
+    assert_eq!(module_position_from_config(&config, "twitch").as_deref(), Some("input"));
+    assert_eq!(module_position_from_config(&config, "clip").as_deref(), Some("preprocess"));
+    assert_eq!(module_position_from_config(&config, "ban").as_deref(), Some("inprocess"));
+    assert_eq!(module_position_from_config(&config, "tts").as_deref(), Some("postprocess"));
+    assert_eq!(module_position_from_config(&config, "not-listed"), None);
 }
