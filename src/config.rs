@@ -537,21 +537,43 @@ pub fn add_module_to_config(
     priority: i32,
 ) {
     update_config(config_state, |config| {
-        // A module lives in ONE stage. If its placement changed (e.g. an
-        // adapter re-registered into `inputs` per its manifest after a legacy
-        // `preprocess` registration), remove it from the OTHER stage lists so
-        // it doesn't stay in the pre/in/post fanout forever.
-        for (label, list) in [
-            ("input", &mut config.inputs),
-            ("preprocess", &mut config.preprocess_modules),
-            ("inprocess", &mut config.inprocess_modules),
-            ("postprocess", &mut config.postprocess_modules),
-        ] {
-            if label != position {
-                list.retain(|entry| entry.name != name);
+        // The operator's stage moves (the TUI's Shift+up/down) are the
+        // AUTHORITATIVE placement once a module is in config.json. This
+        // function runs on every module connect, and forcing a module back to
+        // the position it happened to CONNECT with would silently revert a move
+        // the operator just made (the classic "moves snap back" bug). So a
+        // module already sitting in SOME ordering list keeps its operator-set
+        // placement — only its priority is refreshed.
+        let already_placed = ["input", "preprocess", "inprocess", "postprocess"].iter().any(|label| {
+            let list = match *label {
+                "input" => &config.inputs,
+                "preprocess" => &config.preprocess_modules,
+                "inprocess" => &config.inprocess_modules,
+                "postprocess" => &config.postprocess_modules,
+                _ => unreachable!(),
+            };
+            list.iter().any(|entry| entry.name == name)
+        });
+
+        if already_placed {
+            // Refresh the entry's priority wherever the operator placed it; do
+            // not move it back to `position`.
+            for list in [
+                &mut config.inputs,
+                &mut config.preprocess_modules,
+                &mut config.inprocess_modules,
+                &mut config.postprocess_modules,
+            ] {
+                if let Some(existing) = list.iter_mut().find(|entry| entry.name == name) {
+                    existing.priority = priority;
+                    return;
+                }
             }
+            return;
         }
 
+        // Not placed yet (first registration): remove from the other stage
+        // lists defensively, then add to `position` exactly once.
         let list = match position {
             "input" => &mut config.inputs,
             "preprocess" => &mut config.preprocess_modules,

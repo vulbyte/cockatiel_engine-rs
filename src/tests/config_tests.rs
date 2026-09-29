@@ -3,7 +3,8 @@
 //! and the engine's boot pause state resolves the way the operator asked for.
 
 use crate::config::{
-    Config, ConfigState, backfill_config_defaults, resolve_start_paused, start_paused,
+    Config, ConfigState, add_module_to_config, backfill_config_defaults, get_config,
+    resolve_start_paused, start_paused,
 };
 use std::sync::{Arc, Mutex};
 
@@ -300,6 +301,58 @@ fn refresh_config_picks_up_a_same_size_rewrite_the_size_gate_would_miss() {
     crate::config::refresh_config(&state);
     let c3 = get_config(&state);
     assert_eq!(c3.preprocess_modules[0].name, "bbb", "refresh_config must force the re-read");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn add_module_to_config_does_not_revert_an_operator_stage_move() {
+    // A stage move (the TUI's Shift+up/down) puts a module in its NEW list.
+    // `add_module_to_config` runs on EVERY module connect, and it used to force
+    // the module back to the position it happened to CONNECT with — so a module
+    // that reconnected (blip, engine restart, TUI relaunch) silently reverted
+    // the operator's move. The operator's placement is authoritative: reconnecting
+    // must refresh priority only, never move the module back.
+    let dir = std::env::temp_dir().join(format!("cockatiel-move-{}", uuid::Uuid::new_v4()));
+    let original = r#"{
+        "timeline_database_location": "./test.db",
+        "timeline_database_backup_location": "./test-backup.db",
+        "port": 9734,
+        "preprocessModules": [{"name":"clip","priority":100}],
+        "inprocessModules": []
+    }"#;
+    let (state, _path) = temp_state(&dir, original);
+
+    // The operator moves `clip` pre -> in (Shift+down). The TUI's
+    // `move_module_by_direction` rewrites config.json, so the engine's next
+    // read sees clip in inprocessModules only. Simulate that rewrite here.
+    {
+        let mut state = state.lock().unwrap();
+        state.config.preprocess_modules.clear();
+        state.config.inprocess_modules.push(crate::ModuleEntry {
+            name: "clip".into(),
+            priority: 100,
+        });
+    }
+    assert_eq!(
+        get_config(&state).inprocess_modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+        vec!["clip"],
+        "move must put clip in in-process"
+    );
+
+    // The module now reconnects, announcing its manifest/connect position is
+    // pre-process. This must NOT move it back.
+    add_module_to_config(&state, "clip", "preprocess", 100);
+    assert_eq!(
+        get_config(&state).inprocess_modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+        vec!["clip"],
+        "a reconnect must not revert the operator's stage move"
+    );
+    assert_eq!(
+        get_config(&state).preprocess_modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+        Vec::<&str>::new(),
+        "a reconnect must not re-add the module to its connect-time stage"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
