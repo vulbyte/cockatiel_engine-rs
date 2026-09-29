@@ -453,6 +453,41 @@ pub(crate) async fn send_query_response(
     }
 }
 
+/// Order a `module_list` result for display.
+///
+/// Pre/post/input stages are UNORDERED sets, so their modules sort
+/// alphabetically (the deterministic order a set has). The in-process stage is
+/// an ORDERED CHAIN — its config.json order is what the engine steps through —
+/// so those modules sort by chain position, not by name. This is what makes the
+/// chain VISIBLE to the TUI: the UI renders `module_list` in response order, so
+/// the in-process group shows the real chain and Shift+up/down reorders land
+/// somewhere the operator can see.
+fn sort_module_list(config: &Config, list: &mut [serde_json::Value]) {
+    let chain_order: std::collections::HashMap<String, usize> = config
+        .inprocess_modules
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.name.clone(), i))
+        .collect();
+    list.sort_by(|a, b| {
+        let aname = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let bname = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let apos = a.get("position").and_then(|v| v.as_str()).unwrap_or("");
+        let bpos = b.get("position").and_then(|v| v.as_str()).unwrap_or("");
+        match (chain_order.get(aname), chain_order.get(bname)) {
+            (Some(i), Some(j)) => i.cmp(j),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => {
+                // ...everything else alphabetical. Position is a tiebreak so the
+                // pipeline groups stay grouped even though the TUI groups by
+                // position anyway.
+                apos.cmp(bpos).then_with(|| aname.cmp(bname))
+            }
+        }
+    });
+}
+
 /// Answer one `DatabaseQuery` and return the result triple. The single entry
 /// point the connection loop calls.
 pub(crate) async fn handle_query(
@@ -629,12 +664,7 @@ async fn dispatch(
             }
 
             let mut list: Vec<serde_json::Value> = entries.into_values().collect();
-            list.sort_by(|a, b| {
-                a.get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .cmp(b.get("name").and_then(|v| v.as_str()).unwrap_or(""))
-            });
+            sort_module_list(&config, &mut list);
             let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string());
             QueryOutcome::success(json.into_bytes())
         }
@@ -2809,4 +2839,39 @@ fn module_position_from_config_uses_the_ordering_lists() {
     assert_eq!(module_position_from_config(&config, "ban").as_deref(), Some("inprocess"));
     assert_eq!(module_position_from_config(&config, "tts").as_deref(), Some("postprocess"));
     assert_eq!(module_position_from_config(&config, "not-listed"), None);
+}
+
+#[test]
+fn sort_module_list_keeps_the_inprocess_chain_order_visible() {
+    // The in-process stage is an ordered chain; the TUI renders module_list in
+    // response order, so the chain position must be preserved there while the
+    // unordered stages stay alphabetical.
+    let config: Config = serde_json::from_str(r#"{
+        "timeline_database_location": "./t.db",
+        "timeline_database_backup_location": "./b.db",
+        "port": 9734,
+        "inprocessModules": [
+            {"name":"score-messages","priority":100},
+            {"name":"reprimand","priority":100},
+            {"name":"predictions","priority":100}
+        ],
+        "preprocessModules": [{"name":"banned-words","priority":100},{"name":"clip","priority":100}]
+    }"#).unwrap();
+
+    let mk = |name: &str, pos: &str| serde_json::json!({ "name": name, "position": pos });
+    let mut list = vec![
+        mk("reprimand", "inprocess"),
+        mk("clip", "preprocess"),
+        mk("predictions", "inprocess"),
+        mk("score-messages", "inprocess"),
+        mk("banned-words", "preprocess"),
+    ];
+    sort_module_list(&config, &mut list);
+
+    let names: Vec<&str> = list.iter().map(|e| e["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        vec!["score-messages", "reprimand", "predictions", "banned-words", "clip"],
+        "in-process modules must keep their chain order (config order), pre-process stays alphabetical"
+    );
 }
