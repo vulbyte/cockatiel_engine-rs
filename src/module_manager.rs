@@ -80,6 +80,17 @@ pub struct ModuleManifest {
     /// engine config default (15s).
     #[serde(default)]
     pub probe_response_secs: u64,
+
+    /// How much score a user must spend for the module to run on their
+    /// message. 0 = free. Deducted from the user's CURRENT score when the
+    /// module receives their message; the lifetime `total_score` is untouched.
+    #[serde(default)]
+    pub price: u64,
+
+    /// The minimum numeric rank a user needs (rank >= this) for the module to
+    /// run on their message. 0 = no rank requirement.
+    #[serde(default)]
+    pub min_rank: i64,
 }
 
 #[derive(Debug, Clone)]

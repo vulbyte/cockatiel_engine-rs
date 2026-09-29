@@ -458,6 +458,14 @@ pub struct PipelineOrchestrator {
     /// `module_list` (the TUI's 2s poll) to show each module's current average
     /// time and the per-stage sums.
     pub module_timings: Arc<Mutex<ModuleTimings>>,
+    /// Per-module cost gates: module name -> (price, min_rank). Populated from
+    /// the discovered module manifests. `price` is deducted from the user's
+    /// current score when the module receives their message; `min_rank` is the
+    /// user's numeric rank the module requires. (0, 0) = free + unrestricted.
+    pub module_gates: Arc<std::sync::Mutex<HashMap<String, (u64, i64)>>>,
+    /// The user database client, used by the price/rank gate to charge score
+    /// and check rank. `None` in unit tests that don't gate.
+    pub user_db: Option<crate::user_db_client::SharedUserDbClient>,
 }
 
 impl PipelineOrchestrator {
@@ -476,7 +484,65 @@ impl PipelineOrchestrator {
             command_registry,
             pause_state: Arc::new(Mutex::new(PauseState::default())),
             module_timings: Arc::new(Mutex::new(ModuleTimings::default())),
+            module_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            user_db: None,
         }
+    }
+
+    /// Set the per-module (price, min_rank) gates from the discovered manifests.
+    pub fn set_module_gates(&self, gates: HashMap<String, (u64, i64)>) {
+        *self.module_gates.lock().unwrap() = gates;
+    }
+
+    /// Whether `module_name` is permitted to receive a message for `user_uuid7`
+    /// (the user who sent it), given the module's cost gates.
+    ///
+    ///  - price == 0 AND min_rank == 0 → always allowed (no cost / no rank bar).
+    ///  - empty `user_uuid7` (a system/adapter-originated message, or one with
+    ///    no user identity) → allowed; there is nobody to charge or rank-check.
+    ///  - otherwise the user is fetched ONCE from the user database (score and
+    ///    rank arrive together — a single trip): the module price is deducted
+    ///    from the user's current score if they can afford it, and their rank
+    ///    must meet `min_rank`. A failure (insufficient score, or rank too low)
+    ///    returns `false` so the caller skips THIS module; the rest of the
+    ///    pipeline (and the message) is unaffected.
+    pub async fn permit_module(&self, user_uuid7: &str, module_name: &str) -> bool {
+        let Some(&(price, min_rank)) = self.module_gates.lock().unwrap().get(module_name) else {
+            return true;
+        };
+        if price == 0 && min_rank <= 0 {
+            return true;
+        }
+        if user_uuid7.trim().is_empty() {
+            return true;
+        }
+        let Some(user_db) = &self.user_db else {
+            // No user-db wired (unit test / degraded): don't block modules.
+            return true;
+        };
+        // Fetch the user once — score and rank travel on the same response.
+        let resp = match user_db.get_user(user_uuid7, "", "", "").await {
+            Ok(r) => r,
+            Err(_) => return true, // DB hiccup: don't stall the pipeline on a gate.
+        };
+        let Some(user) = resp.user else {
+            // Unknown user: treat as lacking funds/rank only if a cost exists.
+            return price == 0;
+        };
+
+        // Rank gate first (cheaper to reason about, no mutation).
+        if min_rank > 0 && user.rank < min_rank {
+            return false;
+        }
+
+        // Price gate: deduct from the current score, guarded by the user-db.
+        if price > 0 {
+            match user_db.deduct_score(user_uuid7, price as i64).await {
+                Ok(outcome) if outcome.applied => {}
+                _ => return false, // insufficient funds or user missing.
+            }
+        }
+        true
     }
 
     // ── The pause ──────────────────────────────────────────────────────
@@ -864,6 +930,16 @@ impl PipelineOrchestrator {
 
         let mut sent_any = false;
         for module_name in recipients {
+            // Cost gate: skip THIS module if the user can't afford its price or
+            // doesn't meet its min_rank. The rest of the fanout + message are
+            // unaffected (skip-that-module semantics).
+            if !self.permit_module(&state.user_uuid7, module_name).await {
+                eprintln!(
+                    "[engine] skipped '{}' (pre_process) — user lacks the score/rank the module requires",
+                    module_name
+                );
+                continue;
+            }
             match send_to_module(&self.module_senders, module_name, container.clone(), "pre_process").await {
                 SendOutcome::Sent => {
                     sent_any = true;
@@ -955,7 +1031,18 @@ impl PipelineOrchestrator {
             )),
         };
 
-        let sent = send_to_module(&self.module_senders, module_name, container, "in_process").await;
+        // Cost gate: a user who can't afford the module's price / meet its min_rank
+        // skips to the NEXT in-process module (same as an unconnected module),
+        // so the message continues through the chain.
+        let sent = if self.permit_module(&state.user_uuid7, module_name).await {
+            send_to_module(&self.module_senders, module_name, container, "in_process").await
+        } else {
+            eprintln!(
+                "[engine] skipped '{}' (in_process) — user lacks the score/rank the module requires",
+                module_name
+            );
+            SendOutcome::NotConnected
+        };
         match sent {
             SendOutcome::Sent => {
                 self.ack_tracker.lock().await.track(
@@ -1059,6 +1146,15 @@ impl PipelineOrchestrator {
 
         let mut sent_any = false;
         for module_name in &cfg.post_process_modules {
+            // Cost gate: skip THIS post-process module if the user can't afford
+            // its price / meet its min_rank (skip-that-module semantics).
+            if !self.permit_module(&state.user_uuid7, module_name).await {
+                eprintln!(
+                    "[engine] skipped '{}' (post_process) — user lacks the score/rank the module requires",
+                    module_name
+                );
+                continue;
+            }
             match send_to_module(&self.module_senders, module_name, container.clone(), "post_process").await {
                 SendOutcome::Sent => {
                     self.ack_tracker.lock().await.track(

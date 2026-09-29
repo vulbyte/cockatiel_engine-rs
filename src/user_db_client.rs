@@ -17,6 +17,14 @@ use proto::{
     UserValueListRequest, UserValueRequest,
 };
 
+/// Convenience result for a module-price deduction: the user's updated record,
+/// or an "insufficient funds / user missing" marker.
+#[derive(Debug, Clone)]
+pub struct DeductOutcome {
+    pub applied: bool,
+    pub user: Option<crate::user_db_client::proto::User>,
+}
+
 pub struct UserDbClient {
     pub url: String,
     pub token: String,
@@ -131,6 +139,55 @@ impl UserDbClient {
             delta,
             reason: reason.to_string(),
         })).await
+    }
+
+    /// Deduct a module price from the user's CURRENT score (guarded: refused
+    /// when the user lacks the funds). The lifetime `total_score` is untouched.
+    pub async fn deduct_score(&self, uuid7: &str, amount: i64) -> Result<DeductOutcome, String> {
+        let resp = self
+            .request(user_db_request::Op::DeductScore(crate::user_db_client::proto::DeductScoreRequest {
+                uuid7: uuid7.to_string(),
+                amount,
+                reason: String::new(),
+            }))
+            .await?;
+        Ok(DeductOutcome {
+            applied: resp.success,
+            user: resp.user,
+        })
+    }
+
+    /// Increment a user's `messages_sent` counter (the engine calls this on
+    /// every chat message it ingests for that user).
+    pub async fn increment_messages_sent(&self, uuid7: &str) -> Result<UserDbResponse, String> {
+        self.request(user_db_request::Op::IncrementMessagesSent(
+            crate::user_db_client::proto::IncrementMessagesRequest {
+                uuid7: uuid7.to_string(),
+            },
+        ))
+        .await
+    }
+
+    /// A user's rating history (commendations + reprimands with giver, date and
+    /// reason). Returns everything on record.
+    pub async fn get_rating_history(
+        &self,
+        uuid7: &str,
+        kind: &str,
+        limit: i32,
+        offset: i32,
+    ) -> Result<Vec<crate::user_db_client::proto::RatingHistoryEntry>, String> {
+        let resp = self
+            .request(user_db_request::Op::GetRatingHistory(
+                crate::user_db_client::proto::GetRatingHistoryRequest {
+                    uuid7: uuid7.to_string(),
+                    kind: kind.to_string(),
+                    limit,
+                    offset,
+                },
+            ))
+            .await?;
+        Ok(resp.rating_history)
     }
 
     /// Commend or reprimand a user (chat-command ratings). The user-db
@@ -268,6 +325,9 @@ pub fn userdb_response_to_json(resp: &UserDbResponse) -> String {
             "flags": u.flags,
             "created_at": u.created_at,
             "updated_at": u.updated_at,
+            "total_score": u.total_score,
+            "messages_sent": u.messages_sent,
+            "rank": u.rank,
         })
     });
     serde_json::json!({
@@ -295,6 +355,9 @@ pub fn userdb_response_to_json(resp: &UserDbResponse) -> String {
                 "flags": u.flags,
                 "created_at": u.created_at,
                 "updated_at": u.updated_at,
+                "total_score": u.total_score,
+                "messages_sent": u.messages_sent,
+                "rank": u.rank,
             })
         }).collect::<Vec<_>>(),
         "message": resp.message,
@@ -305,6 +368,15 @@ pub fn userdb_response_to_json(resp: &UserDbResponse) -> String {
         "values": resp.values.iter().map(|v| serde_json::json!({
             "key": v.key,
             "value": v.value,
+        })).collect::<Vec<_>>(),
+        "rating_history": resp.rating_history.iter().map(|e| serde_json::json!({
+            "uuid7": e.uuid7,
+            "giver_uuid7": e.giver_uuid7,
+            "kind": e.kind,
+            "platform": e.platform,
+            "handle": e.handle,
+            "reason": e.reason,
+            "created_at": e.created_at,
         })).collect::<Vec<_>>(),
     }).to_string()
 }

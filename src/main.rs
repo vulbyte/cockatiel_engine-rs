@@ -1272,12 +1272,27 @@ cockatiel
         critical_modules: Vec::new(),
     };
 
-    let orchestrator = PipelineOrchestrator::new(
+    let mut orchestrator = PipelineOrchestrator::new(
         db.clone(),
         pipeline_config,
         module_senders.clone(),
         cmd_registry.clone(),
     );
+
+    // Wire the module cost gates (price / min_rank from the discovered
+    // manifests) and the user database into the orchestrator, so a user must
+    // pay a priced module's cost and meet its rank requirement for the module
+    // to run on their message.
+    {
+        let gates: std::collections::HashMap<String, (u64, i64)> = {
+            let reg = discovered_registry.lock().unwrap();
+            reg.iter()
+                .map(|(name, m)| (name.clone(), (m.manifest.price, m.manifest.min_rank)))
+                .collect()
+        };
+        orchestrator.set_module_gates(gates);
+        orchestrator.user_db = Some(user_db_client.clone());
+    }
 
     // Boot PAUSED. The engine accepts module connections, ingests messages,
     // parses commands and writes the timeline exactly as it normally would, but
@@ -2262,6 +2277,12 @@ let mut bytes = Vec::new();
                             };
                             if fetch {
                                 enrich_chat_user(&user_db_client, chat).await;
+                            }
+                            // A real user message from an adapter: count it toward
+                            // the user's `messages_sent` (a rank factor). Best-effort
+                            // and non-blocking — a failed count never stalls ingest.
+                            if !chat.user_uuid7.is_empty() {
+                                let _ = user_db_client.increment_messages_sent(&chat.user_uuid7).await;
                             }
                         }
                         let enriched_container = Container {

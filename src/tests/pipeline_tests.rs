@@ -552,3 +552,36 @@ fn the_orchestrator_writes_nothing_per_stage() {
         "every terminal path must route through the single consolidated write"
     );
 }
+
+#[tokio::test]
+async fn permit_module_gate_semantics() {
+    // Build a bare orchestrator (no user-db wired). This exercises the gate's
+    // fast paths and the degraded-mode behavior; the actual deduction + rank
+    // check live in the user-db and are covered by its own tests.
+    let db = test_db().await;
+    let (orchestrator, _rx) = wired_orchestrator(db, &[], &[], &[]);
+
+    // No gate registered for a module → allowed.
+    assert!(orchestrator.permit_module("user-1", "unknown-module").await);
+
+    // (0, 0) gate → free + unrestricted → allowed.
+    {
+        let mut gates = std::collections::HashMap::new();
+        gates.insert("free".to_string(), (0u64, 0i64));
+        orchestrator.set_module_gates(gates);
+    }
+    assert!(orchestrator.permit_module("user-1", "free").await);
+
+    // Priced/gated module with NO user-db wired → allowed (degraded: don't
+    // stall the pipeline on a gate when the user-db is unavailable). The real
+    // enforcement happens when user_db is set.
+    {
+        let mut gates = std::collections::HashMap::new();
+        gates.insert("paid".to_string(), (5u64, 3i64));
+        orchestrator.set_module_gates(gates);
+    }
+    assert!(orchestrator.permit_module("user-1", "paid").await);
+
+    // Empty user uuid with a priced module → allowed (nobody to charge).
+    assert!(orchestrator.permit_module("", "paid").await);
+}
