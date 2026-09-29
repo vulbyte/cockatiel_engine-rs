@@ -518,7 +518,10 @@ async fn dispatch(
             // The config's ordering lists are the AUTHORITATIVE position — the
             // TUI rewrites them at runtime (Shift+up/down stage moves), so a
             // module's reported stage must follow config.json, not the stage it
-            // happened to connect on.
+            // happened to connect on. Force a fresh read so a same-byte-length
+            // rewrite (which the size gate would otherwise skip) is still seen;
+            // this is a low-frequency control query, not the message hot path.
+            crate::config::refresh_config(config_state);
             let config = get_config(config_state);
             let sessions = auth_store.values();
             // Modules with an unanswered prompt are waiting on
@@ -586,7 +589,14 @@ async fn dispatch(
                         "shutdown_at": null,
                     }));
                 entry["uuid7"] = serde_json::json!(m.instance_uuid7);
-                entry["position"] = serde_json::json!(m.position);
+                // Position comes from the CONFIG ordering lists, not the
+                // connect-time registration in modules.json — an operator stage
+                // move rewrites config.json and must be what a UI reports, even
+                // for a module that is not currently connected. Only fall back
+                // to the recorded position if the module is not in any list.
+                entry["position"] = serde_json::json!(
+                    module_position_from_config(&config, &m.name).unwrap_or_else(|| m.position.clone())
+                );
                 entry["priority"] = serde_json::json!(m.priority);
             }
 

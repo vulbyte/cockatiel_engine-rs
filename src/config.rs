@@ -519,6 +519,20 @@ where
 {
     let mut state = state.lock().unwrap();
 
+    // Re-read the file fresh BEFORE applying the update. The operator's TUI
+    // rewrites config.json at runtime (Shift+up/down stage moves), and the
+    // engine's in-memory copy can be stale until the next config-poll re-reads
+    // it. Applying an update to a stale snapshot and writing it back would wipe
+    // those external changes — the classic "moved a module and it snapped back"
+    // bug. Reading the current on-disk state and updating on top of it keeps
+    // every external write intact.
+    if let Some(config) = fs::read_to_string(&state.path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<Config>(&content).ok())
+    {
+        state.config = config;
+    }
+
     update(&mut state.config);
 
     if let Ok(serialized) = serde_json::to_string_pretty(&state.config) {

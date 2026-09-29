@@ -4,7 +4,7 @@
 
 use crate::config::{
     Config, ConfigState, add_module_to_config, backfill_config_defaults, get_config,
-    resolve_start_paused, start_paused,
+    resolve_start_paused, start_paused, update_config,
 };
 use std::sync::{Arc, Mutex};
 
@@ -321,19 +321,22 @@ fn add_module_to_config_does_not_revert_an_operator_stage_move() {
         "preprocessModules": [{"name":"clip","priority":100}],
         "inprocessModules": []
     }"#;
-    let (state, _path) = temp_state(&dir, original);
+    let (state, path) = temp_state(&dir, original);
 
     // The operator moves `clip` pre -> in (Shift+down). The TUI's
-    // `move_module_by_direction` rewrites config.json, so the engine's next
-    // read sees clip in inprocessModules only. Simulate that rewrite here.
-    {
-        let mut state = state.lock().unwrap();
-        state.config.preprocess_modules.clear();
-        state.config.inprocess_modules.push(crate::ModuleEntry {
-            name: "clip".into(),
-            priority: 100,
-        });
-    }
+    // `move_module_by_direction` rewrites config.json on disk, so the engine's
+    // next read sees clip in inprocessModules only. Write the moved config to
+    // the file exactly as the TUI would.
+    let moved = r#"{
+        "timeline_database_location": "./test.db",
+        "timeline_database_backup_location": "./test-backup.db",
+        "port": 9734,
+        "preprocessModules": [],
+        "inprocessModules": [{"name":"clip","priority":100}],
+        "module_probe_interval_secs": 30
+    }"#;
+    std::fs::write(&path, moved).unwrap();
+    // Size changed, so the size gate re-reads it.
     assert_eq!(
         get_config(&state).inprocess_modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
         vec!["clip"],
@@ -341,7 +344,9 @@ fn add_module_to_config_does_not_revert_an_operator_stage_move() {
     );
 
     // The module now reconnects, announcing its manifest/connect position is
-    // pre-process. This must NOT move it back.
+    // pre-process. This must NOT move it back — and the engine's own config
+    // write (via add_module_to_config -> update_config) must not clobber the
+    // on-disk move with a stale in-memory snapshot either.
     add_module_to_config(&state, "clip", "preprocess", 100);
     assert_eq!(
         get_config(&state).inprocess_modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
@@ -352,6 +357,71 @@ fn add_module_to_config_does_not_revert_an_operator_stage_move() {
         get_config(&state).preprocess_modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
         Vec::<&str>::new(),
         "a reconnect must not re-add the module to its connect-time stage"
+    );
+    // And the file on disk must still hold the move after the engine's write.
+    let on_disk: Config =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        on_disk.inprocess_modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+        vec!["clip"],
+        "the engine's config write must preserve the on-disk move"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn update_config_re_reads_disk_so_it_never_clobbers_an_external_move() {
+    // The engine's in-memory ConfigState snapshot goes stale until the next
+    // config-poll re-reads it. `update_config` (used by add_module_to_config on
+    // every module connect) used to write that stale snapshot back to disk,
+    // wiping an operator stage move the TUI had just written to config.json —
+    // the "moved a module and it snapped back within seconds" bug. It must
+    // re-read the on-disk state before applying its own change.
+    let dir = std::env::temp_dir().join(format!("cockatiel-upd-{}", uuid::Uuid::new_v4()));
+    let original = r#"{
+        "timeline_database_location": "./test.db",
+        "timeline_database_backup_location": "./test-backup.db",
+        "port": 9734,
+        "preprocessModules": [{"name":"clip","priority":100}],
+        "inprocessModules": []
+    }"#;
+    let (state, path) = temp_state(&dir, original);
+
+    // The operator moves clip pre -> in on disk (the TUI writes config.json).
+    let moved = r#"{
+        "timeline_database_location": "./test.db",
+        "timeline_database_backup_location": "./test-backup.db",
+        "port": 9734,
+        "preprocessModules": [],
+        "inprocessModules": [{"name":"clip","priority":100}],
+        "module_probe_interval_secs": 30
+    }"#;
+    std::fs::write(&path, moved).unwrap();
+
+    // The engine's in-memory snapshot is STILL the original (size-gate). A
+    // module connects now; update_config must read the on-disk moved config,
+    // apply its change on top, and write it back WITHOUT reverting the move.
+    update_config(&state, |config| {
+        if let Some(m) = config.inprocess_modules.iter_mut().find(|m| m.name == "clip") {
+            m.priority = 50;
+        }
+    });
+
+    let on_disk: Config = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        on_disk.inprocess_modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+        vec!["clip"],
+        "update_config must preserve the operator's move on disk"
+    );
+    assert_eq!(
+        on_disk.preprocess_modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+        Vec::<&str>::new(),
+        "update_config must not resurrect clip in pre-process"
+    );
+    assert_eq!(
+        on_disk.inprocess_modules[0].priority, 50,
+        "update_config's own change must still apply on top of the move"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
