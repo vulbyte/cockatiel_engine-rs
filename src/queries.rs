@@ -488,6 +488,23 @@ fn sort_module_list(config: &Config, list: &mut [serde_json::Value]) {
     });
 }
 
+/// The module's CURRENT autostart flag.
+///
+/// The engine caches manifests at discovery, but the TUI can toggle a module's
+/// autostart in its manifest file at runtime (`a` in the modules window). If we
+/// kept reporting the cached value, the TUI's `A` marker would flip back on the
+/// next poll. Re-read the manifest's `autostart` fresh per query — this is a
+/// low-frequency control query, so the file read is negligible — falling back
+/// to the discovery-time value when the file can't be read.
+fn current_autostart(discovered: &crate::module_manager::DiscoveredModule) -> bool {
+    let path = discovered.directory.join("cockatiel_module_info.json");
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .and_then(|m| m.get("autostart").and_then(|v| v.as_bool()))
+        .unwrap_or(discovered.manifest.autostart)
+}
+
 /// Answer one `DatabaseQuery` and return the result triple. The single entry
 /// point the connection loop calls.
 pub(crate) async fn handle_query(
@@ -602,7 +619,7 @@ async fn dispatch(
                         "uuid7": null,
                         "position": "unknown",
                         "priority": null,
-                        "autostart": discovered.manifest.autostart,
+                        "autostart": current_autostart(discovered),
                         "avg_ms": module_timings.get(name.as_str()).copied(),
                         "connected_at": null,
                         "shutdown_at": null,
@@ -2882,4 +2899,45 @@ fn sort_module_list_keeps_the_inprocess_chain_order_visible() {
         vec!["score-messages", "reprimand", "predictions", "banned-words", "clip"],
         "in-process modules must keep their chain order (config order), pre-process stays alphabetical"
     );
+}
+
+#[test]
+fn current_autostart_reads_the_live_manifest_not_the_discovery_snapshot() {
+    // The TUI toggles autostart by rewriting the module's manifest file at
+    // runtime. `current_autostart` must reflect that write (the cached discovery
+    // value would otherwise report the OLD state and the TUI's A marker would
+    // flip back on the next poll).
+    let dir = std::env::temp_dir().join(format!("cockatiel-autostart-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("cockatiel_module_info.json"), r#"{"name":"m","autostart":false}"#).unwrap();
+    let discovered = crate::module_manager::DiscoveredModule {
+        manifest: crate::module_manager::ModuleManifest {
+            name: "m".into(),
+            description: String::new(),
+            version: String::new(),
+            capabilities: "postprocess".into(),
+            root_file: String::new(),
+            launch_command: String::new(),
+            command_flags: vec![],
+            autostart: false,
+            terminal: false,
+            credentials: vec![],
+            unresponsive_timeout_secs: 0,
+            probe_response_secs: 0,
+        },
+        directory: dir.clone(),
+    };
+    // Discovery snapshot says false; the file says false -> false.
+    assert!(!current_autostart(&discovered));
+
+    // Toggle the file (what the TUI's `a` press does); the helper now reports
+    // true even though the discovery snapshot is still false.
+    std::fs::write(dir.join("cockatiel_module_info.json"), r#"{"name":"m","autostart":true}"#).unwrap();
+    assert!(current_autostart(&discovered), "must read the live manifest, not the snapshot");
+
+    // A missing/unreadable file falls back to the snapshot value.
+    std::fs::remove_file(dir.join("cockatiel_module_info.json")).unwrap();
+    assert!(!current_autostart(&discovered), "fallback to the discovery value");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
