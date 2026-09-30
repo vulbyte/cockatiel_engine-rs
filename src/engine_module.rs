@@ -116,6 +116,9 @@ mod tests {
         // Predictions. The brain's read surface: a user's current score
         // before a bet is placed. Opens the 70s decade.
         (70, "QUERY_OP_PREDICTION_GET_SCORE", Some("prediction_get_score")),
+        // Channel stats. Adapters push viewer/member counts; any module reads
+        // them on demand. Sits beside prediction_get_score at 71.
+        (71, "QUERY_OP_CHANNEL_VIEWERS", Some("channel_viewers")),
     ];
 
     /// Every family of operation the dispatcher handles has a variant.
@@ -173,6 +176,8 @@ mod tests {
             "USERDB_ADJUST_SCORE",
             // predictions
             "PREDICTION_GET_SCORE",
+            // channel stats
+            "CHANNEL_VIEWERS",
             // read-only SQL escape hatch
             "SELECT_SQL",
         ] {
@@ -294,16 +299,23 @@ mod tests {
         );
         assert_eq!(QueryOp::EngineShutdown as i32, 60);
         // The predictions read surface opens the 70s decade, so 70 is claimed
-        // too — the lifecycle family still has 61-69 and 71-89 to grow into.
+        // too — the lifecycle family still has 61-69 and 72-89 to grow into.
         assert_eq!(
             QueryOp::try_from(70).expect("valid tag"),
             QueryOp::PredictionGetScore
         );
         assert_eq!(QueryOp::PredictionGetScore as i32, 70);
-        for tag in (60..90).filter(|t| *t != 60 && *t != 70) {
+        // The channel viewer-count read sits beside it at 71 — public stream
+        // data, open to every module.
+        assert_eq!(
+            QueryOp::try_from(71).expect("valid tag"),
+            QueryOp::ChannelViewers
+        );
+        assert_eq!(QueryOp::ChannelViewers as i32, 71);
+        for tag in (60..90).filter(|t| *t != 60 && *t != 70 && *t != 71) {
             assert!(
                 QueryOp::try_from(tag).is_err(),
-                "tag {} is claimed — 61-69 + 71-89 is the room this family grows into",
+                "tag {} is claimed — 61-69 + 72-89 is the room this family grows into",
                 tag
             );
         }

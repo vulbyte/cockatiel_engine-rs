@@ -49,8 +49,8 @@ use crate::module_registry::ModuleRegistryPersistence;
 use crate::pipeline::{PipelineOrchestrator, SendOutcome};
 use crate::user_db_client::{SharedUserDbClient, userdb_response_to_json};
 use crate::{
-    EngineState, PromptSink, SharedPromptRoutes, is_control_surface, is_test_runner, log_event,
-    log_event_broadcast, may_read_other_credentials, userdb_actor_perm,
+    EngineState, PromptSink, SharedChannelStats, SharedPromptRoutes, is_control_surface,
+    is_test_runner, log_event, log_event_broadcast, may_read_other_credentials, userdb_actor_perm,
 };
 
 /// The result of answering one query: the triple the dispatcher has always
@@ -191,6 +191,8 @@ pub(crate) struct QueryContext<'a> {
     pub discovered_registry: &'a Arc<Mutex<ModuleRegistry>>,
     /// Where a prompt is waiting to be answered, for `module_list`.
     pub prompt_routes: &'a SharedPromptRoutes,
+    /// Per-channel viewer/member counts, for `channel_viewers`.
+    pub channel_stats: &'a SharedChannelStats,
     /// The calling module — this is what every gate keys off.
     pub module_name: &'a str,
     /// The calling module's instance uuid, echoed on the response.
@@ -237,6 +239,9 @@ pub(crate) enum QueryRoute {
     UserdbAdjustScore,
     /// Read a user's current score. Predictions module + control surface only.
     PredictionGetScore,
+    /// Read the engine's in-memory per-channel viewer/member counts. Open to
+    /// every authenticated module — the data is public stream information.
+    ChannelViewers,
     /// Any `userdb_`-prefixed query_id, after the exact `userdb_adjust_score`
     /// match above has had its chance.
     UserdbFamily,
@@ -275,6 +280,7 @@ impl QueryRoute {
             QueryRoute::ChatVerifyIdentity => QueryOp::ChatVerifyIdentity,
             QueryRoute::UserdbAdjustScore => QueryOp::UserdbAdjustScore,
             QueryRoute::PredictionGetScore => QueryOp::PredictionGetScore,
+            QueryRoute::ChannelViewers => QueryOp::ChannelViewers,
             QueryRoute::UserdbFamily => QueryOp::Unspecified,
             QueryRoute::SetCredentials => QueryOp::SetCredentials,
             QueryRoute::AudioForMessage => QueryOp::AudioForMessage,
@@ -325,6 +331,7 @@ pub(crate) fn classify_query(query_id: &str) -> QueryRoute {
         "userdb_adjust_score" => QueryRoute::UserdbAdjustScore,
         _ if query_id.starts_with("userdb_") => QueryRoute::UserdbFamily,
         "prediction_get_score" => QueryRoute::PredictionGetScore,
+        "channel_viewers" => QueryRoute::ChannelViewers,
         "set_credentials" => QueryRoute::SetCredentials,
         "audio_for_message" => QueryRoute::AudioForMessage,
         "test_archive" => QueryRoute::TestArchive,
@@ -397,6 +404,7 @@ pub(crate) fn caller_gate(route: QueryRoute, caller: &str) -> Option<&'static st
         | QueryRoute::ChatReprimand
         | QueryRoute::ChatVerifyIdentity
         | QueryRoute::AudioForMessage
+        | QueryRoute::ChannelViewers
         | QueryRoute::ReadOnlySql => None,
     }
 }
@@ -833,6 +841,12 @@ async fn dispatch(
             // places a bet. uuid-only: the brain passes the actor's
             // `chat.user_uuid7` directly — no platform+handle resolution.
             prediction_get_score_virtual_query(user_db_client, sql).await.into()
+        }
+        QueryRoute::ChannelViewers => {
+            // Read the engine's in-memory per-channel viewer/member counts.
+            // Public stream data, so no caller gate — any authenticated module
+            // may read it on demand.
+            channel_viewers_virtual_query(ctx.channel_stats, sql).into()
         }
         QueryRoute::UserdbFamily => {
             // User database is engine-internal — only the TUI
@@ -1348,6 +1362,46 @@ async fn prediction_get_score_virtual_query(
     };
 
     let json = serde_json::json!({ "uuid7": user.uuid7, "score": user.score }).to_string();
+    (true, json.into_bytes(), String::new())
+}
+
+/// Read the engine's in-memory per-channel viewer/member counts, as pushed by
+/// the platform adapters. Returns a JSON object of every known
+/// platform+channel with its current `viewers`, `is_live`, `title` and
+/// `updated_at`. Open to every authenticated module — the data is public
+/// stream information. The optional `sql` body may filter with
+/// `{"platform": "twitch"}`.
+fn channel_viewers_virtual_query(
+    channel_stats: &SharedChannelStats,
+    sql: &str,
+) -> (bool, Vec<u8>, String) {
+    let filter: Option<String> = match serde_json::from_str::<serde_json::Value>(sql) {
+        Ok(v) => v
+            .get("platform")
+            .and_then(|p| p.as_str())
+            .map(|p| p.to_string()),
+        Err(_) => None,
+    };
+
+    let entries: Vec<serde_json::Value> = {
+        let stats = channel_stats.lock().unwrap();
+        stats
+            .values()
+            .filter(|e| filter.as_deref().is_none_or(|p| e.platform == p))
+            .map(|e| {
+                serde_json::json!({
+                    "platform": e.platform,
+                    "channel": e.channel,
+                    "viewers": e.viewers,
+                    "is_live": e.is_live,
+                    "title": e.title,
+                    "updated_at": e.updated_at,
+                })
+            })
+            .collect()
+    };
+
+    let json = serde_json::json!({ "channels": entries }).to_string();
     (true, json.into_bytes(), String::new())
 }
 
@@ -2131,6 +2185,14 @@ mod tests {
             // original never granted.
             ("audio_for_message", NORMAL, true),
             ("audio_for_message", TUI, true),
+            // ── channel_viewers: public stream data — open to every
+            // authenticated module, including a brand-new one.
+            ("channel_viewers", NORMAL, true),
+            ("channel_viewers", TERM_CHAT, true),
+            ("channel_viewers", SCORE_MESSAGES, true),
+            ("channel_viewers", TEST_RUNNER, true),
+            ("channel_viewers", TUI, true),
+            ("channel_viewers", "", true),
             // ── Gated in the handler, not here: the dispatcher admits these and
             // the helper refuses. Asserted so the two layers stay distinct.
             ("mod_commend", NORMAL, true),
@@ -2946,4 +3008,68 @@ fn current_autostart_reads_the_live_manifest_not_the_discovery_snapshot() {
     assert!(!current_autostart(&discovered), "fallback to the discovery value");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn channel_viewers_returns_stored_counts_and_honours_filter() {
+    let stats: SharedChannelStats = Arc::new(Mutex::new(HashMap::new()));
+    {
+        let mut map = stats.lock().unwrap();
+        map.insert(
+            "twitch:vulbyte".to_string(),
+            crate::ChannelStatsEntry {
+                platform: "twitch".to_string(),
+                channel: "vulbyte".to_string(),
+                viewers: 1234,
+                is_live: true,
+                title: "hello stream".to_string(),
+                updated_at: 1_700_000_000_000,
+            },
+        );
+        map.insert(
+            "kick:someone".to_string(),
+            crate::ChannelStatsEntry {
+                platform: "kick".to_string(),
+                channel: "someone".to_string(),
+                viewers: 56,
+                is_live: true,
+                title: String::new(),
+                updated_at: 1_700_000_000_001,
+            },
+        );
+        map.insert(
+            "discord:111222".to_string(),
+            crate::ChannelStatsEntry {
+                platform: "discord".to_string(),
+                channel: "111222".to_string(),
+                viewers: 900,
+                is_live: false,
+                title: String::new(),
+                updated_at: 1_700_000_000_002,
+            },
+        );
+    }
+
+    // No filter: every channel comes back.
+    let (ok, body, err) = channel_viewers_virtual_query(&stats, "{}");
+    assert!(ok, "expected success, got {err}");
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let channels = json["channels"].as_array().unwrap();
+    assert_eq!(channels.len(), 3);
+
+    // Platform filter: only twitch.
+    let (ok, body, _) = channel_viewers_virtual_query(&stats, r#"{"platform":"twitch"}"#);
+    assert!(ok);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let channels = json["channels"].as_array().unwrap();
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0]["channel"], "vulbyte");
+    assert_eq!(channels[0]["viewers"], 1234);
+    assert_eq!(channels[0]["is_live"], true);
+
+    // A malformed body is treated as "no filter" (never an error).
+    let (ok, body, _) = channel_viewers_virtual_query(&stats, "not-json");
+    assert!(ok);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["channels"].as_array().unwrap().len(), 3);
 }

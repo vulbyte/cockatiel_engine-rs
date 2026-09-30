@@ -153,6 +153,11 @@ enum QueryOp {
   // below 60 moves, so no value already on the wire changes.
   QUERY_OP_PREDICTION_GET_SCORE = 70;
 
+  // Read the engine's in-memory per-channel viewer/member counts, as pushed
+  // by the platform adapters. Open to every authenticated module — public
+  // stream data.
+  QUERY_OP_CHANNEL_VIEWERS = 71;
+
   // ── Read-only SQL escape hatch ──
   // The engine's final fallback for any query that is not one of the
   // named operations above. Hard read-only boundary: only

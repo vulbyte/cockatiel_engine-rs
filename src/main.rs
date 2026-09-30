@@ -75,6 +75,28 @@ pub(crate) enum PromptSink {
 
 pub(crate) type SharedPromptRoutes = Arc<Mutex<HashMap<String, PromptSink>>>;
 
+/// One channel's latest viewer/member stats, as reported by its adapter.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ChannelStatsEntry {
+    pub platform: String,
+    pub channel: String,
+    pub viewers: i64,
+    pub is_live: bool,
+    pub title: String,
+    pub updated_at: i64,
+}
+
+/// The engine's in-memory store of per-channel viewer/member counts. Adapters
+/// push their latest `ChannelStats` on each poll; other modules read them on
+/// demand via the `channel_viewers` virtual query.
+pub(crate) type SharedChannelStats = Arc<Mutex<HashMap<String, ChannelStatsEntry>>>;
+
+/// The platform adapters allowed to publish channel stats. A random module
+/// spoofing viewer counts would poison every consumer, so the relay gate keys
+/// off these names.
+pub(crate) const CHANNEL_STATS_ADAPTERS: [&str; 4] =
+    ["twitch-adapter", "kick-adapter", "youtube-adapter", "discord-adapter"];
+
 /// The outcome of asking the user via a broadcast prompt.
 enum PromptOutcome {
     /// A UI answered y/n.
@@ -1506,6 +1528,10 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
 
     let prompt_routes: SharedPromptRoutes = Arc::new(Mutex::new(HashMap::new()));
 
+    // Per-channel viewer/member counts, fed by the platform adapters and read
+    // by other modules via the `channel_viewers` virtual query.
+    let channel_stats: SharedChannelStats = Arc::new(Mutex::new(HashMap::new()));
+
     // Control-surface shutdown signal. Parked at Idle until an accepted
     // `engine_shutdown` request moves it to Requested; the accept loop below
     // watches for that and, once the answer has reached the TUI's socket
@@ -1585,6 +1611,7 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
         let discovered_registry = Arc::clone(&discovered_registry);
         let user_db_client = Arc::clone(&user_db_client);
         let prompt_routes = Arc::clone(&prompt_routes);
+        let channel_stats = Arc::clone(&channel_stats);
         let kill_map = Arc::clone(&kill_map);
         let cmd_registry = Arc::clone(&cmd_registry);
         let pin_gate = pin_gate.clone();
@@ -1620,6 +1647,7 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
                         discovered_registry,
                         user_db_client,
                         prompt_routes,
+                        channel_stats,
                         kill_map,
                         cmd_registry,
                         shutdown,
@@ -1708,6 +1736,7 @@ async fn handle_connection<S>(
     discovered_registry: Arc<Mutex<ModuleRegistry>>,
     user_db_client: SharedUserDbClient,
     prompt_routes: SharedPromptRoutes,
+    channel_stats: SharedChannelStats,
     kill_map: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
     cmd_registry: Arc<Mutex<CommandRegistry>>,
     shutdown: SharedShutdown,
@@ -2339,6 +2368,7 @@ let mut bytes = Vec::new();
                             module_registry: &module_registry,
                             discovered_registry: &discovered_registry,
                             prompt_routes: &prompt_routes,
+                            channel_stats: &channel_stats,
                             module_name: &module_name,
                             instance_uuid7: &instance_uuid7,
                             tx: &tx,
@@ -2634,6 +2664,34 @@ Some(Payload::ModuleControl(_)) => {
                             for sender in senders {
                                 let _ = sender.try_send(forward.clone());
                             }
+                        }
+                    }
+                    Some(Payload::ChannelStats(ref stats)) => {
+                        // Adapters push their channel's current viewer/member
+                        // count on each poll; the engine stores it so other
+                        // modules can read it on demand via the
+                        // `channel_viewers` virtual query. Origin-gated to the
+                        // platform adapters — a random module spoofing counts
+                        // would poison every consumer.
+                        if !CHANNEL_STATS_ADAPTERS.contains(&module_name.as_str()) {
+                            log_event_broadcast(
+                                &ui_state,
+                                format!("[ChannelStats] ignored from '{}': only the platform adapters may publish viewer counts", module_name),
+                            );
+                        } else {
+                            let stats = stats.clone();
+                            let mut map = channel_stats.lock().unwrap();
+                            map.insert(
+                                format!("{}:{}", stats.platform, stats.channel),
+                                ChannelStatsEntry {
+                                    platform: stats.platform,
+                                    channel: stats.channel,
+                                    viewers: stats.viewers,
+                                    is_live: stats.is_live,
+                                    title: stats.title,
+                                    updated_at: stats.updated_at,
+                                },
+                            );
                         }
                     }
                     Some(Payload::PromptResponse(ref resp)) => {
