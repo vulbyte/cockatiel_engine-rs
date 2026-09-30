@@ -380,12 +380,12 @@ pub(crate) fn caller_gate(route: QueryRoute, caller: &str) -> Option<&'static st
             (!is_control_surface(caller)).then_some("Audit access denied: not the TUI")
         }
         QueryRoute::UserdbAdjustScore => {
-            (!is_control_surface(caller) && caller != "score-messages" && caller != "predictions")
-                .then_some("userdb_adjust_score denied: not the TUI, score-messages, or predictions")
+            (!is_control_surface(caller) && caller != "score-messages" && caller != "events")
+                .then_some("userdb_adjust_score denied: not the TUI, score-messages, or events")
         }
         QueryRoute::PredictionGetScore => {
-            (!is_control_surface(caller) && caller != "predictions")
-                .then_some("prediction_get_score denied: not the predictions module")
+            (!is_control_surface(caller) && caller != "events")
+                .then_some("prediction_get_score denied: not the events module")
         }
         QueryRoute::UserdbFamily => {
             (!is_control_surface(caller)).then_some("User database access denied: not the TUI")
@@ -2059,7 +2059,7 @@ mod tests {
     const TEST_RUNNER: &str = "cockatiel-test-runner";
     const SCORE_MESSAGES: &str = "score-messages";
     const TERM_CHAT: &str = "term-chat";
-    const PREDICTIONS: &str = "predictions";
+    const EVENTS: &str = "events";
     /// An ordinary adapter: authenticated, not a control surface, not the
     /// runner, not the automated scorer.
     const NORMAL: &str = "twitch-adapter";
@@ -2149,7 +2149,7 @@ mod tests {
             ("userdb_adjust_score", TUI, true),
             ("userdb_adjust_score", TUI_CHILD, true),
             ("userdb_adjust_score", SCORE_MESSAGES, true),
-            ("userdb_adjust_score", PREDICTIONS, true),
+            ("userdb_adjust_score", EVENTS, true),
             ("userdb_adjust_score", TEST_RUNNER, false),
             ("userdb_adjust_score", TERM_CHAT, false),
             ("userdb_adjust_score", NORMAL, false),
@@ -2158,7 +2158,7 @@ mod tests {
             // Everything else is refused.
             ("prediction_get_score", TUI, true),
             ("prediction_get_score", TUI_CHILD, true),
-            ("prediction_get_score", PREDICTIONS, true),
+            ("prediction_get_score", EVENTS, true),
             ("prediction_get_score", SCORE_MESSAGES, false),
             ("prediction_get_score", TEST_RUNNER, false),
             ("prediction_get_score", TERM_CHAT, false),
@@ -2268,11 +2268,11 @@ mod tests {
         );
         assert_eq!(
             denial("userdb_adjust_score", NORMAL),
-            Some("userdb_adjust_score denied: not the TUI, score-messages, or predictions")
+            Some("userdb_adjust_score denied: not the TUI, score-messages, or events")
         );
         assert_eq!(
             denial("prediction_get_score", NORMAL),
-            Some("prediction_get_score denied: not the predictions module")
+            Some("prediction_get_score denied: not the events module")
         );
         assert_eq!(denial("set_credentials", NORMAL), Some("set_credentials denied: not the TUI"));
         // Admitted callers get no denial at all.
@@ -2281,7 +2281,7 @@ mod tests {
         assert_eq!(denial("pipeline_set_paused", TUI), None);
         assert_eq!(denial("engine_shutdown", TUI), None);
         assert_eq!(denial("engine_shutdown", TUI_CHILD), None);
-        assert_eq!(denial("prediction_get_score", PREDICTIONS), None);
+        assert_eq!(denial("prediction_get_score", EVENTS), None);
         assert_eq!(denial("prediction_get_score", TUI), None);
     }
 

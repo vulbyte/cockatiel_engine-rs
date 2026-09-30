@@ -2615,10 +2615,10 @@ Some(Payload::ModuleControl(_)) => {
                         // surface — may do this: a random module spoofing a bar
                         // would be indistinguishable from a real one, so the
                         // origin is gated before the forward.
-                        if module_name != "predictions" && !is_control_surface(&module_name) {
+                        if module_name != "events" && !is_control_surface(&module_name) {
                             log_event_broadcast(
                                 &ui_state,
-                                format!("[PredictionUpdate] ignored from '{}': only the predictions module or TUI may broadcast", module_name),
+                                format!("[PredictionUpdate] ignored from '{}': only the events module or TUI may broadcast", module_name),
                             );
                         } else {
                             let update = update.clone();
@@ -2648,10 +2648,10 @@ Some(Payload::ModuleControl(_)) => {
                         // every connected module. Origin-gated identically — a
                         // random module spoofing a poll would be
                         // indistinguishable from a real one.
-                        if module_name != "predictions" && !is_control_surface(&module_name) {
+                        if module_name != "events" && !is_control_surface(&module_name) {
                             log_event_broadcast(
                                 &ui_state,
-                                format!("[PollUpdate] ignored from '{}': only the predictions module or TUI may broadcast", module_name),
+                                format!("[PollUpdate] ignored from '{}': only the events module or TUI may broadcast", module_name),
                             );
                         } else {
                             let update = update.clone();

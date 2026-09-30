@@ -5,7 +5,7 @@
 //! gate (`pause_tests.rs`) and the shutdown flush (`shutdown_tests.rs`) are.
 //! What the assertions pin is that the relay arm exists, mirrors the Prompt
 //! forward shape, filters the origin module out of the broadcast, and gates the
-//! origin to the predictions module / control surface.
+//! origin to the events module / control surface.
 
 /// Extract the PredictionUpdate arm from the receive loop's `match
 /// container.payload`, between its own head and the following PromptResponse
@@ -44,7 +44,7 @@ fn the_prediction_update_arm_exists_and_mirrors_the_prompt_forward() {
     assert!(arm.contains("sender.try_send(forward.clone())"), "the forward must be a non-blocking try_send");
 }
 
-/// Only the predictions module (the brain) or the TUI control surface may
+/// Only the events module (the brain) or the TUI control surface may
 /// broadcast a prediction bar; any other module is ignored with a log line that
 /// names it. A random module spoofing a bar would be indistinguishable from a
 /// real one, so the origin is gated before the forward.
@@ -54,15 +54,15 @@ fn the_prediction_update_relay_gates_the_origin() {
     let arm = prediction_arm(src);
 
     assert!(
-        arm.contains("module_name != \"predictions\"") && arm.contains("is_control_surface"),
-        "only the predictions module or the control surface may broadcast"
+        arm.contains("module_name != \"events\"") && arm.contains("is_control_surface"),
+        "only the events module or the control surface may broadcast"
     );
     assert!(
         arm.contains("log_event_broadcast"),
         "an unauthorised broadcaster must be called out"
     );
     assert!(
-        arm.contains("only the predictions module or TUI may broadcast"),
+        arm.contains("only the events module or TUI may broadcast"),
         "the log line must name the rule that was violated"
     );
 }
@@ -101,15 +101,15 @@ fn the_poll_update_relay_gates_the_origin() {
     let arm = poll_arm(src);
 
     assert!(
-        arm.contains("module_name != \"predictions\"") && arm.contains("is_control_surface"),
-        "only the predictions module or the control surface may broadcast"
+        arm.contains("module_name != \"events\"") && arm.contains("is_control_surface"),
+        "only the events module or the control surface may broadcast"
     );
     assert!(
         arm.contains("log_event_broadcast"),
         "an unauthorised broadcaster must be called out"
     );
     assert!(
-        arm.contains("only the predictions module or TUI may broadcast"),
+        arm.contains("only the events module or TUI may broadcast"),
         "the log line must name the rule that was violated"
     );
 }
