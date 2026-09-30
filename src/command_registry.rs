@@ -132,6 +132,25 @@ impl CommandRegistry {
         }
         out
     }
+
+    /// The registered commands grouped by module name, in insertion order
+    /// (deterministic: modules sorted, commands in registration order). Used by
+    /// `!help` to group commands under their owning module.
+    pub fn commands_by_module(&self) -> Vec<(String, Vec<Command>)> {
+        let mut modules: Vec<String> = self.modules.keys().cloned().collect();
+        modules.sort();
+        modules
+            .into_iter()
+            .filter_map(|m| {
+                let cmds = self.modules.get(&m).map(|r| r.commands.clone())?;
+                if cmds.is_empty() {
+                    None // a catch-all has no commands to show
+                } else {
+                    Some((m, cmds))
+                }
+            })
+            .collect()
+    }
 }
 
 /// A parsed chat command: the command + its flag values + the trailing args.

@@ -48,6 +48,7 @@ use database::{DatabaseConfig, DatabaseManager};
 mod credentials;
 
 mod pipeline;
+mod help;
 use pipeline::{PipelineConfig, PipelineOrchestrator, SendOutcome};
 
 /* QUERY SURFACE */
@@ -334,11 +335,13 @@ fn module_search_paths() -> Vec<PathBuf> {
 /// and attach a populated `UserData` (username, roles, name color) so downstream
 /// modules (e.g. term-chat) can display the user nicely.
 /// What to do with a raw chat message after command classification.
+#[derive(Debug)]
 enum CommandAction {
     /// Attach this parsed command (known command — pipeline routes it).
     Attach(crate::cockatiel_protobuf::Command),
-    /// Send the built-in help list back to the chat.
-    Help,
+    /// Send the built-in help list back to the chat. `Some(arg)` = the module
+    /// name after `!help`, for the per-module detail view.
+    Help(Option<String>),
     /// Send the apology reply (unregistered command under an alerting flag).
     Alert,
     /// Nothing (not a flagged command, or a known command already attached).
@@ -353,8 +356,13 @@ fn classify_command(raw: &str, registry: &CommandRegistry) -> CommandAction {
         return CommandAction::None;
     }
     let lower = raw.to_lowercase();
-    if lower == "!help" || lower.starts_with("!help ") {
-        return CommandAction::Help;
+    if lower == "!help" {
+        return CommandAction::Help(None);
+    }
+    if lower.starts_with("!help ") {
+        // `!help <module>` — the module name is everything after the token.
+        let arg = raw[6..].trim().to_string();
+        return CommandAction::Help(if arg.is_empty() { None } else { Some(arg) });
     }
     let Some(parsed) = parse_command(raw, registry) else {
         return CommandAction::None;
@@ -487,17 +495,18 @@ pub async fn handle_command_on_ingest(
             chat.command = Some(cmd);
             outcome = IngestCommandOutcome::Attached;
         }
-        CommandAction::Help => {
+        CommandAction::Help(arg) => {
             let reply = {
                 let reg = registry.lock().unwrap();
-                let mut lines = vec!["Available commands:".to_string()];
-                for c in reg.all_commands() {
-                    lines.push(format!("  {}{} — {}", c.command_flag, c.command_name, c.command_description));
+                match arg {
+                    Some(module) => match crate::help::format_module(&reg, &module) {
+                        Some(text) => text,
+                        None => format!(
+                            "no module named '{module}' — try '!help' to see all modules"
+                        ),
+                    },
+                    None => crate::help::format_overview(&reg),
                 }
-                if lines.len() == 1 {
-                    lines.push("  (none registered yet)".to_string());
-                }
-                lines.join("\n")
             };
             let platform = chat.platform.clone();
             let channel_id = chat.channel_id.clone();

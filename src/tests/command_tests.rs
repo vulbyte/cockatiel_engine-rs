@@ -42,8 +42,13 @@ fn reg_with_commands() -> CommandRegistry {
 #[test]
 fn help_classifies_to_help() {
     let r = reg_with_commands();
-    assert!(matches!(classify_command("!help", &r), CommandAction::Help));
-    assert!(matches!(classify_command("!help what can I do", &r), CommandAction::Help));
+    assert!(matches!(classify_command("!help", &r), CommandAction::Help(None)));
+    assert!(matches!(classify_command("!help what can I do", &r), CommandAction::Help(Some(_))));
+    // The module argument is captured for the detail view.
+    match classify_command("!help tts", &r) {
+        CommandAction::Help(Some(m)) => assert_eq!(m, "tts"),
+        other => panic!("expected Help(Some(tts)), got {other:?}"),
+    }
 }
 
 #[test]
