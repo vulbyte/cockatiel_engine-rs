@@ -10,6 +10,37 @@ use crate::database::{DatabaseManager, PipelineOutcome, PipelineResult};
 
 const DEFAULT_ACK_TIMEOUT_MS: u64 = 3000;
 
+/// Decide which modules receive a message, based on command routing.
+///
+/// A message with a parsed command goes ONLY to the owning module + any
+/// catch-all modules (modules that registered an empty command set). A message
+/// with NO command goes ONLY to catch-alls. Anything else — a module that
+/// registered specific commands it didn't get — is skipped, so no module is
+/// burdened with packages it doesn't need (and the fanout doesn't spend
+/// network/ack time on them).
+///
+/// `stage_modules` is the stage's configured module list, so the result is
+/// always a subset of it (a command owner registered for a different stage is
+/// naturally absent). Returns `None` when scoping is inapplicable (the message
+/// should go to every module in the stage) — currently never, but kept as a
+/// deliberate escape hatch.
+pub(crate) fn command_recipients(
+    parsed_command: Option<&Command>,
+    registry: &CommandRegistry,
+    stage_modules: &[String],
+) -> Option<Vec<String>> {
+    let mut targets: Vec<String> = Vec::new();
+    if let Some(cmd) = parsed_command
+        && let Some(owner) = registry.owner(&cmd.command_flag, &cmd.command_name)
+    {
+        targets.push(owner);
+    }
+    targets.extend(registry.catch_alls());
+    // Keep only targets actually in this stage's configured list.
+    targets.retain(|name| stage_modules.iter().any(|m| m == name));
+    Some(targets)
+}
+
 /// How often the ack-timeout sweep runs. This bounds how long a stage waits once
 /// its ack budget has expired, so it must stay well below [`DEFAULT_ACK_TIMEOUT_MS`]
 /// rather than riding on a multi-second housekeeping interval. It used to run on
@@ -949,26 +980,18 @@ impl PipelineOrchestrator {
             )),
         };
 
-        // Targeted command routing: a registered command goes ONLY to the
-        // owning module + any catch-all modules (empty Commands = receives
-        // everything). Everything else fans out to all pre-process modules.
-        let targets: Option<Vec<String>> = {
+        // Command routing: a message with a registered command goes ONLY to the
+        // owning module + any catch-all modules; a message with no command goes
+        // ONLY to catch-alls. A module that registered specific commands it
+        // didn't get is skipped — it is never burdened with packages it
+        // doesn't need.
+        let cfg = self.config_snapshot().await;
+        let targets = {
             let registry = self.command_registry.lock().unwrap();
-            match &state.parsed_command {
-                Some(pc) => {
-                    let mut t: Vec<String> = Vec::new();
-                    if let Some(owner) = registry.owner(&pc.command_flag, &pc.command_name) {
-                        t.push(owner);
-                    }
-                    t.extend(registry.catch_alls());
-                    Some(t)
-                }
-                None => None,
-            }
+            command_recipients(state.parsed_command.as_ref(), &registry, &cfg.pre_process_modules)
         };
 
         let mut ack_guard = self.ack_tracker.lock().await;
-        let cfg = self.config_snapshot().await;
 
         let recipients: Vec<&String> = match &targets {
             Some(list) => list.iter().collect(),
@@ -1067,7 +1090,7 @@ impl PipelineOrchestrator {
                         raw_data: vec![],
                         raw_message: state.raw_message.clone(),
                         user_uuid7: state.user_uuid7.clone(),
-                        command: None,
+                        command: state.parsed_command.clone(),
                         channel_id: state.channel_id.clone(),
                         user_data: state.user_data.clone(),
                     }),
@@ -1078,6 +1101,37 @@ impl PipelineOrchestrator {
                 },
             )),
         };
+
+        // Command routing: an in-process module only processes messages for the
+        // commands it registered (plus catch-alls). If THIS module isn't a
+        // recipient, skip it without sending — it shouldn't bear packages it
+        // doesn't need.
+        let is_recipient = {
+            let registry = self.command_registry.lock().unwrap();
+            let targets =
+                command_recipients(state.parsed_command.as_ref(), &registry, &cfg.in_process_modules);
+            targets
+                .as_ref()
+                .map(|t| t.iter().any(|m| m == module_name))
+                .unwrap_or(true)
+        };
+        if !is_recipient {
+            let next_index = {
+                let mut states = self.pipeline_states.lock().await;
+                if let Some(state) = states.get_mut(uuid7) {
+                    state.current_in_process_index += 1;
+                    state.current_in_process_index
+                } else {
+                    return Ok(());
+                }
+            };
+            if next_index >= cfg.in_process_modules.len() {
+                self.start_post_process(uuid7).await?;
+            } else {
+                Box::pin(self.start_in_process(uuid7)).await?;
+            }
+            return Ok(());
+        }
 
         // Cost gate: a user who can't afford the module's price / meet its min_rank
         // skips to the NEXT in-process module (same as an unconnected module),
@@ -1179,7 +1233,7 @@ impl PipelineOrchestrator {
                         raw_data: vec![],
                         raw_message: state.raw_message.clone(),
                         user_uuid7: state.user_uuid7.clone(),
-                        command: None,
+                        command: state.parsed_command.clone(),
                         channel_id: state.channel_id.clone(),
                         user_data: state.user_data.clone(),
                     }),
@@ -1192,8 +1246,20 @@ impl PipelineOrchestrator {
 
         let cfg = self.config_snapshot().await;
 
+        // Command routing: a post-process module only receives messages for the
+        // commands it registered (plus catch-alls receive everything). A module
+        // that registered specific commands it didn't get is skipped.
+        let targets = {
+            let registry = self.command_registry.lock().unwrap();
+            command_recipients(state.parsed_command.as_ref(), &registry, &cfg.post_process_modules)
+        };
+        let recipients: Vec<&String> = match &targets {
+            Some(list) => list.iter().collect(),
+            None => cfg.post_process_modules.iter().collect(),
+        };
+
         let mut sent_any = false;
-        for module_name in &cfg.post_process_modules {
+        for module_name in recipients {
             // Cost gate: skip THIS post-process module if the user can't afford
             // its price / meet its min_rank (skip-that-module semantics).
             if !self.permit_module(&state.user_uuid7, module_name).await {

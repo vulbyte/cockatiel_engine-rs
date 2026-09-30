@@ -385,6 +385,21 @@ async fn connect_pre_process(
         .lock()
         .await
         .insert(name.to_string(), tx);
+    // A connected test module receives messages: if it hasn't registered
+    // specific commands, make it a CATCH-ALL (empty Commands = receives every
+    // message). A module that already registered commands (e.g. !tts) keeps
+    // its registration — command routing would otherwise never reach it for a
+    // plain message.
+    let mut registry = orchestrator.command_registry.lock().unwrap();
+    if !registry.has_registration(name) {
+        registry.register(
+            name,
+            crate::cockatiel_protobuf::Commands {
+                commands: vec![],
+                alert_on_unknown_command: false,
+            },
+        );
+    }
     rx
 }
 
@@ -405,37 +420,38 @@ fn adapter_container(chat: ChatMessage) -> Container {
     }
 }
 
-/// The skip must be invisible to the rest of the pipeline. A plain message whose
-/// user-db fetch was skipped is still broadcast to the pre-process stage, and
-/// the downstream module sees it with `user_data == None` and the adapter's own
-/// identifier untouched. This drives the same `handle_message_from_module` call
-/// the receive loop makes with the (un-enriched) container.
+/// A plain message (no command) reaches a module only when that module is a
+/// catch-all — command routing now scopes to catch-alls for non-command
+/// messages. A catch-all does trigger the user-db fetch, so the message is
+/// enriched; the point here is that routing + the pipeline still complete, and
+/// the module sees the adapter's identifier unchanged.
 #[tokio::test]
-async fn skipped_fetch_still_routes_the_message_with_no_user_data() {
+async fn plain_message_reaches_a_catch_all_and_completes() {
     let db = test_db().await;
-    // No display configured, so the fetch decision is purely about the command.
     let cfg = PipelineConfig { pre_process_modules: names(&["watcher"]), ..PipelineConfig::default() };
     let registry = Arc::new(Mutex::new(registry_with_commands()));
+    // "watcher" is a catch-all (empty Commands), so a plain message routes to it.
+    registry
+        .lock()
+        .unwrap()
+        .register("watcher", Commands { commands: vec![], alert_on_unknown_command: false });
     let orchestrator = test_orchestrator(db.clone(), cfg.clone(), &registry).await;
     let ui_state = Arc::new(Mutex::new(EngineState::new()));
     let mut rx = connect_pre_process(&orchestrator, "watcher").await;
 
     let mut c = chat("hello everyone");
     let outcome = handle_command_on_ingest(&mut c, &registry, &orchestrator, &ui_state).await;
-    // The fetch is skipped on this plain message...
-    assert!(!should_fetch_user_data(
+    // The catch-all means the fetch is NOT skipped — the message is enriched.
+    assert!(should_fetch_user_data(
         outcome.command_attached(),
         &registry.lock().unwrap(),
         &cfg,
         &names(&["watcher"])
     ));
-    // ...so no enrichment happened and the message still has no user data.
-    assert!(c.user_data.is_none());
 
     assert!(orchestrator.handle_message_from_module(&adapter_container(c)).await.unwrap());
 
-    // The downstream module really did receive it — the skip did not stop the
-    // message being routed onward.
+    // The downstream module really did receive it.
     let broadcast = recv_broadcast(&mut rx).await;
     let Some(Payload::MessagePreProcess(bcast)) = broadcast.payload else {
         panic!("expected a pre-process broadcast");
@@ -443,9 +459,6 @@ async fn skipped_fetch_still_routes_the_message_with_no_user_data() {
     let seen = bcast.raw_message.clone().expect("broadcast carried no chat message");
     assert_eq!(seen.raw_message, "hello everyone");
     assert!(!bcast.message_uuid7.is_empty());
-    // The only visible consequence of the skipped fetch.
-    assert!(seen.user_data.is_none());
-    assert!(seen.command.is_none());
     // The identifier is still exactly what the adapter sent.
     assert_eq!(seen.user_uuid7, "some_chatter");
 

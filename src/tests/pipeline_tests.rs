@@ -53,10 +53,10 @@ pub(super) fn wired_orchestrator(
         .collect();
     let mut senders = HashMap::new();
     let mut receivers: HashMap<String, ModuleRx> = HashMap::new();
-    for name in names {
+    for name in &names {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         senders.insert(name.clone(), tx);
-        receivers.insert(name, rx);
+        receivers.insert(name.clone(), rx);
     }
     let orchestrator = PipelineOrchestrator::new(
         db,
@@ -70,6 +70,26 @@ pub(super) fn wired_orchestrator(
         Arc::new(tokio::sync::Mutex::new(senders)),
         Arc::new(std::sync::Mutex::new(CommandRegistry::default())),
     );
+    // Every test module that hasn't already registered commands is a CATCH-ALL
+    // (empty Commands = receives every message). Command routing now skips
+    // modules that registered specific commands; without this, a non-command
+    // message would never reach a test module and every stage test would
+    // dead-end. A module that pre-registered specific commands keeps them.
+    let catch_all_names: Vec<String> = names.clone();
+    {
+        let mut registry = orchestrator.command_registry.lock().unwrap();
+        for name in &catch_all_names {
+            if !registry.has_registration(name) {
+                registry.register(
+                    name,
+                    crate::cockatiel_protobuf::Commands {
+                        commands: vec![],
+                        alert_on_unknown_command: false,
+                    },
+                );
+            }
+        }
+    }
     (orchestrator, receivers)
 }
 

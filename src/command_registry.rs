@@ -97,6 +97,13 @@ impl CommandRegistry {
             .collect()
     }
 
+    /// Whether a module has registered ANY command set (specific commands or a
+    /// catch-all). Used to avoid clobbering a specific registration when a
+    /// caller wants to add a catch-all fallback.
+    pub fn has_registration(&self, module: &str) -> bool {
+        self.modules.contains_key(module)
+    }
+
     /// A module that owns `flag` and has `alert_on_unknown_command` set, so an
     /// unregistered command under that flag gets the apology reply.
     pub fn alert_owner_for(&self, flag: &str) -> Option<String> {
@@ -321,5 +328,75 @@ mod tests {
         assert_eq!(r.owner("!", "tts").unwrap(), "tts-service");
         assert_eq!(r.owner("!", "reprimand").unwrap(), "reprimand");
         assert_eq!(r.all_commands().len(), 2);
+    }
+
+    #[test]
+    fn re_registration_on_reconnect_replaces_the_old_set() {
+        let mut r = CommandRegistry::default();
+        r.register("mod", Commands {
+            commands: vec![Command {
+                command_name: "old".into(),
+                command_flag: "!".into(),
+                command_description: String::new(),
+                command_flags: vec![],
+            }],
+            alert_on_unknown_command: false,
+        });
+        assert!(r.has_registration("mod"));
+        assert_eq!(r.owner("!", "old").unwrap(), "mod");
+        assert!(r.owner("!", "new").is_none());
+
+        // A reconnect sends a FRESH CommandsPayload; it must REPLACE the old
+        // set, never accumulate — a stale command from a previous connection
+        // must not keep routing after the module reconnected with different
+        // commands.
+        r.register("mod", Commands {
+            commands: vec![Command {
+                command_name: "new".into(),
+                command_flag: "!".into(),
+                command_description: String::new(),
+                command_flags: vec![],
+            }],
+            alert_on_unknown_command: true,
+        });
+        assert!(r.owner("!", "old").is_none(), "old command must be gone after re-registration");
+        assert_eq!(r.owner("!", "new").unwrap(), "mod");
+        assert_eq!(r.alert_owner_for("!"), Some("mod".to_string()));
+        // Exactly one registration remains (no duplicate owner rows).
+        assert_eq!(r.catch_alls(), Vec::<String>::new());
+        assert_eq!(r.all_commands().len(), 1);
+    }
+
+    #[test]
+    fn command_recipients_scopes_by_command_and_catch_all() {
+        use crate::pipeline::command_recipients;
+        let mut r = CommandRegistry::default();
+        r.register("tts-service", Commands {
+            commands: vec![Command {
+                command_name: "tts".into(),
+                command_flag: "!".into(),
+                command_description: String::new(),
+                command_flags: vec![],
+            }],
+            alert_on_unknown_command: false,
+        });
+        r.register("display", Commands { commands: vec![], alert_on_unknown_command: false });
+        let stage = vec!["tts-service".to_string(), "display".to_string(), "other".to_string()];
+
+        let cmd = Command {
+            command_name: "tts".into(),
+            command_flag: "!".into(),
+            command_description: String::new(),
+            command_flags: vec![],
+        };
+        // A registered command -> owner + catch-all.
+        let targets = command_recipients(Some(&cmd), &r, &stage).unwrap();
+        assert!(targets.contains(&"tts-service".to_string()));
+        assert!(targets.contains(&"display".to_string()));
+        assert!(!targets.contains(&"other".to_string()), "a module outside the stage is excluded");
+
+        // A plain message (no command) -> catch-alls only.
+        let targets = command_recipients(None, &r, &stage).unwrap();
+        assert_eq!(targets, vec!["display".to_string()], "only the catch-all receives plain messages");
     }
 }
