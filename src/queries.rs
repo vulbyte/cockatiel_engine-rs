@@ -35,8 +35,8 @@ use uuid::Uuid;
 
 use crate::auth::AuthStore;
 use crate::cockatiel_protobuf::{
-    AuthVerify, ChatMessage, Command, Container, DatabaseQuery, DatabaseQueryResult, Log,
-    MessageAck, MessagePreProcess, Prompt, Shutdown, container::Payload,
+    AuthVerify, ChatMessage, ContainerForModule, DatabaseQueryResult, Log, MessagePreProcess,
+    Prompt, Shutdown, container_for_module::Payload,
 };
 use crate::config::{Config, ConfigState, get_config};
 use crate::credentials::{
@@ -198,7 +198,7 @@ pub(crate) struct QueryContext<'a> {
     /// The calling module's instance uuid, echoed on the response.
     pub instance_uuid7: &'a str,
     /// Outbound channel to the calling module.
-    pub tx: &'a tokio::sync::mpsc::Sender<Container>,
+    pub tx: &'a tokio::sync::mpsc::Sender<ContainerForModule>,
     /// The engine's control-surface shutdown signal. `engine_shutdown` raises
     /// it; the main loop waits on it.
     pub shutdown: &'a SharedShutdown,
@@ -419,11 +419,10 @@ pub(crate) fn build_query_response(
     instance_uuid7: &str,
     query_id: &str,
     outcome: QueryOutcome,
-) -> Container {
-    Container {
-        version: 1,
+) -> ContainerForModule {
+    ContainerForModule {
+        version: 2,
         auth_token: auth_token.to_string(),
-        module_name: "cockatiel".into(),
         module_instance_uuid7: instance_uuid7.to_string(),
         payload: Some(Payload::DatabaseQueryResult(DatabaseQueryResult {
             query_id: query_id.to_string(),
@@ -1910,7 +1909,7 @@ async fn guarded_execute_query(
     }
 }
 
-/// Build a Container payload of the requested probe type. `payload_json`
+/// Build a ContainerForModule payload of the requested probe type. `payload_json`
 /// carries optional fields (e.g. a log line, a SQL string). Unknown types
 /// yield None (the probe is skipped).
 fn build_probe_payload(ptype: &str, json: &serde_json::Value) -> Option<Payload> {
@@ -1919,11 +1918,6 @@ fn build_probe_payload(ptype: &str, json: &serde_json::Value) -> Option<Payload>
         "log" => Some(Payload::Log(Log {
             log: json.get("log").and_then(|v| v.as_str()).unwrap_or("test probe").to_string(),
             blob: vec![],
-        })),
-        "database_query" => Some(Payload::DatabaseQuery(DatabaseQuery {
-            query_id: json.get("query_id").and_then(|v| v.as_str()).unwrap_or("probe").to_string(),
-            sql: json.get("sql").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            params: vec![],
         })),
         "message_pre_process" => Some(Payload::MessagePreProcess(MessagePreProcess {
             message_uuid7: String::new(),
@@ -1954,15 +1948,6 @@ fn build_probe_payload(ptype: &str, json: &serde_json::Value) -> Option<Payload>
             prompt_type: 0,
         })),
         "shutdown" => Some(Payload::Shutdown(Shutdown { reason: "test probe".to_string() })),
-        "message_ack" => Some(Payload::MessageAck(MessageAck {
-            message_uuid7: json.get("message_uuid7").and_then(|v| v.as_str()).unwrap_or("probe").to_string(),
-        })),
-        "command_payload" => Some(Payload::CommandPayload(Command {
-            command_name: json.get("command").and_then(|v| v.as_str()).unwrap_or("probe").to_string(),
-            command_flag: json.get("flag").and_then(|v| v.as_str()).unwrap_or("!").to_string(),
-            command_description: String::new(),
-            command_flags: vec![],
-        })),
         _ => None,
     }
 }
@@ -1991,10 +1976,9 @@ async fn handle_test_probe(
         .ok_or_else(|| format!("module '{}' not connected", module))?;
 
     let probe_payload = build_probe_payload(&ptype, &pjson);
-    let container = Container {
-        version: 1,
+    let container = ContainerForModule {
+        version: 2,
         auth_token: String::new(),
-        module_name: "cockatiel".into(),
         module_instance_uuid7: instance_uuid.clone(),
         payload: probe_payload,
     };
@@ -2052,7 +2036,7 @@ mod tests {
     //! would not have been caught by `cargo test`.
 
     use super::*;
-    use crate::cockatiel_protobuf::container::Payload;
+    use crate::cockatiel_protobuf::container_for_module::Payload;
 
     const TUI: &str = "cockatiel-tui";
     const TUI_CHILD: &str = "cockatiel-tui-child";
@@ -2676,7 +2660,7 @@ mod tests {
         assert_eq!(shutdown.stage(), ShutdownStage::Requested);
 
         // 2. The connection task queues the answer…
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Container>(64);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ContainerForModule>(64);
         tx.send(build_query_response("tok", "uuid", "engine_shutdown", outcome))
             .await
             .expect("the answer is queued");
@@ -2806,7 +2790,7 @@ mod tests {
 
     // ── 4. The response envelope ──────────────────────────────────────────
 
-    fn result_of(container: &Container) -> &crate::cockatiel_protobuf::DatabaseQueryResult {
+    fn result_of(container: &ContainerForModule) -> &crate::cockatiel_protobuf::DatabaseQueryResult {
         match container.payload.as_ref().expect("payload present") {
             Payload::DatabaseQueryResult(r) => r,
             other => panic!("expected DatabaseQueryResult, got {other:?}"),
@@ -2823,8 +2807,7 @@ mod tests {
             QueryOutcome::success(blob.clone()),
         );
         // Envelope.
-        assert_eq!(container.version, 1);
-        assert_eq!(container.module_name, "cockatiel");
+        assert_eq!(container.version, 2);
         assert_eq!(container.auth_token, "token-abc");
         assert_eq!(container.module_instance_uuid7, "0192f0aa-1111-7aaa-8000-000000000001");
         // Result.

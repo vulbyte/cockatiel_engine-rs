@@ -4,8 +4,12 @@
 //! pipeline runs on now — ONE terminal write per message instead of a per-stage
 //! write, with the in-memory state as the record while a message is in flight.
 
-use crate::cockatiel_protobuf::container::Payload;
-use crate::cockatiel_protobuf::{ChatMessage, Container, MessageInProcess, MessagePostProcess, MessagePreProcess};
+use crate::cockatiel_protobuf::container_for_engine::Payload as EnginePayload;
+use crate::cockatiel_protobuf::container_for_module::Payload as ModulePayload;
+use crate::cockatiel_protobuf::{
+    ChatMessage, ContainerForEngine, ContainerForModule, MessageInProcess, MessagePostProcess,
+    MessagePreProcess,
+};
 use crate::command_registry::CommandRegistry;
 use crate::database::{DatabaseConfig, DatabaseManager};
 use crate::pipeline::{
@@ -16,8 +20,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub(super) fn dummy_container() -> Container {
-    Container::default()
+pub(super) fn dummy_container() -> ContainerForModule {
+    ContainerForModule::default()
 }
 
 /// A fresh in-memory timeline DB.
@@ -34,7 +38,7 @@ pub(super) async fn test_db() -> DatabaseManager {
     db
 }
 
-pub(super) type ModuleRx = tokio::sync::mpsc::Receiver<Container>;
+pub(super) type ModuleRx = tokio::sync::mpsc::Receiver<ContainerForModule>;
 
 /// An orchestrator whose stages are wired to real (test-owned) module channels,
 /// plus the receiving end of each one, so a test can read what the pipeline sent
@@ -94,13 +98,13 @@ pub(super) fn wired_orchestrator(
 }
 
 /// An adapter's "here is a new chat message" container: the DB-as-queue entry.
-pub(super) fn adapter_ingest(raw_message: &str) -> Container {
-    Container {
-        version: 1,
+pub(super) fn adapter_ingest(raw_message: &str) -> ContainerForEngine {
+    ContainerForEngine {
+        version: 2,
         auth_token: String::new(),
         module_name: "adapter".into(),
         module_instance_uuid7: String::new(),
-        payload: Some(Payload::MessagePreProcess(MessagePreProcess {
+        payload: Some(EnginePayload::MessagePreProcess(MessagePreProcess {
             message_uuid7: String::new(),
             raw_message: Some(ChatMessage {
                 platform: "twitch".into(),
@@ -117,9 +121,9 @@ pub(super) fn adapter_ingest(raw_message: &str) -> Container {
     }
 }
 
-pub(super) fn from_module(module_name: &str, payload: Payload) -> Container {
-    Container {
-        version: 1,
+pub(super) fn from_module(module_name: &str, payload: EnginePayload) -> ContainerForEngine {
+    ContainerForEngine {
+        version: 2,
         auth_token: String::new(),
         module_name: module_name.into(),
         module_instance_uuid7: String::new(),
@@ -139,10 +143,10 @@ pub(super) fn chat(text: &str) -> ChatMessage {
     }
 }
 
-pub(super) fn pre_reply(module: &str, uuid7: &str, text: &str) -> Container {
+pub(super) fn pre_reply(module: &str, uuid7: &str, text: &str) -> ContainerForEngine {
     from_module(
         module,
-        Payload::MessagePreProcess(MessagePreProcess {
+        EnginePayload::MessagePreProcess(MessagePreProcess {
             message_uuid7: uuid7.into(),
             raw_message: Some(chat(text)),
             audio: vec![],
@@ -151,10 +155,10 @@ pub(super) fn pre_reply(module: &str, uuid7: &str, text: &str) -> Container {
     )
 }
 
-pub(super) fn in_reply(module: &str, uuid7: &str, text: &str, abandon: bool) -> Container {
+pub(super) fn in_reply(module: &str, uuid7: &str, text: &str, abandon: bool) -> ContainerForEngine {
     from_module(
         module,
-        Payload::MessageInProcess(MessageInProcess {
+        EnginePayload::MessageInProcess(MessageInProcess {
             message_uuid7: uuid7.into(),
             raw_message: Some(chat(text)),
             processed_message: text.into(),
@@ -165,10 +169,10 @@ pub(super) fn in_reply(module: &str, uuid7: &str, text: &str, abandon: bool) -> 
     )
 }
 
-pub(super) fn post_reply(module: &str, uuid7: &str, text: &str) -> Container {
+pub(super) fn post_reply(module: &str, uuid7: &str, text: &str) -> ContainerForEngine {
     from_module(
         module,
-        Payload::MessagePostProcess(MessagePostProcess {
+        EnginePayload::MessagePostProcess(MessagePostProcess {
             message_uuid7: uuid7.into(),
             raw_message: Some(chat(text)),
             processed_message: text.into(),
@@ -185,9 +189,9 @@ pub(super) fn take_broadcast(rx: &mut ModuleRx) -> String {
         .try_recv()
         .expect("the pipeline must have broadcast to this module");
     match &container.payload {
-        Some(Payload::MessagePreProcess(m)) => m.message_uuid7.clone(),
-        Some(Payload::MessageInProcess(m)) => m.message_uuid7.clone(),
-        Some(Payload::MessagePostProcess(m)) => m.message_uuid7.clone(),
+        Some(ModulePayload::MessagePreProcess(m)) => m.message_uuid7.clone(),
+        Some(ModulePayload::MessageInProcess(m)) => m.message_uuid7.clone(),
+        Some(ModulePayload::MessagePostProcess(m)) => m.message_uuid7.clone(),
         other => panic!("expected a stage message, got {other:?}"),
     }
 }
@@ -207,7 +211,7 @@ pub(super) async fn row(db: &DatabaseManager, uuid7: &str) -> serde_json::Map<St
 
 #[tokio::test]
 async fn send_outcome_not_connected_when_module_has_no_sender() {
-    let senders: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<Container>>>> =
+    let senders: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<ContainerForModule>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let outcome = send_to_module(&senders, "ghost", dummy_container(), "test").await;
     assert_eq!(outcome, SendOutcome::NotConnected);
@@ -215,7 +219,7 @@ async fn send_outcome_not_connected_when_module_has_no_sender() {
 
 #[tokio::test]
 async fn send_outcome_not_connected_when_channel_is_closed() {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Container>(1);
+    let (tx, rx) = tokio::sync::mpsc::channel::<ContainerForModule>(1);
     drop(rx); // the module's socket is gone; its sender slot still lingers.
     let senders = Arc::new(tokio::sync::Mutex::new(HashMap::from([("mod".to_string(), tx)])));
     let outcome = send_to_module(&senders, "mod", dummy_container(), "test").await;
@@ -225,7 +229,7 @@ async fn send_outcome_not_connected_when_channel_is_closed() {
 #[tokio::test]
 async fn send_outcome_dropped_when_channel_is_full() {
     // Bounded capacity-1 channel, receiver kept alive and NEVER drained.
-    let (tx, _rx) = tokio::sync::mpsc::channel::<Container>(1);
+    let (tx, _rx) = tokio::sync::mpsc::channel::<ContainerForModule>(1);
     tx.try_send(dummy_container()).unwrap(); // fill it — the next send can't land
     let senders = Arc::new(tokio::sync::Mutex::new(HashMap::from([("mod".to_string(), tx)])));
     let outcome = send_to_module(&senders, "mod", dummy_container(), "test").await;

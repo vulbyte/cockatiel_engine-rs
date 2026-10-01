@@ -815,6 +815,111 @@ impl DatabaseManager {
         }
     }
 
+    /// Query timeline events by filter. `None`/empty filters mean "any". Only
+    /// read-only SQL is built, from a fixed set of columns, with bound
+    /// parameters — never string-concatenated input. Returns JSON rows.
+    pub async fn query_timeline(
+        &self,
+        timeline_id_uuid7: Option<&[u8]>,
+        event_type: Option<i32>,
+        platform: Option<&str>,
+        user_uuid7: Option<&str>,
+        kind: Option<&str>,
+        since_ms: Option<i64>,
+        limit: i32,
+        offset: i32,
+    ) -> Result<String, String> {
+        let conn = self.locked().await;
+        let conn = conn.as_ref().ok_or("Local database not initialized")?;
+
+        let mut limit = if limit <= 0 { 100 } else { limit.min(500) };
+        let mut offset = offset.max(0);
+
+        // Base select over the fixed timeline columns.
+        let mut sql = String::from(
+            "SELECT uuid7, event_type, platform, raw_message, command, flags, data_blob, \
+             user_uuid7, processed_message, error_message, persisted_at, pipeline_status \
+             FROM timeline_events WHERE 1=1",
+        );
+        let mut args: Vec<Value> = Vec::new();
+
+        if let Some(id) = timeline_id_uuid7 {
+            sql.push_str(" AND uuid7 = ?");
+            args.push(Value::Blob(id.to_vec()));
+            // A single-event fetch ignores pagination.
+            limit = 1;
+            offset = 0;
+        }
+        if let Some(et) = event_type {
+            sql.push_str(" AND event_type = ?");
+            args.push(Value::Integer(et as i64));
+        }
+        if let Some(p) = platform {
+            sql.push_str(" AND platform = ?");
+            args.push(Value::Text(p.to_string()));
+        }
+        if let Some(u) = user_uuid7 {
+            sql.push_str(" AND user_uuid7 = ?");
+            args.push(Value::Text(u.to_string()));
+        }
+        if let Some(k) = kind {
+            // `kind` lives inside the flags blob; match it with a LIKE on the
+            // JSON-ish text, safe because the pattern is bound, not injected.
+            sql.push_str(" AND flags LIKE ?");
+            args.push(Value::Text(format!("%{}%", k)));
+        }
+        if let Some(ts) = since_ms {
+            sql.push_str(" AND persisted_at >= ?");
+            args.push(Value::Integer(ts));
+        }
+        sql.push_str(" ORDER BY persisted_at DESC LIMIT ? OFFSET ?");
+        args.push(Value::Integer(limit as i64));
+        args.push(Value::Integer(offset as i64));
+
+        let mut rows = conn
+            .query(sql.as_str(), turso::params_from_iter(args))
+            .await
+            .map_err(|e| format!("timeline query failed: {}", e))?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|e| format!("row read failed: {}", e))? {
+            let uuid7: Option<Vec<u8>> = row.get(0).ok();
+            let event_type: i32 = row.get(1).unwrap_or(0);
+            let platform: Option<String> = row.get(2).ok();
+            let raw_message: String = row.get(3).unwrap_or_default();
+            let command: Option<String> = row.get(4).ok();
+            let flags: Option<String> = row.get(5).ok();
+            let data_blob: Option<Vec<u8>> = row.get(6).ok();
+            let user_uuid7: Option<String> = row.get(7).ok();
+            let processed_message: Option<String> = row.get(8).ok();
+            let error_message: Option<String> = row.get(9).ok();
+            let persisted_at: Option<i64> = row.get(10).ok();
+            let pipeline_status: Option<String> = row.get(11).ok();
+
+            let id_hex = uuid7
+                .as_deref()
+                .and_then(|b| uuid::Uuid::from_slice(b).ok())
+                .map(|u| u.to_string())
+                .unwrap_or_default();
+            out.push(serde_json::json!({
+                "timeline_id_uuid7": id_hex,
+                "event_type": event_type,
+                "platform": platform,
+                "raw_message": raw_message,
+                "command": command,
+                "flags": flags,
+                "data_blob": data_blob,
+                "user_uuid7": user_uuid7,
+                "processed_message": processed_message,
+                "error_message": error_message,
+                "persisted_at": persisted_at,
+                "pipeline_status": pipeline_status,
+            }));
+        }
+
+        Ok(serde_json::to_string(&out).map_err(|e| format!("json encode failed: {}", e))?)
+    }
+
     /// Execute an arbitrary read-only SQL query and return results as JSON.
     /// Returns an array of objects where keys are column names and values are the cell values.
     pub async fn execute_query(

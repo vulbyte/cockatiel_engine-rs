@@ -61,7 +61,12 @@ use user_db_client::{SharedUserDbClient, UserDbClient};
 /* PROTOBUF STUFF */
 pub use cockatiel_proto::proto as cockatiel_protobuf;
 
-use cockatiel_protobuf::{Container, container::Payload, ProcessPosition, Prompt, PromptType, Log};
+use cockatiel_protobuf::{
+    container_for_engine::Payload as EnginePayload,
+    container_for_module::Payload as ModulePayload,
+    ContainerForEngine, ContainerForModule, ProcessPosition, Prompt, PromptType, Log,
+    TimelineQueryResult,
+};
 
 mod engine_module;
 
@@ -71,7 +76,7 @@ mod engine_module;
 pub(crate) enum PromptSink {
     Engine(oneshot::Sender<bool>),
     /// A module-originated prompt: (origin module name, response channel).
-    Module(String, tokio::sync::mpsc::Sender<Container>),
+    Module(String, tokio::sync::mpsc::Sender<ContainerForModule>),
 }
 
 pub(crate) type SharedPromptRoutes = Arc<Mutex<HashMap<String, PromptSink>>>;
@@ -172,7 +177,7 @@ pub struct ModuleInfo {
     pub process_position: String,
     pub connected_at: Option<i64>,
     pub shutdown_at: Option<i64>,
-    pub sender: Option<tokio::sync::mpsc::Sender<Container>>,
+    pub sender: Option<tokio::sync::mpsc::Sender<ContainerForModule>>,
 }
 
 #[derive(Clone)]
@@ -459,7 +464,7 @@ pub fn should_fetch_user_data(
 /// Snapshot of the module names that are currently connected with a live
 /// outbound channel. This is the liveness input to [`should_fetch_user_data`].
 async fn connected_module_names(
-    senders: &Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<Container>>>>,
+    senders: &Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<ContainerForModule>>>>,
 ) -> Vec<String> {
     let senders = senders.lock().await;
     senders
@@ -561,12 +566,11 @@ pub async fn engine_reply_to_platform(
         actor_uuid7: String::new(),
         channel_id: channel_id.to_string(),
     };
-    let container = Container {
-        version: 1,
+    let container = ContainerForModule {
+        version: 2,
         auth_token: String::new(),
-        module_name: "cockatiel".into(),
         module_instance_uuid7: String::new(),
-        payload: Some(Payload::SendToPlatforms(send)),
+        payload: Some(ModulePayload::SendToPlatforms(send)),
     };
     for name in targets {
             let sent = crate::pipeline::send_to_module(&orchestrator.module_senders, name, container.clone(), "commands").await;
@@ -785,7 +789,7 @@ async fn log_to_timeline(db: &DatabaseManager, kind: &str, source: &str, message
 async fn broadcast_prompt_and_wait(
     prompt: Prompt,
     module_senders: &Arc<
-        tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<Container>>>,
+        tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<ContainerForModule>>>,
     >,
     prompt_routes: &SharedPromptRoutes,
     ui_state: &Arc<Mutex<EngineState>>,
@@ -794,7 +798,7 @@ async fn broadcast_prompt_and_wait(
     let prompt_id = prompt.prompt_id_uuid7.clone();
     let timeout = if prompt.timeout > 0 { prompt.timeout } else { 30 };
 
-    let senders: Vec<tokio::sync::mpsc::Sender<Container>> = {
+    let senders: Vec<tokio::sync::mpsc::Sender<ContainerForModule>> = {
         let senders = module_senders.lock().await;
         senders.values().cloned().collect()
     };
@@ -808,12 +812,11 @@ async fn broadcast_prompt_and_wait(
         .unwrap()
         .insert(prompt_id.clone(), PromptSink::Engine(tx));
 
-    let container = Container {
-        version: 1,
+    let container = ContainerForModule {
+        version: 2,
         auth_token: String::new(),
-        module_name: "engine".to_string(),
         module_instance_uuid7: String::new(),
-        payload: Some(Payload::Prompt(prompt)),
+        payload: Some(ModulePayload::Prompt(prompt)),
     };
     for sender in senders {
         // Best-effort broadcast: a full module queue must never wedge a prompt.
@@ -841,7 +844,7 @@ async fn prompt_user_to_allow(
     position: &str,
     priority: u32,
     module_senders: &Arc<
-        tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<Container>>>,
+        tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<ContainerForModule>>>,
     >,
     prompt_routes: &SharedPromptRoutes,
     ui_state: &Arc<Mutex<EngineState>>,
@@ -931,7 +934,7 @@ async fn handle_chat_message_rejected(
     let origin = &rej.origin;
     let reason = &rej.reason;
     let raw = &rej.message.as_ref().map(|m| m.raw_message.clone()).unwrap_or_default();
-    let processed = &rej.processed_message;
+    let processed = rej.processed_message.as_deref().unwrap_or("");
     log_event_broadcast(
         ui_state,
         compose_rejection_broadcast(origin, &rej.message_uuid7, reason, raw, processed),
@@ -951,7 +954,7 @@ async fn handle_audit_flag(
     db: &DatabaseManager,
     flag: &cockatiel_protobuf::AuditFlag,
     module_senders: &Arc<
-        tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<Container>>>,
+        tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<ContainerForModule>>>,
     >,
     prompt_routes: &SharedPromptRoutes,
     ui_state: &Arc<Mutex<EngineState>>,
@@ -1024,7 +1027,7 @@ let prompt = Prompt {
 pub async fn broadcast_stage(
     modules: &Arc<Mutex<HashMap<String, ModuleInfo>>>,
     position: &str,
-    container: &Container,
+    container: &ContainerForModule,
     config_state: &Arc<Mutex<ConfigState>>,
 ) {
     let config = get_config(config_state);
@@ -1038,7 +1041,7 @@ pub async fn broadcast_stage(
     entries.sort_by_key(|entry| entry.priority);
 
     for entry in entries {
-        let matching_senders: Vec<tokio::sync::mpsc::Sender<Container>> = {
+        let matching_senders: Vec<tokio::sync::mpsc::Sender<ContainerForModule>> = {
             let mods = modules.lock().unwrap();
             mods.values()
                 .filter(|m| m.name == entry.name)
@@ -1147,7 +1150,7 @@ cockatiel
     log_event_broadcast(&ui_state, format!("UserDB client configured for {}:{}", user_db_host, user_db_port));
 
     // Pipeline
-    let module_senders: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<Container>>>> =
+    let module_senders: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<ContainerForModule>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     // Command registry: which modules subscribe to which chat commands
@@ -1245,12 +1248,11 @@ cockatiel
                     {
                         let deadline = now_ms + (response * 1000) as i64;
                         auth_store.mark_probed(&session.instance_uuid7, now_ms, deadline);
-                        let probe = Container {
-                            version: 1,
+                        let probe = ContainerForModule {
+                            version: 2,
                             auth_token: String::new(),
-                            module_name: "engine".into(),
                             module_instance_uuid7: String::new(),
-                            payload: Some(Payload::AuthVerify(cockatiel_protobuf::AuthVerify {
+                            payload: Some(ModulePayload::AuthVerify(cockatiel_protobuf::AuthVerify {
                                 cur_auth: String::new(),
                             })),
                         };
@@ -1272,12 +1274,11 @@ cockatiel
         let module_senders = Arc::clone(&module_senders);
         tokio::spawn(async move {
             while let Some(line) = log_rx.recv().await {
-                let container = Container {
-                    version: 1,
+                let container = ContainerForModule {
+                    version: 2,
                     auth_token: String::new(),
-                    module_name: "engine".into(),
                     module_instance_uuid7: String::new(),
-                    payload: Some(Payload::Log(Log {
+                    payload: Some(ModulePayload::Log(Log {
                         log: line,
                         blob: vec![],
                     })),
@@ -1763,7 +1764,7 @@ where
         }),
     )
     .await?;
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Container>(64);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ContainerForModule>(64);
 
     // Loopback status is computed from the pre-TLS peer address (passed in) —
     // a TlsStream doesn't expose peer_addr directly.
@@ -1786,9 +1787,9 @@ where
         return Ok(());
     };
 
-    let container = Container::decode(data.as_ref())?;
+    let container = ContainerForEngine::decode(data.as_ref())?;
 
-    let Payload::ConnectionRequest(request) = container.payload.as_ref().unwrap() else {
+    let EnginePayload::ConnectionRequest(request) = container.payload.as_ref().unwrap() else {
         log_event(
             &ui_state,
             format!(
@@ -1869,12 +1870,11 @@ where
         // client (the TUI reconnects with its persisted token + uuid) waits for
         // a ConnectionRequestReturn before entering its read loop. Without it,
         // the TUI's handshake never completes and it reconnects forever.
-        let response = Container {
-            version: 1,
+        let response = ContainerForModule {
+            version: 2,
             auth_token: container.auth_token.clone(),
-            module_name: "cockatiel".into(),
             module_instance_uuid7: assigned_uuid.clone(),
-            payload: Some(Payload::ConnectionRequestReturn(
+            payload: Some(ModulePayload::ConnectionRequestReturn(
                 cockatiel_protobuf::ConnectionRequestReturn {
                     new_port: 0,
                     module_instance_uuid7: assigned_uuid.clone(),
@@ -1892,12 +1892,11 @@ where
                 &ui_state,
                 format!("PIN locked out for {}", peer_ip),
             );
-            let response = Container {
-                version: 1,
+            let response = ContainerForModule {
+                version: 2,
                 auth_token: String::new(),
-                module_name: "cockatiel".into(),
                 module_instance_uuid7: String::new(),
-                payload: Some(Payload::ConnectionRequestReturn(
+                payload: Some(ModulePayload::ConnectionRequestReturn(
                     cockatiel_protobuf::ConnectionRequestReturn {
                         new_port: 0,
                         module_instance_uuid7: String::new(),
@@ -1917,12 +1916,11 @@ where
                 format!("Rejected: invalid PIN from '{}'", container.module_name),
             );
             log_to_timeline(&db, "module_reject", &container.module_name, "invalid PIN").await;
-            let response = Container {
-                version: 1,
+            let response = ContainerForModule {
+                version: 2,
                 auth_token: String::new(),
-                module_name: "cockatiel".into(),
                 module_instance_uuid7: String::new(),
-                payload: Some(Payload::ConnectionRequestReturn(
+                payload: Some(ModulePayload::ConnectionRequestReturn(
                     cockatiel_protobuf::ConnectionRequestReturn {
                         new_port: 0,
                         module_instance_uuid7: String::new(),
@@ -1952,12 +1950,11 @@ where
                 ),
             );
             log_to_timeline(&db, "module_reject", claimed, "blank/unnamed module identity").await;
-            let response = Container {
-                version: 1,
+            let response = ContainerForModule {
+                version: 2,
                 auth_token: String::new(),
-                module_name: "cockatiel".into(),
                 module_instance_uuid7: String::new(),
-                payload: Some(Payload::ConnectionRequestReturn(
+                payload: Some(ModulePayload::ConnectionRequestReturn(
                     cockatiel_protobuf::ConnectionRequestReturn {
                         new_port: 0,
                         module_instance_uuid7: String::new(),
@@ -2094,12 +2091,11 @@ where
         if !approved {
             log_event_broadcast(&ui_state, format!("Rejected: user denied module '{}'", module_name));
             log_to_timeline(&db, "module_reject", &module_name, "user denied").await;
-            let response = Container {
-                version: 1,
+            let response = ContainerForModule {
+                version: 2,
                 auth_token: String::new(),
-                module_name: "cockatiel".into(),
                 module_instance_uuid7: String::new(),
-                payload: Some(Payload::ConnectionRequestReturn(
+                payload: Some(ModulePayload::ConnectionRequestReturn(
                     cockatiel_protobuf::ConnectionRequestReturn {
                         new_port: 0,
                         module_instance_uuid7: String::new(),
@@ -2157,12 +2153,11 @@ where
         )
         .await;
 
-        let response = Container {
-            version: 1,
+        let response = ContainerForModule {
+            version: 2,
             auth_token: auth_token.clone(),
-            module_name: "cockatiel".into(),
             module_instance_uuid7: assigned_uuid.clone(),
-            payload: Some(Payload::ConnectionRequestReturn(
+            payload: Some(ModulePayload::ConnectionRequestReturn(
                 cockatiel_protobuf::ConnectionRequestReturn {
                     new_port: 0,
                     module_instance_uuid7: assigned_uuid.clone(),
@@ -2235,7 +2230,7 @@ let mut bytes = Vec::new();
                     continue;
                 };
 
-                let container = match Container::decode(data.as_ref()) {
+                let container = match ContainerForEngine::decode(data.as_ref()) {
                     Ok(c) => c,
                     Err(e) => {
                         log_event_broadcast(&ui_state, format!("Decode error: {}", e));
@@ -2275,15 +2270,15 @@ let mut bytes = Vec::new();
                 auth_store.update_activity(&container.module_instance_uuid7, activity_now);
 
                 match container.payload {
-                    Some(Payload::ConnectionRequest(_)) => {
+                    Some(EnginePayload::ConnectionRequest(_)) => {
                         log_event_broadcast(&ui_state, "Ignoring ConnectionRequest from authenticated module");
                     }
-                    Some(Payload::AuthVerify(_)) => {
+                    Some(EnginePayload::AuthVerify(_)) => {
                         // Liveness probe response. The generic per-message auth
                         // check above already verified the token; nothing more
                         // to do — last_activity was refreshed.
                     }
-                    Some(Payload::MessagePreProcess(ref msg)) => {
+                    Some(EnginePayload::MessagePreProcess(ref msg)) => {
                         let mut enriched = msg.clone();
                         if let Some(chat) = enriched.raw_message.as_mut() {
                             // Command parsing FIRST: if the raw message starts
@@ -2332,36 +2327,112 @@ let mut bytes = Vec::new();
                                 let _ = user_db_client.increment_messages_sent(&chat.user_uuid7).await;
                             }
                         }
-                        let enriched_container = Container {
+                        let enriched_container = ContainerForEngine {
                             version: container.version,
                             auth_token: container.auth_token.clone(),
                             module_name: container.module_name.clone(),
                             module_instance_uuid7: container.module_instance_uuid7.clone(),
-                            payload: Some(Payload::MessagePreProcess(enriched)),
+                            payload: Some(EnginePayload::MessagePreProcess(enriched)),
                         };
                         if let Err(e) = orchestrator.handle_message_from_module(&enriched_container).await {
                             log_event_broadcast(&ui_state, format!("Pipeline error: {}", e));
                         }
                     }
-                    Some(Payload::MessageInProcess(_))
-                    | Some(Payload::MessagePostProcess(_))
-                    | Some(Payload::MessageAck(_)) => {
+                    Some(EnginePayload::MessageInProcess(_))
+                    | Some(EnginePayload::MessagePostProcess(_))
+                    | Some(EnginePayload::MessageAck(_)) => {
                         if let Err(e) = orchestrator.handle_message_from_module(&container).await {
                             log_event_broadcast(&ui_state, format!("Pipeline error: {}", e));
                         }
                     }
-                    Some(Payload::TimelineEvent(ref ev)) => {
-                        log_event_broadcast(&ui_state, format!("Timeline event: {:?}", ev));
+                    Some(EnginePayload::TimelineQuery(query)) => {
+                        // A module requests timeline events. Build the response
+                        // and ship it back on the same outbound channel.
+                        let id = if query.timeline_id_uuid7.is_empty() {
+                            None
+                        } else {
+                            uuid::Uuid::parse_str(&query.timeline_id_uuid7)
+                                .ok()
+                                .map(|u| u.as_bytes().to_vec())
+                        };
+                        let event_type = if query.event_type == 0 {
+                            None
+                        } else {
+                            Some(query.event_type as i32)
+                        };
+                        let platform = if query.platform.is_empty() { None } else { Some(query.platform.as_str()) };
+                        let user = if query.user_uuid7.is_empty() { None } else { Some(query.user_uuid7.as_str()) };
+                        let kind = if query.kind.is_empty() { None } else { Some(query.kind.as_str()) };
+                        let since = if query.since_ms == 0 { None } else { Some(query.since_ms) };
+                        let rows = db
+                            .query_timeline(
+                                id.as_deref(),
+                                event_type,
+                                platform,
+                                user,
+                                kind,
+                                since,
+                                query.limit,
+                                query.offset,
+                            )
+                            .await;
+                        match rows {
+                            Ok(json) => {
+                                let events = serde_json::from_str::<Vec<serde_json::Value>>(&json)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .filter_map(|row| {
+                                        Some(cockatiel_protobuf::TimelineEvent {
+                                            timeline_id_uuid7: row.get("timeline_id_uuid7")?.as_str()?.to_string(),
+                                            event_type: row
+                                                .get("event_type")
+                                                .and_then(|v| v.as_i64())
+                                                .unwrap_or(0) as i32,
+                                            command_flag: row.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                            data_blob: Vec::new(),
+                                            error_message: row.get("error_message").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                            raw_flags: row.get("flags").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                            message_origin: String::new(),
+                                            stream_origin: row.get("platform").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                            raw_message: row.get("raw_message").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                            processed_message: row.get("processed_message").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                            user_uuid7: row.get("user_uuid7").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                            version: 0,
+                                        })
+                                    })
+                                    .collect();
+                                let result = TimelineQueryResult {
+                                    events,
+                                    truncated: false,
+                                    request_id: query.request_id.clone(),
+                                };
+                                let reply = ContainerForModule {
+                                    version: 2,
+                                    auth_token: container.auth_token.clone(),
+                                    module_instance_uuid7: container.module_instance_uuid7.clone(),
+                                    payload: Some(ModulePayload::TimelineQueryResult(result)),
+                                };
+                                let mut buf = Vec::new();
+                                if reply.encode(&mut buf).is_ok() {
+                                    if let Err(e) = bounded_ws_send(&mut websocket, WsMessage::Binary(buf), bounds.send_timeout_secs).await {
+                                        log_event_broadcast(&ui_state, format!("TimelineQuery reply send failed: {}", e));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log_event_broadcast(&ui_state, format!("TimelineQuery failed: {}", e));
+                            }
+                        }
                     }
-                    Some(Payload::Log(ref lg)) => {
+                    Some(EnginePayload::Log(ref lg)) => {
                         log_event(&ui_state, format!("[{}] {}", module_name, lg.log));
                         log_to_timeline(&db, "module_log", &module_name, &lg.log).await;
                     }
-                    Some(Payload::Err(ref err)) => {
+                    Some(EnginePayload::Err(ref err)) => {
                         log_event(&ui_state, format!("[{}] Error: {}", module_name, err.log));
                         log_to_timeline(&db, "module_error", &module_name, &err.log).await;
                     }
-                    Some(Payload::DatabaseQuery(ref query)) => {
+                    Some(EnginePayload::DatabaseQuery(ref query)) => {
                         // The query surface, its gates and its response
                         // envelope all live in `queries`; this arm only lends
                         // it the connection's ambient state and ships the answer
@@ -2417,7 +2488,7 @@ let mut bytes = Vec::new();
                             shutdown.mark_answered();
                         }
                     }
-Some(Payload::SendToPlatforms(send)) => {
+Some(EnginePayload::SendToPlatforms(send)) => {
                         // The actor (the human who triggered the send) must be
                         // verified against the user DB before anything routes.
                         let actor_lookup = if !send.actor_uuid7.is_empty() {
@@ -2457,12 +2528,11 @@ let targets: Vec<&str> = match send.platform.as_str() {
                                 Vec::new()
                             }
                         };
-                        let forward = Container {
-                            version: 1,
+                        let forward = ContainerForModule {
+                            version: 2,
                             auth_token: container.auth_token.clone(),
-                            module_name: container.module_name.clone(),
                             module_instance_uuid7: container.module_instance_uuid7.clone(),
-                            payload: Some(Payload::SendToPlatforms(send.clone())),
+                            payload: Some(ModulePayload::SendToPlatforms(send.clone())),
                         };
                         for name in targets {
                             let sent = crate::pipeline::send_to_module(&orchestrator.module_senders, name, forward.clone(), "SendToPlatforms").await;
@@ -2487,12 +2557,12 @@ let targets: Vec<&str> = match send.platform.as_str() {
                             log_event_broadcast(&ui_state, format!("[SendToPlatforms] '{}' -> {} (by {})", send.msg, send.platform, send.actor_handle));
                         }
                     }
-Some(Payload::ModuleControl(_)) => {
+Some(EnginePayload::ModuleControl(_)) => {
                         // Process lifecycle is owned by the TUI supervisor.
                         // The engine no longer starts/stops modules.
                         log_event_broadcast(&ui_state, "[{}] ModuleControl ignored (processes owned by TUI)".to_string());
                     }
-                    Some(Payload::CommandsPayload(commands)) => {
+                    Some(EnginePayload::Commands(commands)) => {
                         // Command registration: the module subscribes to these
                         // (flag, command) pairs. An EMPTY list = catch-all
                         // (receives every message). `alert_on_unknown_command`
@@ -2510,7 +2580,7 @@ Some(Payload::ModuleControl(_)) => {
                             ),
                         );
                     }
-                    Some(Payload::CommandPayload(command)) => {
+                    Some(EnginePayload::Command(command)) => {
                         // Standalone command invocation: a module/UI sends a
                         // `Command` outside of any chat message. The engine
                         // routes it to the owning module (delivered as a
@@ -2522,12 +2592,11 @@ Some(Payload::ModuleControl(_)) => {
                         registry.owner(&command.command_flag, &command.command_name)
                     }; // guard dropped before any await
                     if let Some(owner) = owner {
-                            let forward = Container {
-                                version: 1,
+                            let forward = ContainerForModule {
+                                version: 2,
                                 auth_token: String::new(),
-                                module_name: "cockatiel".into(),
                                 module_instance_uuid7: String::new(),
-                                payload: Some(Payload::MessagePreProcess(
+                                payload: Some(ModulePayload::MessagePreProcess(
                                     cockatiel_protobuf::MessagePreProcess {
                                         message_uuid7: String::new(),
                                         raw_message: Some(cockatiel_protobuf::ChatMessage {
@@ -2579,7 +2648,7 @@ Some(Payload::ModuleControl(_)) => {
                             );
                         }
                     }
-                    Some(Payload::Prompt(ref prompt)) => {
+                    Some(EnginePayload::Prompt(ref prompt)) => {
                         // A module is asking the user something (e.g. "allow this
                         // action?"). Forward it to every OTHER connected module so
                         // they can display it, and remember the origin so a
@@ -2589,14 +2658,13 @@ Some(Payload::ModuleControl(_)) => {
                             prompt.prompt_id_uuid7.clone(),
                             PromptSink::Module(module_name.clone(), tx.clone()),
                         );
-                        let forward = Container {
-                            version: 1,
+                        let forward = ContainerForModule {
+                            version: 2,
                             auth_token: container.auth_token.clone(),
-                            module_name: container.module_name.clone(),
                             module_instance_uuid7: container.module_instance_uuid7.clone(),
-                            payload: Some(Payload::Prompt(prompt)),
+                            payload: Some(ModulePayload::Prompt(prompt)),
                         };
-                        let senders: Vec<tokio::sync::mpsc::Sender<Container>> = {
+                        let senders: Vec<tokio::sync::mpsc::Sender<ContainerForModule>> = {
                             let senders = orchestrator.module_senders.lock().await;
                             senders
                                 .iter()
@@ -2608,7 +2676,7 @@ Some(Payload::ModuleControl(_)) => {
                             let _ = sender.try_send(forward.clone());
                         }
                     }
-                    Some(Payload::PredictionUpdate(ref update)) => {
+                    Some(EnginePayload::PredictionUpdate(ref update)) => {
                         // The predictions module (the brain) broadcasts a
                         // prediction bar to every connected module so they can
                         // display it. Only the brain — or the TUI control
@@ -2622,14 +2690,13 @@ Some(Payload::ModuleControl(_)) => {
                             );
                         } else {
                             let update = update.clone();
-                            let forward = Container {
-                                version: 1,
+                            let forward = ContainerForModule {
+                                version: 2,
                                 auth_token: container.auth_token.clone(),
-                                module_name: container.module_name.clone(),
                                 module_instance_uuid7: container.module_instance_uuid7.clone(),
-                                payload: Some(Payload::PredictionUpdate(update)),
+                                payload: Some(ModulePayload::PredictionUpdate(update)),
                             };
-                            let senders: Vec<tokio::sync::mpsc::Sender<Container>> = {
+                            let senders: Vec<tokio::sync::mpsc::Sender<ContainerForModule>> = {
                                 let senders = orchestrator.module_senders.lock().await;
                                 senders
                                     .iter()
@@ -2642,7 +2709,7 @@ Some(Payload::ModuleControl(_)) => {
                             }
                         }
                     }
-                    Some(Payload::PollUpdate(ref update)) => {
+                    Some(EnginePayload::PollUpdate(ref update)) => {
                         // Same relay contract as PredictionUpdate: the
                         // predictions module broadcasts free-vote poll state to
                         // every connected module. Origin-gated identically — a
@@ -2655,14 +2722,13 @@ Some(Payload::ModuleControl(_)) => {
                             );
                         } else {
                             let update = update.clone();
-                            let forward = Container {
-                                version: 1,
+                            let forward = ContainerForModule {
+                                version: 2,
                                 auth_token: container.auth_token.clone(),
-                                module_name: container.module_name.clone(),
                                 module_instance_uuid7: container.module_instance_uuid7.clone(),
-                                payload: Some(Payload::PollUpdate(update)),
+                                payload: Some(ModulePayload::PollUpdate(update)),
                             };
-                            let senders: Vec<tokio::sync::mpsc::Sender<Container>> = {
+                            let senders: Vec<tokio::sync::mpsc::Sender<ContainerForModule>> = {
                                 let senders = orchestrator.module_senders.lock().await;
                                 senders
                                     .iter()
@@ -2675,7 +2741,7 @@ Some(Payload::ModuleControl(_)) => {
                             }
                         }
                     }
-                    Some(Payload::ChannelStats(ref stats)) => {
+                    Some(EnginePayload::ChannelStats(ref stats)) => {
                         // Adapters push their channel's current viewer/member
                         // count on each poll; the engine stores it so other
                         // modules can read it on demand via the
@@ -2703,7 +2769,7 @@ Some(Payload::ModuleControl(_)) => {
                             );
                         }
                     }
-                    Some(Payload::PromptResponse(ref resp)) => {
+                    Some(EnginePayload::PromptResponse(ref resp)) => {
                         // Route the user's answer back to whoever is waiting on
                         // this prompt_id (the engine's own connection prompt, or
                         // the module that originally raised the prompt).
@@ -2719,19 +2785,18 @@ Some(Payload::ModuleControl(_)) => {
                                     let _ = tx.send(resp.accepted);
                                 }
                                 PromptSink::Module(_origin, sender) => {
-                                    let forward = Container {
-                                        version: 1,
+                                    let forward = ContainerForModule {
+                                        version: 2,
                                         auth_token: container.auth_token.clone(),
-                                        module_name: container.module_name.clone(),
                                         module_instance_uuid7: container.module_instance_uuid7.clone(),
-                                        payload: Some(Payload::PromptResponse(resp)),
+                                        payload: Some(ModulePayload::PromptResponse(resp)),
                                     };
                                     let _ = tokio::time::timeout(Duration::from_millis(1000), sender.send(forward)).await;
                                 }
                             }
                         }
                     }
-                    Some(Payload::AuditFlag(ref flag)) => {
+                    Some(EnginePayload::AuditFlag(ref flag)) => {
                         // A module flagged a message for human review (e.g. a
                         // different language). Hold it and ask a connected UI.
                         //
@@ -2780,7 +2845,7 @@ Some(Payload::ModuleControl(_)) => {
                             });
                         }
                     }
-                    Some(Payload::ChatMessageRejected(ref rej)) => {
+                    Some(EnginePayload::ChatMessageRejected(ref rej)) => {
                         // A module rejected a message: surface it clearly (no
                         // buried log strings) and persist it as a searchable
                         // timeline record. The message itself still flows as the

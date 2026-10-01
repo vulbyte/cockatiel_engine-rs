@@ -10,7 +10,11 @@
 //! on the command having been classified first, and the fact that a skipped
 //! fetch does not stop the message being routed onward.
 
-use crate::cockatiel_protobuf::{ChatMessage, Command, Commands, Container, MessagePreProcess, container::Payload};
+use crate::cockatiel_protobuf::container_for_engine::Payload as EnginePayload;
+use crate::cockatiel_protobuf::container_for_module::Payload as ModulePayload;
+use crate::cockatiel_protobuf::{
+    ChatMessage, Command, Commands, ContainerForEngine, ContainerForModule, MessagePreProcess,
+};
 use crate::command_registry::CommandRegistry;
 use crate::database::{DatabaseConfig, DatabaseManager};
 use crate::pipeline::{PipelineConfig, PipelineOrchestrator};
@@ -365,8 +369,8 @@ async fn help_and_apology_are_engine_handled_not_attached() {
 /// Receive one broadcast, failing fast rather than hanging forever if the
 /// message was never routed.
 async fn recv_broadcast(
-    rx: &mut tokio::sync::mpsc::Receiver<Container>,
-) -> Container {
+    rx: &mut tokio::sync::mpsc::Receiver<ContainerForModule>,
+) -> ContainerForModule {
     tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
         .await
         .expect("timed out: the message was not routed to the pre-process stage")
@@ -378,8 +382,8 @@ async fn recv_broadcast(
 async fn connect_pre_process(
     orchestrator: &PipelineOrchestrator,
     name: &str,
-) -> tokio::sync::mpsc::Receiver<Container> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Container>(8);
+) -> tokio::sync::mpsc::Receiver<ContainerForModule> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<ContainerForModule>(8);
     orchestrator
         .module_senders
         .lock()
@@ -405,13 +409,13 @@ async fn connect_pre_process(
 
 /// The adapter's inbound container: an empty `message_uuid7` is a brand new
 /// message, which is what an input-stage adapter sends.
-fn adapter_container(chat: ChatMessage) -> Container {
-    Container {
-        version: 1,
+fn adapter_container(chat: ChatMessage) -> ContainerForEngine {
+    ContainerForEngine {
+        version: 2,
         auth_token: String::new(),
         module_name: "twitch-adapter".to_string(),
         module_instance_uuid7: "0198aabb-0000-7000-8000-0000000000aa".to_string(),
-        payload: Some(Payload::MessagePreProcess(MessagePreProcess {
+        payload: Some(EnginePayload::MessagePreProcess(MessagePreProcess {
             message_uuid7: String::new(),
             raw_message: Some(chat),
             audio: Vec::new(),
@@ -453,7 +457,7 @@ async fn plain_message_reaches_a_catch_all_and_completes() {
 
     // The downstream module really did receive it.
     let broadcast = recv_broadcast(&mut rx).await;
-    let Some(Payload::MessagePreProcess(bcast)) = broadcast.payload else {
+    let Some(ModulePayload::MessagePreProcess(bcast)) = broadcast.payload else {
         panic!("expected a pre-process broadcast");
     };
     let seen = bcast.raw_message.clone().expect("broadcast carried no chat message");
@@ -464,12 +468,12 @@ async fn plain_message_reaches_a_catch_all_and_completes() {
 
     // And the message still runs the rest of the pipeline to completion.
     let uuid = bcast.message_uuid7.clone();
-    let ack = Container {
-        version: 1,
+    let ack = ContainerForEngine {
+        version: 2,
         auth_token: String::new(),
         module_name: "watcher".to_string(),
         module_instance_uuid7: "0198aabb-0000-7000-8000-0000000000dd".to_string(),
-        payload: Some(Payload::MessagePreProcess(MessagePreProcess {
+        payload: Some(EnginePayload::MessagePreProcess(MessagePreProcess {
             message_uuid7: uuid.clone(),
             raw_message: bcast.raw_message,
             audio: Vec::new(),
@@ -504,7 +508,7 @@ async fn attached_command_still_routes_with_the_command_attached() {
     assert!(orchestrator.handle_message_from_module(&adapter_container(c)).await.unwrap());
 
     let broadcast = recv_broadcast(&mut rx).await;
-    let Some(Payload::MessagePreProcess(bcast)) = broadcast.payload else {
+    let Some(ModulePayload::MessagePreProcess(bcast)) = broadcast.payload else {
         panic!("expected a pre-process broadcast");
     };
     let seen = bcast.raw_message.clone().expect("broadcast carried no chat message");
@@ -515,12 +519,12 @@ async fn attached_command_still_routes_with_the_command_attached() {
 
     // Ack it so the row completes rather than waiting on the timeout sweep.
     let uuid = bcast.message_uuid7.clone();
-    let ack = Container {
-        version: 1,
+    let ack = ContainerForEngine {
+        version: 2,
         auth_token: String::new(),
         module_name: "tts-service".to_string(),
         module_instance_uuid7: "0198aabb-0000-7000-8000-0000000000ee".to_string(),
-        payload: Some(Payload::MessagePreProcess(MessagePreProcess {
+        payload: Some(EnginePayload::MessagePreProcess(MessagePreProcess {
             message_uuid7: uuid.clone(),
             raw_message: bcast.raw_message,
             audio: Vec::new(),

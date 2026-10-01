@@ -4,7 +4,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::cockatiel_protobuf;
-use crate::cockatiel_protobuf::{Container, container::Payload, ChatMessage, Command};
+use crate::cockatiel_protobuf::{
+    container_for_engine::Payload as EnginePayload,
+    container_for_module::Payload as ModulePayload,
+    ChatMessage, Command, ContainerForEngine, ContainerForModule,
+};
 use crate::command_registry::CommandRegistry;
 use crate::database::{DatabaseManager, PipelineOutcome, PipelineResult};
 
@@ -76,9 +80,9 @@ pub(crate) enum SendOutcome {
 /// not connected too (the module is gone even if its slot lingers); a full
 /// channel that never frees up yields `Dropped`.
 pub(crate) async fn send_to_module(
-    senders: &Arc<Mutex<HashMap<String, mpsc::Sender<Container>>>>,
+    senders: &Arc<Mutex<HashMap<String, mpsc::Sender<ContainerForModule>>>>,
     module_name: &str,
-    container: Container,
+    container: ContainerForModule,
     label: &str,
 ) -> SendOutcome {
     let sender = {
@@ -504,7 +508,7 @@ pub struct PipelineOrchestrator {
     pub ack_tracker: Arc<Mutex<AckTracker>>,
     pub pipeline_states: Arc<Mutex<HashMap<String, PipelineState>>>,
     pub config: Arc<Mutex<PipelineConfig>>,
-    pub module_senders: Arc<Mutex<HashMap<String, mpsc::Sender<Container>>>>,
+    pub module_senders: Arc<Mutex<HashMap<String, mpsc::Sender<ContainerForModule>>>>,
     pub command_registry: Arc<std::sync::Mutex<CommandRegistry>>,
     /// The operator pause and the messages it is holding.
     ///
@@ -530,7 +534,7 @@ impl PipelineOrchestrator {
     pub fn new(
         db: DatabaseManager,
         config: PipelineConfig,
-        module_senders: Arc<Mutex<HashMap<String, mpsc::Sender<Container>>>>,
+        module_senders: Arc<Mutex<HashMap<String, mpsc::Sender<ContainerForModule>>>>,
         command_registry: Arc<std::sync::Mutex<CommandRegistry>>,
     ) -> Self {
         Self {
@@ -957,12 +961,11 @@ impl PipelineOrchestrator {
             None => return Ok(()),
         };
 
-        let container = Container {
-            version: 1,
+        let container = ContainerForModule {
+            version: 2,
             auth_token: String::new(),
-            module_name: "cockatiel".into(),
             module_instance_uuid7: String::new(),
-            payload: Some(Payload::MessagePreProcess(
+            payload: Some(ModulePayload::MessagePreProcess(
                 cockatiel_protobuf::MessagePreProcess {
                     message_uuid7: uuid7.to_string(),
                     raw_message: Some(ChatMessage {
@@ -1077,12 +1080,11 @@ impl PipelineOrchestrator {
 
         let module_name = &cfg.in_process_modules[state.current_in_process_index];
 
-        let container = Container {
-            version: 1,
+        let container = ContainerForModule {
+            version: 2,
             auth_token: String::new(),
-            module_name: "cockatiel".into(),
             module_instance_uuid7: String::new(),
-            payload: Some(Payload::MessageInProcess(
+            payload: Some(ModulePayload::MessageInProcess(
                 cockatiel_protobuf::MessageInProcess {
                     message_uuid7: uuid7.to_string(),
                     raw_message: Some(ChatMessage {
@@ -1220,12 +1222,11 @@ impl PipelineOrchestrator {
             (state.audio.clone(), state.audio_type.clone())
         };
 
-        let container = Container {
-            version: 1,
+        let container = ContainerForModule {
+            version: 2,
             auth_token: String::new(),
-            module_name: "cockatiel".into(),
             module_instance_uuid7: String::new(),
-            payload: Some(Payload::MessagePostProcess(
+            payload: Some(ModulePayload::MessagePostProcess(
                 cockatiel_protobuf::MessagePostProcess {
                     message_uuid7: uuid7.to_string(),
                     raw_message: Some(ChatMessage {
@@ -1628,10 +1629,10 @@ impl PipelineOrchestrator {
 
     pub async fn handle_message_from_module(
         &self,
-        container: &Container,
+        container: &ContainerForEngine,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         match &container.payload {
-            Some(Payload::MessagePreProcess(msg)) => {
+            Some(EnginePayload::MessagePreProcess(msg)) => {
                 if msg.message_uuid7.is_empty() {
                     // New message from an adapter (input) — ingest it into the
                     // pipeline with a fresh uuid7. This is the DB-as-queue entry.
@@ -1669,7 +1670,7 @@ impl PipelineOrchestrator {
                 self.handle_ack(&msg.message_uuid7, &container.module_name).await?;
                 Ok(true)
             }
-            Some(Payload::MessageInProcess(msg)) => {
+            Some(EnginePayload::MessageInProcess(msg)) => {
                 if msg.message_uuid7.is_empty() {
                     return Ok(true);
                 }
@@ -1696,7 +1697,7 @@ impl PipelineOrchestrator {
                 self.handle_ack(&msg.message_uuid7, &container.module_name).await?;
                 Ok(true)
             }
-            Some(Payload::MessagePostProcess(msg)) => {
+            Some(EnginePayload::MessagePostProcess(msg)) => {
                 if msg.message_uuid7.is_empty() {
                     return Ok(true);
                 }
@@ -1712,7 +1713,7 @@ impl PipelineOrchestrator {
                 self.handle_ack(&msg.message_uuid7, &container.module_name).await?;
                 Ok(true)
             }
-            Some(Payload::MessageAck(ack)) => {
+            Some(EnginePayload::MessageAck(ack)) => {
                 if ack.message_uuid7.is_empty() {
                     return Ok(true);
                 }

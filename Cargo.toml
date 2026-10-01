@@ -6,7 +6,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cockatiel-proto = { git = "https://github.com/vulbyte/cockatiel_proto", rev = "881c4bfd3396007127ac9196d90c304035c078ce" }
+cockatiel-proto = { git = "https://github.com/vulbyte/cockatiel_proto", rev = "99b1d37865c41d4f4796f3b02b6dd65fe5312a78" }
 tokio = { version = "1.38", features = ["full"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"

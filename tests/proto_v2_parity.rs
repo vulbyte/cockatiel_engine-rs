@@ -1,3 +1,21 @@
+//! Migration audit for the unified Cockatiel protocol spec.
+//!
+//! The old `proto_v2_parity.rs` compared the archived v1 spec against a
+//! v2 spec that no longer exists: the protocol is now ONE unified file
+//! (`cockatiel_lib/cockatiel_protobuf.proto`, package `cockatiel_protobuf`)
+//! carrying the direction-split containers, the typed query surface, the
+//! timeline read path and the user-database model together. v1 is archived and
+//! not spoken.
+//!
+//! What this test pins instead is that the unified spec is self-consistent:
+//!   * the file compiles with protoc
+//!   * the two containers exist and carry every shared payload
+//!   * direction-invalid payloads are `reserved`, so a peer cannot express a
+//!     payload addressed away from it
+//!   * both containers carry `version` (field 1) — the engine requires 2
+//!   * the pipeline stage remains the message type (no bare ChatMessage payload)
+//!   * the legacy DatabaseQuery/Result pair is still carried (Phase 2 removes it)
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -104,215 +122,56 @@ fn oneof_payloads(message_body: &str) -> BTreeMap<u32, String> {
     out
 }
 
-/// A regular (non-`oneof`) field, normalized so that cosmetic differences in the
-/// source text do not read as a wire difference.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FieldDecl {
-    /// The base type with `repeated`/`optional` stripped and `map<K, V>` reduced
-    /// to a single punctuation-only-spaced token.
-    ty: String,
-    repeated: bool,
-    optional: bool,
-}
-
-impl FieldDecl {
-    /// The comparable form of this declaration. The labels are folded back IN so
-    /// that the comparison stays strict on purpose: `repeated Flag` and a bare
-    /// `Flag` must not compare equal (a repeated field is a list, never a
-    /// singular value), and `optional string` and a bare `string` must not
-    /// compare equal either (only one of those two can be absent on the wire).
-    /// Collapsing either pair would be the exact class of bug this test exists
-    /// to catch, so the allowlist in `nested_field_parity` is the only escape.
-    fn parity_key(&self) -> String {
-        if self.repeated {
-            format!("repeated {}", self.ty)
-        } else if self.optional {
-            format!("optional {}", self.ty)
-        } else {
-            self.ty.clone()
-        }
-    }
-}
-
-/// Collapse cosmetic differences in a declared type. Only whitespace is touched
-/// — no type is ever aliased onto another, because an alias would hide exactly
-/// the break this test exists to catch: `float` is wire type fixed32 and
-/// `double` is fixed64, and a decoder silently DROPS a field whose wire type
-/// does not match rather than reporting an error.
-fn normalize_type(ty: &str) -> String {
-    let squashed = ty.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut out = String::with_capacity(squashed.len());
-    let mut after_punct = false;
-    for ch in squashed.chars() {
-        if ch == ' ' {
-            // A space inside a generic argument list is not a token boundary, so
-            // `map<string, string>` and `map<string,string>` are the same type.
-            if !after_punct && !out.is_empty() {
-                out.push(' ');
-            }
-            continue;
-        }
-        after_punct = matches!(ch, '<' | '>' | ',');
-        if after_punct {
-            while out.ends_with(' ') {
-                out.pop();
-            }
-        }
-        out.push(ch);
-    }
-    out
-}
-
-/// Parse the REGULAR (non-`oneof`, non-`reserved`) fields of a message body into
-/// field-number -> declaration.
-///
-/// The container tests only ever compared the `oneof` tag -> type mapping, which
-/// is blind to anything INSIDE a message: a `float` -> `double` swap on `Flag`
-/// fields 4/5 left every one of them green. This closes that hole.
-///
-/// How the source text is taken apart, and why:
-///   * the field NAME is the trailing identifier and the TYPE is everything
-///     before it. Splitting on the first space instead would make
-///     `map<string, string> css_properties = 1;` parse its type as `map<string,`
-///     and its name as `string>`.
-///   * the `oneof payload { ... }` region is cut out first, so its members are
-///     never mistaken for regular fields, and `reserved` lines are skipped so a
-///     tag list never parses as a field.
-///   * the `= N;` tail is stripped by splitting on the LAST `=`, and a trailing
-///     comment is cut defensively (`load` already strips comments, but this
-///     helper must not silently lose a field if that ever changes).
-fn regular_fields(message_body: &str) -> BTreeMap<u32, FieldDecl> {
-    let mut scannable = message_body.to_string();
-    if let Some(at) = scannable.find("oneof ")
-        && let Some(open) = scannable[at..].find('{').map(|n| at + n)
-    {
-        let span = 1 + body_after(&scannable, open).len();
-        scannable.replace_range(open..open + span, "");
-    }
-
-    let mut out = BTreeMap::new();
-    for line in scannable.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("reserved ") {
-            continue;
-        }
-        let Some((lhs, number)) = line.rsplit_once('=') else {
-            continue;
-        };
-        let Ok(number) = number.trim().trim_end_matches(';').trim().parse::<u32>() else {
-            continue;
-        };
-        let lhs = match lhs.find("//") {
-            Some(n) => lhs[..n].trim(),
-            None => lhs.trim(),
-        };
-        let Some(name_at) = lhs.rfind(char::is_whitespace) else {
-            continue;
-        };
-        let (mut ty, _name) = lhs.split_at(name_at);
-
-        let (mut repeated, mut optional) = (false, false);
-        loop {
-            if let Some(rest) = ty.strip_prefix("repeated ") {
-                repeated = true;
-                ty = rest.trim_start();
-            } else if let Some(rest) = ty.strip_prefix("optional ") {
-                optional = true;
-                ty = rest.trim_start();
-            } else {
-                break;
-            }
-        }
-        let ty = normalize_type(ty);
-        if ty.is_empty() {
-            continue;
-        }
-        out.insert(
-            number,
-            FieldDecl {
-                ty,
-                repeated,
-                optional,
-            },
-        );
-    }
-    out
-}
-
 fn reserved_tags(message_body: &str) -> BTreeSet<u32> {
     let mut out = BTreeSet::new();
     for line in message_body.lines() {
         let line = line.trim();
-        let Some(rest) = line.strip_prefix("reserved ") else {
-            continue;
-        };
-        for part in rest.trim_end_matches(';').split(',') {
-            let part = part.trim();
-            if let Ok(tag) = part.parse::<u32>() {
-                out.insert(tag);
+        if line.starts_with("reserved ") {
+            let rest = &line["reserved ".len()..];
+            let rest = rest.trim_end_matches(';');
+            for token in rest.split(',') {
+                if let Ok(t) = token.trim().parse::<u32>() {
+                    out.insert(t);
+                }
             }
         }
     }
     out
 }
 
-struct Protos {
-    v1_container: BTreeMap<u32, String>,
-    v1_defined: BTreeSet<String>,
-    v1_fields: BTreeMap<String, BTreeMap<u32, FieldDecl>>,
-    v2_for_module: BTreeMap<u32, String>,
-    v2_for_engine: BTreeMap<u32, String>,
-    v2_defined: BTreeSet<String>,
-    v2_reserved_for_module: BTreeSet<u32>,
-    v2_reserved_for_engine: BTreeSet<u32>,
-    v2_fields: BTreeMap<String, BTreeMap<u32, FieldDecl>>,
+struct Unified {
+    bodies: BTreeMap<String, String>,
+    for_engine: BTreeMap<u32, String>,
+    for_module: BTreeMap<u32, String>,
+    engine_reserved: BTreeSet<u32>,
+    module_reserved: BTreeSet<u32>,
 }
 
-fn load() -> Protos {
-    let v1 = strip_comments(&read_proto("cockatiel_protobuf.proto"));
-    let v2 = strip_comments(&read_proto("cockatiel_v2.proto"));
-    let v1_msgs = message_bodies(&v1);
-    let v2_msgs = message_bodies(&v2);
-    Protos {
-        v1_container: oneof_payloads(v1_msgs.get("Container").expect("v1 Container")),
-        v1_defined: v1_msgs.keys().cloned().collect(),
-        v1_fields: v1_msgs
-            .iter()
-            .map(|(name, body)| (name.clone(), regular_fields(body)))
-            .collect(),
-        v2_for_module: oneof_payloads(
-            v2_msgs
-                .get("ContainerForModule")
-                .expect("v2 ContainerForModule"),
-        ),
-        v2_for_engine: oneof_payloads(
-            v2_msgs
-                .get("ContainerForEngine")
-                .expect("v2 ContainerForEngine"),
-        ),
-        v2_defined: v2_msgs.keys().cloned().collect(),
-        v2_reserved_for_module: reserved_tags(v2_msgs.get("ContainerForModule").unwrap()),
-        v2_reserved_for_engine: reserved_tags(v2_msgs.get("ContainerForEngine").unwrap()),
-        v2_fields: v2_msgs
-            .iter()
-            .map(|(name, body)| (name.clone(), regular_fields(body)))
-            .collect(),
+fn load() -> Unified {
+    let src = strip_comments(&read_proto("cockatiel_protobuf.proto"));
+    let bodies = message_bodies(&src);
+    Unified {
+        for_engine: oneof_payloads(bodies.get("ContainerForEngine").expect("ContainerForEngine")),
+        for_module: oneof_payloads(bodies.get("ContainerForModule").expect("ContainerForModule")),
+        engine_reserved: reserved_tags(bodies.get("ContainerForEngine").expect("ContainerForEngine")),
+        module_reserved: reserved_tags(bodies.get("ContainerForModule").expect("ContainerForModule")),
+        bodies,
     }
 }
 
 #[test]
-fn v2_compiles() {
+fn the_unified_spec_compiles() {
     let out = Command::new("protoc")
         .arg("--proto_path")
         .arg(lib_dir())
         .arg("--descriptor_set_out")
-        .arg(std::env::temp_dir().join("cockatiel_v2_parity.pb"))
-        .arg(lib_dir().join("cockatiel_v2.proto"))
+        .arg(std::env::temp_dir().join("cockatiel_unified_audit.pb"))
+        .arg(lib_dir().join("cockatiel_protobuf.proto"))
         .output()
         .expect("protoc must be on PATH");
     assert!(
         out.status.success(),
-        "cockatiel_v2.proto does not compile:\n{}",
+        "cockatiel_protobuf.proto does not compile:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -321,323 +180,179 @@ fn v2_compiles() {
 fn the_parser_actually_read_the_containers() {
     let p = load();
     assert!(
-        p.v1_container.len() >= 24,
-        "v1 Container only yielded {} payloads; the parser is broken, so every \
-         parity test below would pass vacuously",
-        p.v1_container.len()
+        p.for_engine.len() >= 20,
+        "ContainerForEngine only yielded {} payloads; the parser is broken",
+        p.for_engine.len()
     );
     assert!(
-        p.v2_for_module.len() >= 15 && p.v2_for_engine.len() >= 15,
-        "v2 containers yielded {}/{} payloads; the parser is broken",
-        p.v2_for_module.len(),
-        p.v2_for_engine.len()
+        p.for_module.len() >= 20,
+        "ContainerForModule only yielded {} payloads; the parser is broken",
+        p.for_module.len()
     );
 }
 
+/// Every payload BOTH directions need is carried by both containers, and the
+/// stage messages travel engine -> module (the ack-with-result echo rides back
+/// module -> engine on the same tags).
 #[test]
-fn v2_carries_every_payload_v1_carried() {
+fn both_containers_carry_the_shared_payloads() {
     let p = load();
-    let carried: BTreeSet<&str> = p
-        .v2_for_module
-        .values()
-        .chain(p.v2_for_engine.values())
-        .map(|s| s.as_str())
-        .collect();
-    let missing: Vec<&str> = p
-        .v1_container
-        .values()
-        .map(|s| s.as_str())
-        .filter(|t| !carried.contains(t))
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "v1 carried these payloads but v2 dropped them: {missing:?}"
-    );
-}
+    let engine: BTreeSet<&str> = p.for_engine.values().map(|s| s.as_str()).collect();
+    let module: BTreeSet<&str> = p.for_module.values().map(|s| s.as_str()).collect();
 
-#[test]
-fn every_v2_payload_is_actually_defined() {
-    let p = load();
-    for tag_type in p.v2_for_module.iter().chain(p.v2_for_engine.iter()) {
-        let (tag, ty) = tag_type;
+    // Payloads that flow in BOTH directions.
+    for shared in ["Ban", "Commands", "Log", "Err", "SendToPlatforms", "Prompt", "PromptResponse"] {
         assert!(
-            p.v2_defined.contains(ty),
-            "tag {tag} carries undefined type {ty}"
+            engine.contains(shared),
+            "ContainerForEngine is missing the shared payload {shared}"
+        );
+        assert!(
+            module.contains(shared),
+            "ContainerForModule is missing the shared payload {shared}"
+        );
+    }
+
+    // The pipeline stage is the message type: all three stage messages travel
+    // engine -> module, and their ack-with-result echoes travel module -> engine.
+    for stage in ["MessagePreProcess", "MessageInProcess", "MessagePostProcess"] {
+        assert!(
+            module.contains(stage),
+            "{stage} is not engine -> module, so a message cannot advance"
+        );
+        assert!(
+            engine.contains(stage),
+            "{stage} is not module -> engine, so a module cannot ack a stage by echo"
+        );
+    }
+
+    // Event projections flow both ways (publish + relay).
+    for proj in ["PredictionUpdate", "PollUpdate", "ChannelStats"] {
+        assert!(engine.contains(proj), "{proj} is not module -> engine");
+        assert!(module.contains(proj), "{proj} is not engine -> module");
+    }
+}
+
+/// A peer cannot EXPRESS a payload addressed away from it: engine-only payloads
+/// are reserved on ContainerForEngine, module-only payloads are reserved on
+/// ContainerForModule.
+#[test]
+fn direction_invalid_payloads_are_reserved() {
+    let p = load();
+
+    // Engine -> module only: the module must not be able to send them.
+    let module_only = ["AuthNew", "ConnectionRequestReturn", "Shutdown", "TimelineEvent", "UserData"];
+    for payload in module_only {
+        assert!(
+            p.for_engine.values().all(|t| t != payload),
+            "module can express {payload} on ContainerForEngine — engine->module only"
+        );
+    }
+
+    // Module -> engine only: the engine must not offer them to a module.
+    let engine_only = ["ConnectionRequest", "Command", "MessageAck", "DatabaseQuery", "ModuleControl"];
+    for payload in engine_only {
+        assert!(
+            p.for_module.values().all(|t| t != payload),
+            "engine can express {payload} on ContainerForModule — module->engine only"
         );
     }
 }
 
-#[test]
-fn v2_never_reuses_a_v1_tag_for_a_different_type() {
-    let p = load();
-    let mut v2_all: BTreeMap<u32, &String> = BTreeMap::new();
-    for (tag, ty) in p.v2_for_module.iter().chain(p.v2_for_engine.iter()) {
-        if let Some(prev) = v2_all.insert(*tag, ty) {
-            assert_eq!(
-                prev, ty,
-                "tag {tag} means both {prev} and {ty} in v2"
-            );
-        }
-    }
-    for (tag, v1_ty) in &p.v1_container {
-        if let Some(v2_ty) = v2_all.get(tag) {
-            assert_eq!(
-                v1_ty.as_str(),
-                v2_ty.as_str(),
-                "tag {tag} was {v1_ty} in v1 but {v2_ty} in v2 - a silent wire break"
-            );
-        }
-    }
-}
-
-#[test]
-fn every_v1_tag_v2_drops_is_reserved() {
-    let p = load();
-    for (name, used, reserved) in [
-        (
-            "ContainerForModule",
-            &p.v2_for_module,
-            &p.v2_reserved_for_module,
-        ),
-        (
-            "ContainerForEngine",
-            &p.v2_for_engine,
-            &p.v2_reserved_for_engine,
-        ),
-    ] {
-        let dropped: BTreeSet<u32> = p
-            .v1_container
-            .keys()
-            .filter(|t| !used.contains_key(t))
-            .copied()
-            .collect();
-        let unreserved: Vec<u32> = dropped.difference(reserved).copied().collect();
-        assert!(
-            unreserved.is_empty(),
-            "{name} drops v1 tags {unreserved:?} without reserving them"
-        );
-    }
-}
-
+/// No container reserves a tag it also uses. A reserved tag must be genuinely
+/// absent from the oneof.
 #[test]
 fn no_container_reserves_a_tag_it_also_uses() {
     let p = load();
-    for (name, used, reserved) in [
-        (
-            "ContainerForModule",
-            &p.v2_for_module,
-            &p.v2_reserved_for_module,
-        ),
-        (
-            "ContainerForEngine",
-            &p.v2_for_engine,
-            &p.v2_reserved_for_engine,
-        ),
-    ] {
-        let clash: Vec<u32> = used.keys().filter(|t| reserved.contains(t)).copied().collect();
-        assert!(clash.is_empty(), "{name} both uses and reserves {clash:?}");
-    }
-}
-
-#[test]
-fn v2_keeps_the_pipeline_stage_as_the_message_type() {
-    let p = load();
-    let carried: BTreeSet<&str> = p
-        .v2_for_module
-        .values()
-        .chain(p.v2_for_engine.values())
-        .map(|s| s.as_str())
-        .collect();
-    for stage in [
-        "MessagePreProcess",
-        "MessageInProcess",
-        "MessagePostProcess",
-    ] {
+    let engine: BTreeSet<u32> = p.for_engine.keys().copied().collect();
+    let module: BTreeSet<u32> = p.for_module.keys().copied().collect();
+    for t in &p.engine_reserved {
         assert!(
-            carried.contains(stage),
-            "{stage} is not carried, so a message cannot advance through the pipeline"
+            !engine.contains(t),
+            "ContainerForEngine reserves tag {t} but also carries a payload on it"
         );
     }
-    assert!(
-        !carried.contains("ChatMessage"),
-        "a bare ChatMessage payload would leave the stage ambiguous; it belongs \
-         only inside the stage messages"
-    );
-}
-
-#[test]
-fn credential_rotation_is_engine_to_module_only() {
-    let p = load();
-    assert!(
-        p.v1_defined.contains("AuthNew"),
-        "sanity: v1 defines AuthNew"
-    );
-    assert!(
-        p.v2_for_module.values().any(|t| t == "AuthNew"),
-        "AuthNew must be engine -> module, or modules can never be rotated to a \\
-         new token"
-    );
-    assert!(
-        !p.v2_for_engine.values().any(|t| t == "AuthNew"),
-        "a module must not be able to ask the engine to rotate its credential"
-    );
-}
-
-/// The ONLY nested-field deviation from v1 that v2 is allowed to carry. Every
-/// other shared message must be identical in field number and in wire type.
-///
-/// `ChatMessageRejected.processed_message`: `string` -> `optional string`. This
-/// is wire-COMPATIBLE — both encode as a single length-delimited field, so a v1
-/// peer still reads the value without complaint — and only the PRESENCE
-/// semantics differ: in v1 an empty string was the only way to say "dropped", so
-/// a module that deliberately censored a message down to nothing was
-/// indistinguishable from one that dropped it. That ambiguity is the whole point
-/// of the change, so it is deliberate rather than a regression.
-///
-/// Nothing else may be added here: a second entry means a second silent wire
-/// break, which is exactly what `nested_field_parity` exists to prevent.
-const ALLOWED_NESTED_DEVIATIONS: &[(&str, u32)] = &[("ChatMessageRejected", 3)];
-
-#[test]
-fn nested_field_parity() {
-    let p = load();
-
-    let shared: Vec<&str> = p
-        .v1_fields
-        .keys()
-        .filter(|name| p.v2_fields.contains_key(*name))
-        .map(|name| name.as_str())
-        .collect();
-    assert!(
-        shared.len() >= 25,
-        "only {} messages are defined in both specs, so there is nothing to \
-         compare; the message parser is broken",
-        shared.len()
-    );
-
-    let mut mismatches = Vec::new();
-    let mut used_deviations = BTreeSet::new();
-    for name in &shared {
-        let v1_fields = &p.v1_fields[*name];
-        let v2_fields = &p.v2_fields[*name];
-        let numbers: BTreeSet<u32> = v1_fields.keys().chain(v2_fields.keys()).copied().collect();
-        for number in numbers {
-            match (v1_fields.get(&number), v2_fields.get(&number)) {
-                (Some(a), Some(b)) if a.parity_key() == b.parity_key() => {}
-                (Some(_), Some(_)) if ALLOWED_NESTED_DEVIATIONS.contains(&(*name, number)) => {
-                    used_deviations.insert((*name, number));
-                }
-                (Some(a), Some(b)) => mismatches.push(format!(
-                    "{name} field {number}: v1 declares `{}`, v2 declares `{}`. \
-                     A differing TYPE is a silent wire break (a decoder drops a \
-                     field whose wire type does not match instead of erroring), and \
-                     a differing LABEL changes presence. If this change is really \
-                     intended it must be justified in the v2 header and added to \
-                     ALLOWED_NESTED_DEVIATIONS.",
-                    a.parity_key(),
-                    b.parity_key()
-                )),
-                (Some(a), None) => mismatches.push(format!(
-                    "{name} field {number}: v1 declares `{}` and v2 dropped it, so a \
-                     v1 peer's value is discarded",
-                    a.parity_key()
-                )),
-                (None, Some(b)) => mismatches.push(format!(
-                    "{name} field {number}: v2 ADDS `{}`, which no v1 peer will ever read",
-                    b.parity_key()
-                )),
-                (None, None) => {
-                    unreachable!("field {number} was drawn from the union of both key sets")
-                }
-            }
-        }
-    }
-    assert!(
-        mismatches.is_empty(),
-        "v2 must match v1 field-for-field on every shared message except the one \
-         allowlisted presence change. These differ:\n  {}",
-        mismatches.join("\n  ")
-    );
-
-    // An allowlist entry that no longer describes a real difference is worse
-    // than no allowlist: it silently widens the blast radius the next deviation
-    // is allowed to have. Fail loudly so it gets deleted instead.
-    let stale: Vec<String> = ALLOWED_NESTED_DEVIATIONS
-        .iter()
-        .filter(|(name, number)| !used_deviations.contains(&(*name, *number)))
-        .map(|(name, number)| format!("{name} field {number}"))
-        .collect();
-    assert!(
-        stale.is_empty(),
-        "ALLOWED_NESTED_DEVIATIONS lists {stale:?}, but v1 and v2 now agree on \
-         those fields. Remove the entries - an unused allowlist entry is a hole \
-         with no one watching it"
-    );
-}
-
-/// The container tests are only as good as the parser behind them, and this repo
-/// has ALREADY shipped a parser that returned an empty map while every parity
-/// test it fed stayed green. `regular_fields` is a new parser feeding a new
-/// test, so it needs the same guard: prove it actually read the fields before
-/// trusting it to compare them.
-#[test]
-fn the_field_parser_actually_read_the_messages() {
-    let p = load();
-
-    for (label, fields) in [("v1", &p.v1_fields), ("v2", &p.v2_fields)] {
-        let total: usize = fields.values().map(BTreeMap::len).sum();
+    for t in &p.module_reserved {
         assert!(
-            total >= 130,
-            "{label} yielded only {total} nested fields across {} messages; the \
-             field parser is broken, so `nested_field_parity` would pass vacuously",
-            fields.len()
+            !module.contains(t),
+            "ContainerForModule reserves tag {t} but also carries a payload on it"
         );
     }
+}
 
-    // Exact counts for messages large and varied enough that a parser which
-    // dropped `repeated`, `map<>` or nested-message fields could not land on
-    // them by accident.
-    for (label, fields) in [("v1", &p.v1_fields), ("v2", &p.v2_fields)] {
-        for (name, expected) in [("SendToPlatforms", 9), ("Prompt", 12), ("UserData", 10)] {
-            let got = fields.get(name).map_or(0, BTreeMap::len);
-            assert_eq!(
-                got, expected,
-                "{label} {name} parsed to {got} regular fields, not {expected}; the \
-                 field parser is losing or inventing fields"
-            );
-        }
-    }
-
-    // The containers must report ONLY their header fields. If the `oneof` region
-    // leaked into the regular-field map these counts would be off by ~24 and
-    // ~18 respectively, which is the specific bug this parser is most able to
-    // make.
-    for (label, fields, name, expected) in [
-        ("v1", &p.v1_fields, "Container", 4),
-        ("v2", &p.v2_fields, "ContainerForModule", 3),
-        ("v2", &p.v2_fields, "ContainerForEngine", 4),
-    ] {
-        let got = fields.get(name).map_or(0, BTreeMap::len);
-        assert_eq!(
-            got, expected,
-            "{label} {name} reported {got} regular fields, not {expected}; the \
-             oneof members or the reserved list are being parsed as regular fields"
+/// The engine requires version 2. Both containers must declare `version` on
+/// field 1 (parity with the header field numbers).
+#[test]
+fn both_containers_declare_version() {
+    let p = load();
+    // The oneof parser only sees oneof members; check the header text directly.
+    for name in ["ContainerForEngine", "ContainerForModule"] {
+        let body = p.bodies.get(name).expect(name);
+        assert!(
+            body.contains("int32 version = 1"),
+            "{name} must declare int32 version = 1 (the engine requires 2)"
         );
     }
+}
 
-    // And a `map<,>` field must survive parsing as one field of one type, not
-    // split at the comma or dropped entirely.
-    for (label, fields) in [("v1", &p.v1_fields), ("v2", &p.v2_fields)] {
-        let template = fields
-            .get("UserStylingTemplate")
-            .and_then(|f| f.get(&1))
-            .unwrap_or_else(|| panic!("{label} UserStylingTemplate field 1 is missing"));
-        assert_eq!(
-            template.parity_key(),
-            "map<string,string>",
-            "{label} UserStylingTemplate field 1 parsed as `{}`; map<,> fields must \
-             normalize to a single type token",
-            template.parity_key()
+/// The pipeline stage stays the message type: no bare `ChatMessage` payload.
+#[test]
+fn the_pipeline_stage_is_the_message_type() {
+    let p = load();
+    let engine: BTreeSet<&str> = p.for_engine.values().map(|s| s.as_str()).collect();
+    let module: BTreeSet<&str> = p.for_module.values().map(|s| s.as_str()).collect();
+    assert!(
+        !engine.contains("ChatMessage") && !module.contains("ChatMessage"),
+        "a bare ChatMessage payload would leave the stage ambiguous; it belongs only \
+         inside the stage messages"
+    );
+}
+
+/// The legacy DatabaseQuery/Result pair is still carried during the migration
+/// (Phase 2 removes it and the engine's string-dispatch path). This test is the
+/// tripwire that gets deleted when that removal lands.
+#[test]
+fn legacy_database_query_is_still_carried_pending_phase_2() {
+    let p = load();
+    assert!(
+        p.for_engine.get(&23).map(|t| t == "DatabaseQuery").unwrap_or(false),
+        "ContainerForEngine tag 23 must carry DatabaseQuery during Phase 1"
+    );
+    assert!(
+        p.for_module.get(&24).map(|t| t == "DatabaseQueryResult").unwrap_or(false),
+        "ContainerForModule tag 24 must carry DatabaseQueryResult during Phase 1"
+    );
+}
+
+/// The new typed query surface and timeline read path are on the wire.
+#[test]
+fn the_typed_surface_is_on_the_wire() {
+    let p = load();
+    assert!(
+        p.for_engine.get(&35).map(|t| t == "QueryRequest").unwrap_or(false),
+        "ContainerForEngine tag 35 must carry QueryRequest"
+    );
+    assert!(
+        p.for_module.get(&35).map(|t| t == "QueryResponse").unwrap_or(false),
+        "ContainerForModule tag 35 must carry QueryResponse"
+    );
+    assert!(
+        p.for_engine.get(&34).map(|t| t == "TimelineQuery").unwrap_or(false),
+        "ContainerForEngine tag 34 must carry TimelineQuery"
+    );
+    assert!(
+        p.for_module.get(&34).map(|t| t == "TimelineQueryResult").unwrap_or(false),
+        "ContainerForModule tag 34 must carry TimelineQueryResult"
+    );
+}
+
+/// The user-database model + envelope live in the shared spec.
+#[test]
+fn the_user_database_lives_in_the_shared_spec() {
+    let p = load();
+    for name in ["User", "ChannelRef", "RatingHistoryEntry", "UserDbRequest", "UserDbResponse"] {
+        assert!(
+            p.bodies.contains_key(name),
+            "the unified spec is missing {name}"
         );
     }
 }

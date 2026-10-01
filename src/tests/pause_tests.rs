@@ -74,13 +74,13 @@ async fn wait_for_broadcasts(
     while seen.len() < count {
         if let Ok(container) = rx.try_recv() {
             let uuid7 = match &container.payload {
-                Some(crate::cockatiel_protobuf::container::Payload::MessagePreProcess(m)) => {
+                Some(crate::cockatiel_protobuf::container_for_module::Payload::MessagePreProcess(m)) => {
                     m.message_uuid7.clone()
                 }
-                Some(crate::cockatiel_protobuf::container::Payload::MessageInProcess(m)) => {
+                Some(crate::cockatiel_protobuf::container_for_module::Payload::MessageInProcess(m)) => {
                     m.message_uuid7.clone()
                 }
-                Some(crate::cockatiel_protobuf::container::Payload::MessagePostProcess(m)) => {
+                Some(crate::cockatiel_protobuf::container_for_module::Payload::MessagePostProcess(m)) => {
                     m.message_uuid7.clone()
                 }
                 other => panic!("expected a stage message, got {other:?}"),
