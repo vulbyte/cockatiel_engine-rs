@@ -2363,7 +2363,13 @@ let mut bytes = Vec::new();
                         let platform = if query.platform.is_empty() { None } else { Some(query.platform.as_str()) };
                         let user = if query.user_uuid7.is_empty() { None } else { Some(query.user_uuid7.as_str()) };
                         let kind = if query.kind.is_empty() { None } else { Some(query.kind.as_str()) };
+                        let raw_prefix = if query.raw_prefix.is_empty() { None } else { Some(query.raw_prefix.as_str()) };
                         let since = if query.since_ms == 0 { None } else { Some(query.since_ms) };
+                        let pipeline_status = if query.pipeline_status.is_empty() {
+                            None
+                        } else {
+                            Some(query.pipeline_status.as_str())
+                        };
                         let rows = db
                             .query_timeline(
                                 id.as_deref(),
@@ -2371,7 +2377,9 @@ let mut bytes = Vec::new();
                                 platform,
                                 user,
                                 kind,
+                                raw_prefix,
                                 since,
+                                pipeline_status,
                                 query.limit,
                                 query.offset,
                             )
@@ -2398,6 +2406,7 @@ let mut bytes = Vec::new();
                                             processed_message: row.get("processed_message").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                                             user_uuid7: row.get("user_uuid7").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                                             version: 0,
+                                            pipeline_status: row.get("pipeline_status").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                                         })
                                     })
                                     .collect();

@@ -825,7 +825,9 @@ impl DatabaseManager {
         platform: Option<&str>,
         user_uuid7: Option<&str>,
         kind: Option<&str>,
+        raw_prefix: Option<&str>,
         since_ms: Option<i64>,
+        pipeline_status: Option<&str>,
         limit: i32,
         offset: i32,
     ) -> Result<String, String> {
@@ -868,9 +870,17 @@ impl DatabaseManager {
             sql.push_str(" AND flags LIKE ?");
             args.push(Value::Text(format!("%{}%", k)));
         }
+        if let Some(prefix) = raw_prefix {
+            sql.push_str(" AND raw_message LIKE ?");
+            args.push(Value::Text(format!("{}%", prefix)));
+        }
         if let Some(ts) = since_ms {
             sql.push_str(" AND persisted_at >= ?");
             args.push(Value::Integer(ts));
+        }
+        if let Some(ps) = pipeline_status {
+            sql.push_str(" AND pipeline_status = ?");
+            args.push(Value::Text(ps.to_string()));
         }
         sql.push_str(" ORDER BY persisted_at DESC LIMIT ? OFFSET ?");
         args.push(Value::Integer(limit as i64));
