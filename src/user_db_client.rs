@@ -6,9 +6,7 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
 
-pub mod proto {
-    include!(concat!(env!("OUT_DIR"), "/cockatiel_userdb.v1.rs"));
-}
+pub use cockatiel_proto::proto;
 
 use proto::{
     user_db_request, AddChannelRequest, AddUserRequest, ChannelRef, DeleteUserRequest,
