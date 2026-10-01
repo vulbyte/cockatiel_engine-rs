@@ -283,7 +283,7 @@ pub fn ensure_secrets(state: &Arc<Mutex<ConfigState>>) -> String {
     }
 
     // 3. Generate anything still missing.
-    let pin = pin.unwrap_or_else(|| (100000 + (Uuid::new_v4().as_u128() % 900000) as u32));
+    let pin = pin.unwrap_or_else(|| 100000 + (Uuid::new_v4().as_u128() % 900000) as u32);
     let secret = secret.unwrap_or_else(|| Uuid::new_v4().to_string());
 
     // 4. Persist to `.env` (owner-only). Secrets are generated when missing;

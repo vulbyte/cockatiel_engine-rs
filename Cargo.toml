@@ -23,10 +23,5 @@ tokio-rustls = "0.26"
 rustls-pemfile = "2"
 rcgen = "0.13"
 
-prost-build = "0.13"
-
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
-
 [build-dependencies]
-prost-build = "0.13"
+prost-build = "0.14"
