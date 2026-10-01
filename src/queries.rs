@@ -526,7 +526,7 @@ pub(crate) fn route_from_op(op: WireQueryOp) -> Option<QueryRoute> {
         // handler, but the dispatcher runs them through `userdb_virtual_query`
         // on the query_id string; map the named family ops to the family.
         UserdbAddUser
-        | UserdbDeleteUser
+        | UserdbDeleteUserRecord
         | UserdbAddScore
         | UserdbRemoveScore
         | UserdbAddChannel
