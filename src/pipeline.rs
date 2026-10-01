@@ -520,30 +520,30 @@ pub struct PipelineState {
 ///
 ///  - `authority`: minimum role. 0=user (no gate), 1=mod (mod|admin|owner),
 ///    2=admin (admin|owner), 3=owner. Cascades up.
-///  - `min_rank`: the user's numeric rank must be >= this. 0 = neutral/no gate.
+///  - `min_rank`: the user's rank (0-1 float) must be >= this. 0 = no gate.
 ///  - `price`: score deducted from the user's CURRENT score when the module
 ///    receives their message. 0 = free. Lifetime `total_score` is untouched.
 ///
 /// (0, 0, 0) = free + unrestricted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModuleGate {
-    pub authority: u64,
-    pub min_rank: i64,
-    pub price: u64,
+    pub authority: u32,
+    pub min_rank: f32,
+    pub price: u32,
 }
 
 impl ModuleGate {
     /// Whether this gate lets everyone through (no authority, rank or price bar).
     pub fn is_open(&self) -> bool {
-        self.authority == 0 && self.min_rank <= 0 && self.price == 0
+        self.authority == 0 && self.min_rank <= 0.0 && self.price == 0
     }
 }
 
 /// The per-module authority tiers, aligned with the `User` role flags.
-pub const AUTHORITY_USER: u64 = 0;
-pub const AUTHORITY_MOD: u64 = 1;
-pub const AUTHORITY_ADMIN: u64 = 2;
-pub const AUTHORITY_OWNER: u64 = 3;
+pub const AUTHORITY_USER: u32 = 0;
+pub const AUTHORITY_MOD: u32 = 1;
+pub const AUTHORITY_ADMIN: u32 = 2;
+pub const AUTHORITY_OWNER: u32 = 3;
 
 #[derive(Clone)]
 pub struct PipelineOrchestrator {
@@ -656,8 +656,8 @@ impl PipelineOrchestrator {
             }
         }
 
-        // Rank gate (cheaper to reason about, no mutation).
-        if gate.min_rank > 0 && user.rank < gate.min_rank {
+        // Rank gate (cheaper to reason about, no mutation). Rank is a 0-1 float.
+        if gate.min_rank > 0.0 && user.rank < gate.min_rank {
             return false;
         }
 

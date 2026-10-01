@@ -669,7 +669,7 @@ async fn permit_module_gate_semantics() {
         let mut gates = std::collections::HashMap::new();
         gates.insert("free".to_string(), crate::pipeline::ModuleGate {
             authority: crate::pipeline::AUTHORITY_USER,
-            min_rank: 0,
+            min_rank: 0.0,
             price: 0,
         });
         orchestrator.set_module_gates(gates);
@@ -683,7 +683,7 @@ async fn permit_module_gate_semantics() {
         let mut gates = std::collections::HashMap::new();
         gates.insert("paid".to_string(), crate::pipeline::ModuleGate {
             authority: crate::pipeline::AUTHORITY_MOD,
-            min_rank: 3,
+            min_rank: 0.3,
             price: 5,
         });
         orchestrator.set_module_gates(gates);
@@ -703,7 +703,7 @@ async fn module_authority_cascades_up_and_never_down() {
     // A helper that reports the authority tier a role set passes for a gate.
     // This is a pure projection of the same logic permit_module uses, kept here
     // so the cascade rule is asserted independently of the user-db round-trip.
-    let tier = |is_owner: bool, is_admin: bool, is_moderator: bool| -> u64 {
+    let tier = |is_owner: bool, is_admin: bool, is_moderator: bool| -> u32 {
         if is_owner {
             AUTHORITY_OWNER
         } else if is_admin {
@@ -715,7 +715,7 @@ async fn module_authority_cascades_up_and_never_down() {
         }
     };
     // A gate is satisfied when the user's tier >= the gate's authority.
-    let satisfied = |gate: u64, user_tier: u64| user_tier >= gate;
+    let satisfied = |gate: u32, user_tier: u32| user_tier >= gate;
 
     // user (0) passes only an authority-0 gate.
     assert!(satisfied(AUTHORITY_USER, tier(false, false, false)));
@@ -738,8 +738,8 @@ async fn module_authority_cascades_up_and_never_down() {
     assert!(satisfied(AUTHORITY_MOD, t_owner));
 
     // And the gate struct's open-check: (0,0,0) is open, anything else isn't.
-    let open = ModuleGate { authority: AUTHORITY_USER, min_rank: 0, price: 0 };
+    let open = ModuleGate { authority: AUTHORITY_USER, min_rank: 0.0, price: 0 };
     assert!(open.is_open());
-    let closed = ModuleGate { authority: AUTHORITY_MOD, min_rank: 0, price: 0 };
+    let closed = ModuleGate { authority: AUTHORITY_MOD, min_rank: 0.0, price: 0 };
     assert!(!closed.is_open());
 }

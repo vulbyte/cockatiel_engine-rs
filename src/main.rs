@@ -56,6 +56,7 @@ mod queries;
 use queries::{QueryContext, SharedShutdown, ShutdownStage};
 
 mod user_db_client;
+mod rank_chart;
 use user_db_client::{SharedUserDbClient, UserDbClient};
 
 /* PROTOBUF STUFF */
@@ -620,31 +621,25 @@ pub async fn enrich_chat_user(
     if !name_color.is_empty() {
         css.insert("color".to_string(), name_color);
     }
-    // Rank tiers derived from the user's score (negative → lower, positive → higher).
-    let rank = if user.is_owner {
-        "owner"
+    // The numeric rank is 0-1 (numbers are for logic). The display tier NAME
+    // comes from the shared root `rank_chart.json`; platform roles still win
+    // over the mineral ladder.
+    let rank_name = if user.is_owner {
+        "owner".to_string()
     } else if user.is_admin {
-        "admin"
+        "admin".to_string()
     } else if user.is_moderator {
-        "mod"
+        "mod".to_string()
     } else if user.is_sponsor {
-        "sponsor"
-    } else if user.score >= 50 {
-        "opal"
-    } else if user.score >= 20 {
-        "gold"
-    } else if user.score >= 5 {
-        "silver"
-    } else if user.score <= -20 {
-        "trash"
-    } else if user.score <= -5 {
-        "coal"
+        "sponsor".to_string()
     } else {
-        "regular"
+        crate::rank_chart::tier_name(user.rank)
     };
-    css.insert("rank".to_string(), rank.to_string());
-    // Expose the raw score too, so displays can apply their own trust level
-    // (e.g. term-chat's `image_min_rank` can be a numeric score threshold).
+    css.insert("rank".to_string(), rank_name);
+    // Expose the numeric 0-1 rank so displays/gates can compare numbers without
+    // loading the chart (e.g. term-chat's `image_min_rank` numeric gate).
+    css.insert("rank_value".to_string(), format!("{:.6}", user.rank));
+    // Expose the raw score too, so displays can apply their own trust level.
     css.insert("score".to_string(), user.score.to_string());
     // Expose the rating counters so displays can show a reprimand indicator.
     css.insert("reprimands".to_string(), user.reprimands.to_string());

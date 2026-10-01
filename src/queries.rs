@@ -2922,7 +2922,7 @@ fn current_autostart_reads_the_live_manifest_not_the_discovery_snapshot() {
             unresponsive_timeout_secs: 0,
             probe_response_secs: 0,
             price: 0,
-            min_rank: 0,
+            min_rank: 0.0,
             authority: crate::module_manager::default_authority(),
         },
         directory: dir.clone(),

@@ -85,12 +85,13 @@ pub struct ModuleManifest {
     /// message. 0 = free. Deducted from the user's CURRENT score when the
     /// module receives their message; the lifetime `total_score` is untouched.
     #[serde(default)]
-    pub price: u64,
+    pub price: u32,
 
-    /// The minimum numeric rank a user needs (rank >= this) for the module to
-    /// run on their message. 0 = no rank requirement.
+    /// The minimum rank (0-1 float) a user needs (rank >= this) for the module
+    /// to run on their message. 0 = no rank requirement. Numbers are for
+    /// logic; tier NAMES are a display concern from the root `rank_chart.json`.
     #[serde(default)]
-    pub min_rank: i64,
+    pub min_rank: f32,
 
     /// The minimum authority (role) a user needs for the module to run on
     /// their message. Cascades UP: 0=user (no gate), 1=mod (mod|admin|owner),
@@ -99,13 +100,13 @@ pub struct ModuleManifest {
     /// (0) explicitly. This keeps the safe default (a random new module can't
     /// run for every viewer) while letting an operator open a module up.
     #[serde(default = "default_authority")]
-    pub authority: u64,
+    pub authority: u32,
 }
 
 /// The default authority for a module with no explicit `authority` field: MOD
 /// (1). New modules are mod-gated by default; existing modules explicitly set
 /// `authority: 0` (user) to stay open.
-pub fn default_authority() -> u64 {
+pub fn default_authority() -> u32 {
     1
 }
 
