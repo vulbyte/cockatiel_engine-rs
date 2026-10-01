@@ -12,7 +12,7 @@ use crate::cockatiel_protobuf::{
 use crate::command_registry::CommandRegistry;
 use crate::database::{DatabaseManager, PipelineOutcome, PipelineResult};
 
-const DEFAULT_ACK_TIMEOUT_MS: u64 = 3000;
+const DEFAULT_ACK_TIMEOUT_MS: u32 = 3000;
 
 /// How many times the engine resends a stage message whose RECEIPT ping never
 /// arrived. Past this the module is treated as dead (normal timeout path).
@@ -228,10 +228,10 @@ pub struct PendingAck {
 #[derive(Debug, Clone, Default)]
 pub struct ModuleTiming {
     /// The most recent samples, oldest first, capped at [`WINDOW`].
-    samples: Vec<f64>,
+    samples: Vec<f32>,
     /// The average of the current samples (ms). Kept so a zero-sample module
     /// still reports a definite 0 rather than a blank.
-    pub avg_ms: f64,
+    pub avg_ms: f32,
 }
 
 impl ModuleTiming {
@@ -240,14 +240,14 @@ impl ModuleTiming {
 
     /// Record one message's processing time (ms). Keeps only the last
     /// [`WINDOW`] samples and re-derives the average.
-    pub fn record(&mut self, elapsed_ms: f64) {
+    pub fn record(&mut self, elapsed_ms: f32) {
         self.samples.push(elapsed_ms);
         if self.samples.len() > Self::WINDOW {
             let overflow = self.samples.len() - Self::WINDOW;
             self.samples.drain(0..overflow);
         }
-        let sum: f64 = self.samples.iter().sum();
-        self.avg_ms = sum / self.samples.len() as f64;
+        let sum: f32 = self.samples.iter().sum();
+        self.avg_ms = sum / self.samples.len() as f32;
     }
 }
 
@@ -260,7 +260,7 @@ pub struct ModuleTimings {
 impl ModuleTimings {
     /// Record a processing time for `module_name`, creating its window on first
     /// use.
-    pub fn record(&mut self, module_name: &str, elapsed_ms: f64) {
+    pub fn record(&mut self, module_name: &str, elapsed_ms: f32) {
         self.by_module
             .entry(module_name.to_string())
             .or_default()
@@ -269,12 +269,12 @@ impl ModuleTimings {
 
     /// The current rolling average (ms) for `module_name`, or `None` if the
     /// module has not completed a message yet.
-    pub fn avg_ms(&self, module_name: &str) -> Option<f64> {
+    pub fn avg_ms(&self, module_name: &str) -> Option<f32> {
         self.by_module.get(module_name).map(|t| t.avg_ms)
     }
 
     /// Snapshot of every recorded module's current average (ms).
-    pub fn all_avgs(&self) -> HashMap<String, f64> {
+    pub fn all_avgs(&self) -> HashMap<String, f32> {
         self.by_module
             .iter()
             .map(|(n, t)| (n.clone(), t.avg_ms))
@@ -299,14 +299,14 @@ impl AckTracker {
         uuid7: String,
         stage: String,
         module_name: String,
-        timeout_ms: u64,
+        timeout_ms: u32,
     ) {
         let entry = PendingAck {
             uuid7: uuid7.clone(),
             stage,
             module_name,
             sent_at: Instant::now(),
-            timeout: Duration::from_millis(timeout_ms),
+            timeout: Duration::from_millis(timeout_ms as u64),
             receipt_received: false,
             resend_count: 0,
         };
@@ -351,12 +351,12 @@ impl AckTracker {
     /// first). Returns the stage that was acked AND the processing duration
     /// (ms since the send) — the duration is what feeds the module's rolling
     /// latency average. `None` if this module had no pending ack for the message.
-    pub fn ack_module(&mut self, uuid7: &str, module_name: &str) -> Option<(String, f64)> {
+    pub fn ack_module(&mut self, uuid7: &str, module_name: &str) -> Option<(String, f32)> {
         let now = Instant::now();
         let (stage, elapsed_ms) = {
             let entries = self.pending.get(uuid7)?;
             let entry = entries.iter().find(|e| e.module_name == module_name)?;
-            let elapsed_ms = now.duration_since(entry.sent_at).as_secs_f64() * 1000.0;
+            let elapsed_ms = now.duration_since(entry.sent_at).as_secs_f32() * 1000.0;
             (entry.stage.clone(), elapsed_ms)
         };
         if let Some(entries) = self.pending.get_mut(uuid7) {
@@ -440,7 +440,7 @@ pub struct PipelineConfig {
     pub pre_process_modules: Vec<String>,
     pub in_process_modules: Vec<String>,
     pub post_process_modules: Vec<String>,
-    pub ack_timeout_ms: u64,
+    pub ack_timeout_ms: u32,
     pub critical_modules: Vec<String>,
 }
 
@@ -663,7 +663,7 @@ impl PipelineOrchestrator {
 
         // Price gate: deduct from the current score, guarded by the user-db.
         if gate.price > 0 {
-            match user_db.deduct_score(user_uuid7, gate.price as i64).await {
+            match user_db.deduct_score(user_uuid7, gate.price as i32).await {
                 Ok(outcome) if outcome.applied => {}
                 _ => return false, // insufficient funds or user missing.
             }
@@ -1914,7 +1914,7 @@ mod timeout_sweep_tests {
     #[test]
     fn the_sweep_interval_is_far_below_the_ack_timeout() {
         let sweep = super::TIMEOUT_SWEEP_INTERVAL;
-        let ack = Duration::from_millis(DEFAULT_ACK_TIMEOUT_MS);
+        let ack = Duration::from_millis(DEFAULT_ACK_TIMEOUT_MS as u64);
         assert!(
             sweep < ack,
             "sweep {:?} must be well under the {:?} ack budget",
@@ -2100,7 +2100,7 @@ mod timing_tests {
         // 12 messages: 1..=12. The window is 8, so the average must be of
         // 5..=12 (sum 68 / 8 = 8.5), not the since-start mean.
         for i in 1..=12 {
-            t.record(i as f64);
+            t.record(i as f32);
         }
         assert_eq!(t.samples.len(), ModuleTiming::WINDOW);
         assert!((t.avg_ms - 8.5).abs() < 1e-9, "avg was {}", t.avg_ms);

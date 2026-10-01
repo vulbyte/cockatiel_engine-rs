@@ -74,12 +74,12 @@ pub struct ModuleManifest {
     /// Optional per-module dead-air threshold (seconds) before the engine
     /// probes this module. 0 = use the engine config default (30s).
     #[serde(default)]
-    pub unresponsive_timeout_secs: u64,
+    pub unresponsive_timeout_secs: u32,
 
     /// Optional per-module probe response window (seconds). 0 = use the
     /// engine config default (15s).
     #[serde(default)]
-    pub probe_response_secs: u64,
+    pub probe_response_secs: u32,
 
     /// How much score a user must spend for the module to run on their
     /// message. 0 = free. Deducted from the user's CURRENT score when the

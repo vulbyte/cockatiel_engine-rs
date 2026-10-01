@@ -30,7 +30,7 @@ use std::time::Duration;
 /// the running half too (a message must be able to be in flight BEFORE a pause
 /// lands).
 async fn orchestrator_with(
-    ack_timeout_ms: u64,
+    ack_timeout_ms: u32,
     paused: bool,
 ) -> (PipelineOrchestrator, HashMap<String, ModuleRx>) {
     let db = test_db().await;
@@ -250,7 +250,7 @@ async fn resuming_an_engine_that_is_not_paused_changes_nothing() {
 /// fails this message, which is exactly the data loss the rule forbids.
 #[tokio::test]
 async fn a_message_mid_chain_when_the_pause_lands_still_completes_after_it() {
-    const ACK_BUDGET_MS: u64 = 250;
+    const ACK_BUDGET_MS: u32 = 250;
     /// Two of these overshoot the budget more than twice over.
     const HOLD: Duration = Duration::from_millis(300);
 
@@ -485,7 +485,7 @@ fn the_recovery_drain_task_is_a_single_pass() {
         "a per-row failure must still be logged as before"
     );
     // The grace sleep is unchanged.
-    assert!(block.contains("sleep(std::time::Duration::from_secs(grace))"), "the grace sleep must stay");
+    assert!(block.contains("sleep(std::time::Duration::from_secs(grace as u64))"), "the grace sleep must stay");
 }
 
 /// Structural guard for the other half: the engine must boot through the pause

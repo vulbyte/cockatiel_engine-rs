@@ -111,7 +111,7 @@ impl UserDbClient {
         })).await
     }
 
-    pub async fn add_score(&self, uuid7: &str, delta: i64, reason: &str) -> Result<UserDbResponse, String> {
+    pub async fn add_score(&self, uuid7: &str, delta: i32, reason: &str) -> Result<UserDbResponse, String> {
         self.request(user_db_request::Op::AddScore(ScoreRequest {
             uuid7: uuid7.to_string(),
             delta,
@@ -119,7 +119,7 @@ impl UserDbClient {
         })).await
     }
 
-    pub async fn remove_score(&self, uuid7: &str, delta: i64, reason: &str) -> Result<UserDbResponse, String> {
+    pub async fn remove_score(&self, uuid7: &str, delta: i32, reason: &str) -> Result<UserDbResponse, String> {
         self.request(user_db_request::Op::RemoveScore(ScoreRequest {
             uuid7: uuid7.to_string(),
             delta,
@@ -131,7 +131,7 @@ impl UserDbClient {
     /// the commendations/reprimands counters and WITHOUT the rating cooldown.
     /// Used by the automated scorer so real configured deltas apply without
     /// corrupting the human-rating counters.
-    pub async fn adjust_score_only(&self, uuid7: &str, delta: i64, reason: &str) -> Result<UserDbResponse, String> {
+    pub async fn adjust_score_only(&self, uuid7: &str, delta: i32, reason: &str) -> Result<UserDbResponse, String> {
         self.request(user_db_request::Op::AdjustScoreOnly(ScoreRequest {
             uuid7: uuid7.to_string(),
             delta,
@@ -141,7 +141,7 @@ impl UserDbClient {
 
     /// Deduct a module price from the user's CURRENT score (guarded: refused
     /// when the user lacks the funds). The lifetime `total_score` is untouched.
-    pub async fn deduct_score(&self, uuid7: &str, amount: i64) -> Result<DeductOutcome, String> {
+    pub async fn deduct_score(&self, uuid7: &str, amount: i32) -> Result<DeductOutcome, String> {
         let resp = self
             .request(user_db_request::Op::DeductScore(crate::user_db_client::proto::DeductScoreRequest {
                 uuid7: uuid7.to_string(),

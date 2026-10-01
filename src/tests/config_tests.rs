@@ -17,7 +17,7 @@ fn temp_state(dir: &std::path::Path, content: &str) -> (Arc<Mutex<ConfigState>>,
     let config: Config = serde_json::from_str(content).unwrap();
     let state = Arc::new(Mutex::new(ConfigState {
         path: path.clone(),
-        last_size: content.len() as u64,
+        last_size: content.len() as u32,
         config,
         pin: 0,
         jwt_secret: String::new(),
@@ -277,7 +277,7 @@ fn refresh_config_picks_up_a_same_size_rewrite_the_size_gate_would_miss() {
     let config: Config = serde_json::from_str(original).unwrap();
     let state = Arc::new(Mutex::new(ConfigState {
         path: path.clone(),
-        last_size: original.len() as u64,
+        last_size: original.len() as u32,
         config,
         pin: 0,
         jwt_secret: String::new(),

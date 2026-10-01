@@ -745,7 +745,7 @@ impl DatabaseManager {
 
     pub async fn get_unsynced_count(
         &self,
-    ) -> Result<i64, Box<dyn std::error::Error>> {
+    ) -> Result<i32, Box<dyn std::error::Error>> {
         let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
@@ -756,7 +756,7 @@ impl DatabaseManager {
 
         if let Some(row) = rows.next().await? {
             let count: i64 = row.get(0)?;
-            Ok(count)
+            Ok(count as i32)
         } else {
             Ok(0)
         }
@@ -1002,7 +1002,7 @@ impl DatabaseManager {
     /// It is NOT the crash-recovery path any more. A message that was mid-flight
     /// when the engine died is still 'queued' and is replayed to completion by
     /// `get_queued_uuids` + `recover_one`, which now claims rows in memory.
-    pub async fn mark_all_processing_as_failed(&self, reason: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    pub async fn mark_all_processing_as_failed(&self, reason: &str) -> Result<u32, Box<dyn std::error::Error>> {
         let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
@@ -1011,7 +1011,7 @@ impl DatabaseManager {
             turso::params![reason],
         ).await?;
 
-        Ok(result as u64)
+        Ok(result as u32)
     }
 
     /// Load a queued row's content by uuid7, if it is still `pipeline_status =
@@ -1086,7 +1086,7 @@ impl DatabaseManager {
     /// and SQLite's type rules mean a BLOB param never equals a TEXT column.
     /// Re-write those rows as BLOB so all byte-keyed queries (status updates,
     /// stage completion, recovery) work on them. Returns rows normalized.
-    pub async fn normalize_uuid_storage(&self) -> Result<u64, Box<dyn std::error::Error>> {
+    pub async fn normalize_uuid_storage(&self) -> Result<u32, Box<dyn std::error::Error>> {
         let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
@@ -1102,7 +1102,7 @@ impl DatabaseManager {
             }
         }
 
-        let mut normalized = 0u64;
+        let mut normalized = 0u32;
         for u in text_uuids {
             // Match the TEXT row by string; set the same bytes as a BLOB.
             conn.execute(
@@ -1250,7 +1250,7 @@ impl DatabaseManager {
     /// held (no concurrent writes) so the snapshot is authoritative and the
     /// backup file stays portable/inspectable. Returns 1 on success, 0 when no
     /// backup is configured.
-    pub async fn sync_to_remote(&self) -> Result<u64, Box<dyn std::error::Error>> {
+    pub async fn sync_to_remote(&self) -> Result<u32, Box<dyn std::error::Error>> {
         let Some(bp) = self.config.remote_url.as_deref() else {
             return Ok(0);
         };

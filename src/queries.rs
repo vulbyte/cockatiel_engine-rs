@@ -983,7 +983,7 @@ async fn dispatch(
             let payload: serde_json::Value =
                 serde_json::from_str(sql).unwrap_or(serde_json::json!({}));
             let batch_uuid = payload.get("batch_uuid").and_then(|v| v.as_str()).unwrap_or("test");
-            let mut inserted = 0u64;
+            let mut inserted = 0u32;
             let mut error = String::new();
             if let Some(entries) = payload.get("entries").and_then(|v| v.as_array()) {
                 for e in entries {
@@ -1019,7 +1019,7 @@ async fn dispatch(
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
             let five_min_ago = now_ms - (5 * 60 * 1000);
-            let bucket_ms = 10_000i64;
+            let bucket_ms = 10_000i32;
 
             let mut out = serde_json::Map::new();
 
@@ -1256,13 +1256,13 @@ async fn userdb_virtual_query(
         }
         "userdb_add_score" => {
             let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let delta = payload.get("delta").and_then(|v| v.as_i64()).unwrap_or(1);
+            let delta = payload.get("delta").and_then(|v| v.as_i64()).map(|d| d as i32).unwrap_or(1);
             let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
             client.add_score(uuid7, delta, reason).await
         }
         "userdb_remove_score" => {
             let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let delta = payload.get("delta").and_then(|v| v.as_i64()).unwrap_or(1);
+            let delta = payload.get("delta").and_then(|v| v.as_i64()).map(|d| d as i32).unwrap_or(1);
             let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
             client.remove_score(uuid7, delta, reason).await
         }
@@ -1399,7 +1399,7 @@ async fn userdb_adjust_score_virtual_query(
         Err(e) => return (false, Vec::new(), format!("Invalid userdb_adjust_score payload: {}", e)),
     };
 
-    let delta = payload.get("delta").and_then(|v| v.as_i64()).unwrap_or(0);
+    let delta = payload.get("delta").and_then(|v| v.as_i64()).map(|d| d as i32).unwrap_or(0);
     let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("userdb_adjust_score");
 
     // Resolve the target user: prefer an explicit uuid7, else by (platform, handle).
@@ -1978,14 +1978,14 @@ async fn handle_test_probe(
     };
     let sent_at = now_ms();
     let mut responded = false;
-    let mut latency = 0i64;
+    let mut latency = 0i32;
     for _ in 0..200 {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         if let Some((_, la)) = auth_store.find_by_module(&module)
             && la > last_activity
         {
             responded = true;
-            latency = now_ms().saturating_sub(sent_at);
+            latency = now_ms().saturating_sub(sent_at) as i32;
             break;
         }
     }
@@ -2479,7 +2479,7 @@ mod tests {
         let config: Config = serde_json::from_str(&content).unwrap();
         Arc::new(Mutex::new(ConfigState {
             path,
-            last_size: content.len() as u64,
+            last_size: content.len() as u32,
             config,
             pin: 0,
             jwt_secret: String::new(),
@@ -2574,7 +2574,7 @@ mod tests {
         );
         let config_state = Arc::new(Mutex::new(ConfigState {
             path,
-            last_size: content.len() as u64,
+            last_size: content.len() as u32,
             config,
             pin: 0,
             jwt_secret: String::new(),

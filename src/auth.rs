@@ -37,7 +37,7 @@ pub struct AuthSession {
     /// Unique id of the socket currently bound to this session. A reconnect
     /// claims the session under a NEW socket; the old socket's disconnect
     /// cleanup then sees a mismatched token and must NOT evict the session.
-    pub socket_token: u64,
+    pub socket_token: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -48,7 +48,7 @@ pub struct TokenClaims {
     pub exp: i64,
 }
 
-const TOKEN_TTL_SECS: i64 = 30 * 24 * 60 * 60; // 30 days
+const TOKEN_TTL_SECS: i32 = 30 * 24 * 60 * 60; // 30 days
 
 #[derive(Clone)]
 pub struct AuthStore {
@@ -132,7 +132,7 @@ impl AuthStore {
     /// Bind a session to a NEW socket after a reconnect: mark it live again and
     /// stamp it with the new socket's token so the old socket's cleanup can't
     /// evict it. No-op if the session no longer exists (handled by the caller).
-    pub fn claim_socket(&self, instance_uuid7: &str, socket_token: u64, now_ms: i64) {
+    pub fn claim_socket(&self, instance_uuid7: &str, socket_token: u32, now_ms: i64) {
         let mut sessions = self.sessions.lock().unwrap();
         if let Some(session) = sessions.get_mut(instance_uuid7) {
             session.socket_token = socket_token;
@@ -147,7 +147,7 @@ impl AuthStore {
     /// Remove the session ONLY if it is still bound to the given socket. Used
     /// by a disconnecting socket so it can't evict a session a reconnect took
     /// over. Returns whether the session was removed.
-    pub fn remove_if_socket(&self, instance_uuid7: &str, socket_token: u64) -> bool {
+    pub fn remove_if_socket(&self, instance_uuid7: &str, socket_token: u32) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         if sessions
             .get(instance_uuid7)
@@ -162,7 +162,7 @@ impl AuthStore {
     }
 
     /// Mark shutdown ONLY if the session is still bound to the given socket.
-    pub fn set_shutdown_if_socket(&self, instance_uuid7: &str, timestamp: i64, socket_token: u64) {
+    pub fn set_shutdown_if_socket(&self, instance_uuid7: &str, timestamp: i64, socket_token: u32) {
         let mut sessions = self.sessions.lock().unwrap();
         if let Some(session) = sessions.get_mut(instance_uuid7) {
             if session.socket_token == socket_token {
@@ -236,7 +236,7 @@ pub fn generate_auth_token(secret: &str, instance_uuid7: &str, module_name: &str
         sub: instance_uuid7.to_string(),
         name: module_name.to_string(),
         iat: now,
-        exp: now + TOKEN_TTL_SECS,
+        exp: now + i64::from(TOKEN_TTL_SECS),
     };
 
     encode(

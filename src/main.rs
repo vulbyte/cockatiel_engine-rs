@@ -8,7 +8,7 @@ use std::{
     env, fs,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, Ordering},
         Arc, Mutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -86,7 +86,7 @@ pub(crate) type SharedPromptRoutes = Arc<Mutex<HashMap<String, PromptSink>>>;
 pub(crate) struct ChannelStatsEntry {
     pub platform: String,
     pub channel: String,
-    pub viewers: i64,
+    pub viewers: i32,
     pub is_live: bool,
     pub title: String,
     pub updated_at: i64,
@@ -212,8 +212,8 @@ impl EngineState {
 struct EngineBounds {
     max_message_bytes: usize,
     max_connections: usize,
-    handshake_timeout_secs: u64,
-    send_timeout_secs: u64,
+    handshake_timeout_secs: u32,
+    send_timeout_secs: u32,
 }
 
 pub fn log_event(state: &Arc<Mutex<EngineState>>, text: impl Into<String>) {
@@ -1093,7 +1093,7 @@ cockatiel
 
     let (config_string, config_path) = verify_config().await?;
     let config: Config = serde_json::from_str(&config_string)?;
-    let config_size = fs::metadata(&config_path)?.len();
+    let config_size = fs::metadata(&config_path)?.len() as u32;
     let config_state = Arc::new(Mutex::new(ConfigState {
         path: config_path,
         last_size: config_size,
@@ -1460,7 +1460,7 @@ cockatiel
         let ui_state = ui_state.clone();
         let grace = config::get_config(&config_state).recovery_grace_secs;
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(grace)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(grace as u64)).await;
             match orchestrator.drain_queued_once().await {
                 Ok(drain) => {
                     for (uuid, error) in drain.failures {
@@ -1628,7 +1628,7 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
             // completes it must not squat a task (and a connection slot)
             // forever.
             match tokio::time::timeout(
-                Duration::from_secs(bounds.handshake_timeout_secs),
+Duration::from_secs(bounds.handshake_timeout_secs as u64),
                 tls_acceptor.accept(stream),
             )
             .await
@@ -1704,7 +1704,7 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
 /// Monotonic id identifying the socket a session is currently bound to. A
 /// reconnect claims a session under a new id; a stale socket's cleanup can
 /// then detect it no longer owns the session and must not evict it.
-static NEXT_SOCKET_TOKEN: AtomicU64 = AtomicU64::new(1);
+static NEXT_SOCKET_TOKEN: AtomicU32 = AtomicU32::new(1);
 
 /// Send a WebSocket message with a bounded wait so a wedged socket can't stall
 /// the connection task indefinitely. A timeout (or a send error) is treated as
@@ -1712,12 +1712,12 @@ static NEXT_SOCKET_TOKEN: AtomicU64 = AtomicU64::new(1);
 async fn bounded_ws_send<S>(
     websocket: &mut WebSocketStream<S>,
     msg: WsMessage,
-    timeout_secs: u64,
+    timeout_secs: u32,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    match tokio::time::timeout(Duration::from_secs(timeout_secs), websocket.send(msg)).await {
+    match tokio::time::timeout(Duration::from_secs(timeout_secs as u64), websocket.send(msg)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e.into()),
         Err(_) => Err("outbound WebSocket send timed out".into()),
@@ -1767,7 +1767,7 @@ where
     // Bound the wait for the first message: a client that connects (TLS done)
     // but never speaks must not squat the connection task (or a slot) forever.
     let first_msg = match tokio::time::timeout(
-        Duration::from_secs(bounds.handshake_timeout_secs),
+        Duration::from_secs(bounds.handshake_timeout_secs as u64),
         websocket.next(),
     )
     .await

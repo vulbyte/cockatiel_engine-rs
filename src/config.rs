@@ -32,12 +32,12 @@ pub struct Config {
     /// Dead-air threshold (seconds) before the engine probes a module with an
     /// AuthVerify. Defaults to 30.
     #[serde(default = "default_probe_interval_secs")]
-    pub module_probe_interval_secs: u64,
+    pub module_probe_interval_secs: u32,
 
     /// How long (seconds) a module has to answer a probe before it is
     /// declared unresponsive. Defaults to 15.
     #[serde(default = "default_probe_response_secs")]
-    pub module_probe_response_secs: u64,
+    pub module_probe_response_secs: u32,
 
     /// Headless module-approval policy: "auto-deny" (default) or "auto-allow".
     #[serde(default = "default_approval_policy")]
@@ -55,17 +55,17 @@ pub struct Config {
     /// Seconds a connection has to complete its TLS handshake and send its
     /// first (ConnectionRequest) message before it is dropped. Defaults to 10.
     #[serde(default = "default_handshake_timeout_secs")]
-    pub handshake_timeout_secs: u64,
+    pub handshake_timeout_secs: u32,
 
     /// Seconds a WebSocket outbound send may block before it is treated as a
     /// send failure. Defaults to 5.
     #[serde(default = "default_send_timeout_secs")]
-    pub send_timeout_secs: u64,
+    pub send_timeout_secs: u32,
 
     /// Seconds the engine waits after startup before draining stranded
     /// 'queued' messages from the timeline DB. Defaults to 10.
     #[serde(default = "default_recovery_grace_secs")]
-    pub recovery_grace_secs: u64,
+    pub recovery_grace_secs: u32,
 
     /// Whether the engine starts with the message pipeline PAUSED. When true
     /// (the default) the engine ingests, persists and parses commands normally
@@ -94,7 +94,7 @@ pub struct Config {
     pub prediction_creator_role: String,
 }
 
-fn default_probe_interval_secs() -> u64 {
+fn default_probe_interval_secs() -> u32 {
     30
 }
 
@@ -102,7 +102,7 @@ fn default_timeline_target_mb() -> u32 {
     50
 }
 
-fn default_probe_response_secs() -> u64 {
+fn default_probe_response_secs() -> u32 {
     15
 }
 
@@ -118,15 +118,15 @@ fn default_max_connections() -> usize {
     128
 }
 
-fn default_handshake_timeout_secs() -> u64 {
+fn default_handshake_timeout_secs() -> u32 {
     10
 }
 
-fn default_send_timeout_secs() -> u64 {
+fn default_send_timeout_secs() -> u32 {
     5
 }
 
-fn default_recovery_grace_secs() -> u64 {
+fn default_recovery_grace_secs() -> u32 {
     10
 }
 
@@ -180,7 +180,7 @@ pub fn resolve_start_paused(config: &Config, env_value: Option<&str>) -> bool {
 
 pub struct ConfigState {
     pub path: PathBuf,
-    pub last_size: u64,
+    pub last_size: u32,
     pub config: Config,
     /// Connection PIN (secret) — lives in `.env`, not config.json.
     pub pin: u32,
@@ -465,7 +465,7 @@ pub fn get_config(state: &Arc<Mutex<ConfigState>>) -> Config {
     let mut state = state.lock().unwrap();
 
     if let Ok(metadata) = fs::metadata(&state.path) {
-        let size = metadata.len();
+        let size = metadata.len() as u32;
 
         if size != state.last_size {
             if let Ok(content) = fs::read_to_string(&state.path) {
@@ -490,7 +490,7 @@ pub fn get_config(state: &Arc<Mutex<ConfigState>>) -> Config {
 /// not be silently ignored, so the poll calls this before reading.
 pub fn refresh_config(state: &Arc<Mutex<ConfigState>>) {
     let mut state = state.lock().unwrap();
-    state.last_size = u64::MAX;
+    state.last_size = u32::MAX;
 }
 
 pub async fn verify_config() -> Result<(String, PathBuf), Box<dyn std::error::Error>> {
@@ -538,7 +538,7 @@ where
     if let Ok(serialized) = serde_json::to_string_pretty(&state.config) {
         if write_atomic(&state.path, &serialized).is_ok() {
             if let Ok(metadata) = fs::metadata(&state.path) {
-                state.last_size = metadata.len();
+                state.last_size = metadata.len() as u32;
             }
         }
     }
