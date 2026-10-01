@@ -68,7 +68,6 @@ use cockatiel_protobuf::{
     TimelineQueryResult,
 };
 
-mod engine_module;
 
 /// Where a PromptResponse should be routed. The engine's own prompts (module
 /// connection approval) wait on a oneshot; prompts originating from a module

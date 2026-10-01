@@ -16,11 +16,6 @@
 //!   Extracted from the chain so the branch set can be asserted, not eyeballed.
 //! * [`caller_gate`] — the pure authorisation decision, (op, caller) -> denial.
 //!   Extracted from the chain's inline `if !is_control_surface(..)` guards.
-//!
-//! Neither the proto [`QueryOp`] enum nor anything else in `engine_module` is
-//! on the wire path yet; rewiring the dispatcher onto the proto is a later
-//! workstream. [`QueryRoute::op`] exists only so the branch-coverage test can
-//! name the operations in the engine's own vocabulary.
 
 #![allow(clippy::type_complexity)]
 
@@ -43,7 +38,6 @@ use crate::credentials::{
     credential_values_map, is_config_complete, save_module_credentials, validate_credential_fields,
 };
 use crate::database::DatabaseManager;
-use crate::engine_module::proto::QueryOp;
 use crate::module_manager::ModuleRegistry;
 use crate::module_registry::ModuleRegistryPersistence;
 use crate::pipeline::{PipelineOrchestrator, SendOutcome};
@@ -256,44 +250,6 @@ pub(crate) enum QueryRoute {
     Unsupported,
 }
 
-impl QueryRoute {
-    /// The engine-owned proto operation this route answers, or
-    /// [`QueryOp::Unspecified`] for the two prefix families — the proto names
-    /// their members individually, so there is no single op for "whatever
-    /// `mod_*` this is". Wiring the dispatcher onto these opcodes is the later
-    /// workstream; this mapping exists so the branch set can be asserted
-    /// against the engine's own vocabulary.
-    // Live code today only in the branch-coverage test; it earns its keep when
-    // the dispatcher is rewired onto the proto opcodes.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn op(self) -> QueryOp {
-        match self {
-            QueryRoute::DbStatus => QueryOp::DbStatus,
-            QueryRoute::ModuleList => QueryOp::ModuleList,
-            QueryRoute::EngineInfo => QueryOp::EngineInfo,
-            QueryRoute::PipelineSetPaused => QueryOp::PipelineSetPaused,
-            QueryRoute::EngineShutdown => QueryOp::EngineShutdown,
-            QueryRoute::TestRun => QueryOp::TestRun,
-            QueryRoute::TestProbe => QueryOp::TestProbe,
-            QueryRoute::AuditList => QueryOp::AuditList,
-            QueryRoute::AuditApprove => QueryOp::AuditApprove,
-            QueryRoute::AuditReject => QueryOp::AuditReject,
-            QueryRoute::ModFamily => QueryOp::Unspecified,
-            QueryRoute::ChatCommend => QueryOp::ChatCommend,
-            QueryRoute::ChatReprimand => QueryOp::ChatReprimand,
-            QueryRoute::ChatVerifyIdentity => QueryOp::ChatVerifyIdentity,
-            QueryRoute::UserdbAdjustScore => QueryOp::UserdbAdjustScore,
-            QueryRoute::PredictionGetScore => QueryOp::PredictionGetScore,
-            QueryRoute::ChannelViewers => QueryOp::ChannelViewers,
-            QueryRoute::UserdbFamily => QueryOp::Unspecified,
-            QueryRoute::SetCredentials => QueryOp::SetCredentials,
-            QueryRoute::AudioForMessage => QueryOp::AudioForMessage,
-            QueryRoute::TestArchive => QueryOp::TestArchive,
-            QueryRoute::Stats => QueryOp::Unspecified,
-            QueryRoute::Unsupported => QueryOp::Unspecified,
-        }
-    }
-}
 
 /// The routing decision, split out of the dispatch chain so the branch set is
 /// assertable.
@@ -2448,41 +2404,6 @@ mod tests {
         assert_eq!(classify_query("userdbx"), QueryRoute::Unsupported);
         assert_eq!(classify_query("modules_list"), QueryRoute::Unsupported);
         assert_eq!(classify_query("set_credential"), QueryRoute::Unsupported);
-    }
-
-    #[test]
-    fn routes_map_onto_the_engine_owned_proto_operations() {
-        // The proto enum was built to mirror these branches 1:1, so this is
-        // the mapping the later rewiring workstream will assert on. Both
-        // prefix families report Unspecified: the proto names their members
-        // individually, and there is no single op for "whatever mod_* this is".
-        let expected: &[(QueryRoute, QueryOp)] = &[
-            (QueryRoute::DbStatus, QueryOp::DbStatus),
-            (QueryRoute::ModuleList, QueryOp::ModuleList),
-            (QueryRoute::EngineInfo, QueryOp::EngineInfo),
-            (QueryRoute::PipelineSetPaused, QueryOp::PipelineSetPaused),
-            (QueryRoute::EngineShutdown, QueryOp::EngineShutdown),
-            (QueryRoute::TestRun, QueryOp::TestRun),
-            (QueryRoute::TestProbe, QueryOp::TestProbe),
-            (QueryRoute::AuditList, QueryOp::AuditList),
-            (QueryRoute::AuditApprove, QueryOp::AuditApprove),
-            (QueryRoute::AuditReject, QueryOp::AuditReject),
-            (QueryRoute::ModFamily, QueryOp::Unspecified),
-            (QueryRoute::ChatCommend, QueryOp::ChatCommend),
-            (QueryRoute::ChatReprimand, QueryOp::ChatReprimand),
-            (QueryRoute::ChatVerifyIdentity, QueryOp::ChatVerifyIdentity),
-            (QueryRoute::UserdbAdjustScore, QueryOp::UserdbAdjustScore),
-            (QueryRoute::PredictionGetScore, QueryOp::PredictionGetScore),
-            (QueryRoute::UserdbFamily, QueryOp::Unspecified),
-            (QueryRoute::SetCredentials, QueryOp::SetCredentials),
-            (QueryRoute::AudioForMessage, QueryOp::AudioForMessage),
-            (QueryRoute::TestArchive, QueryOp::TestArchive),
-            (QueryRoute::Stats, QueryOp::Unspecified),
-            (QueryRoute::Unsupported, QueryOp::Unspecified),
-        ];
-        for (route, op) in expected {
-            assert_eq!(route.op(), *op, "route {route:?} should map to {op:?}");
-        }
     }
 
     #[test]
