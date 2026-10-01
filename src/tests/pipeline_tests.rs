@@ -495,6 +495,8 @@ async fn a_critical_module_timeout_lands_a_failed_outcome_with_its_error() {
             module_name: "mid".into(),
             sent_at: Instant::now() - Duration::from_secs(30),
             timeout: Duration::from_millis(1),
+            receipt_received: true,
+            resend_count: 0,
         }],
     );
     orchestrator.handle_timeout().await.unwrap();
@@ -512,6 +514,80 @@ async fn a_critical_module_timeout_lands_a_failed_outcome_with_its_error() {
         r["in_process_completed_at"].is_null() && r["post_process_completed_at"].is_null() && r["persisted_at"].is_null(),
         "a failed message must not claim it was persisted"
     );
+}
+
+/// A module that never sent its receipt ping gets the stage message RESENT
+/// (up to the cap) instead of being treated as dead — the receipt distinguishes
+/// "didn't get it" from "got it but hasn't finished".
+#[tokio::test]
+async fn a_receipt_less_module_is_resent_not_advanced() {
+    let db = test_db().await;
+    let (orchestrator, mut rx) = wired_orchestrator(db.clone(), &["pre"], &[], &[]);
+
+    orchestrator
+        .handle_message_from_module(&adapter_ingest("raw text"))
+        .await
+        .unwrap();
+    let uuid7 = take_broadcast(rx.get_mut("pre").unwrap());
+
+    // 'pre' never sends a receipt and never returns a result. Inject an expired
+    // pending entry with receipt_received=false, like a message whose budget
+    // lapsed while the module was silent.
+    orchestrator.ack_tracker.lock().await.inject(
+        uuid7.clone(),
+        vec![PendingAck {
+            uuid7: uuid7.clone(),
+            stage: "pre_process".into(),
+            module_name: "pre".into(),
+            sent_at: Instant::now() - Duration::from_secs(30),
+            timeout: Duration::from_millis(1),
+            receipt_received: false,
+            resend_count: 0,
+        }],
+    );
+    orchestrator.handle_timeout().await.unwrap();
+
+    // The message is still in flight, and the module got a fresh broadcast
+    // (the resend). Nothing has been marked failed/complete.
+    assert_eq!(take_broadcast(rx.get_mut("pre").unwrap()), uuid7, "the stage must be resent");
+    assert!(
+        orchestrator.ack_tracker.lock().await.has_pending(&uuid7),
+        "the message stays pending across the resend"
+    );
+
+    // The module now sends its receipt, then its result → the stage advances.
+    orchestrator
+        .handle_message_from_module(&ack_container("pre", &uuid7))
+        .await
+        .unwrap();
+    assert!(
+        orchestrator.ack_tracker.lock().await.has_pending(&uuid7),
+        "a receipt alone must not advance the stage"
+    );
+    orchestrator
+        .handle_message_from_module(&pre_reply("pre", &uuid7, "done"))
+        .await
+        .unwrap();
+    assert!(!orchestrator.ack_tracker.lock().await.has_pending(&uuid7));
+
+    let r = row(&db, &uuid7).await;
+    assert_eq!(r["pipeline_status"], "complete");
+    assert_eq!(r["processed_message"], "done");
+}
+
+/// Build a pure receipt ping (`MessageAck`) from a module for a message.
+fn ack_container(module: &str, uuid7: &str) -> ContainerForEngine {
+    ContainerForEngine {
+        version: 2,
+        auth_token: String::new(),
+        module_name: module.to_string(),
+        module_instance_uuid7: String::new(),
+        payload: Some(EnginePayload::MessageAck(
+            crate::cockatiel_protobuf::MessageAck {
+                message_uuid7: uuid7.to_string(),
+            },
+        )),
+    }
 }
 
 /// The claim check the database used to do. A row in flight is 'queued' now

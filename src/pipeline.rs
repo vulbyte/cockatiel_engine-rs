@@ -14,6 +14,10 @@ use crate::database::{DatabaseManager, PipelineOutcome, PipelineResult};
 
 const DEFAULT_ACK_TIMEOUT_MS: u64 = 3000;
 
+/// How many times the engine resends a stage message whose RECEIPT ping never
+/// arrived. Past this the module is treated as dead (normal timeout path).
+const MAX_ACK_RESENDS: u32 = 3;
+
 /// Decide which modules receive a message, based on command routing.
 ///
 /// A message with a parsed command goes ONLY to the owning module + any
@@ -202,6 +206,15 @@ pub struct PendingAck {
     pub module_name: String,
     pub sent_at: Instant,
     pub timeout: Duration,
+    /// Whether the module sent its receipt ping (`MessageAck`) for this
+    /// message. A receipt confirms delivery; the RESULT (the stage-echo) is
+    /// what clears the pending entry. When the receipt never arrives within
+    /// the window, the engine RESENDS the stage message.
+    pub receipt_received: bool,
+    /// How many times this stage message has been resent because the receipt
+    /// never arrived. Capped so a genuinely dead module cannot be resent
+    /// forever — past the cap it takes the normal timeout path.
+    pub resend_count: u32,
 }
 
 /// A module's rolling per-message processing latency.
@@ -294,9 +307,39 @@ impl AckTracker {
             module_name,
             sent_at: Instant::now(),
             timeout: Duration::from_millis(timeout_ms),
+            receipt_received: false,
+            resend_count: 0,
         };
 
         self.pending.entry(uuid7).or_default().push(entry);
+    }
+
+    /// Mark that `module_name` sent its receipt ping for `uuid7`. A receipt
+    /// confirms DELIVERY only — the pending entry stays until the result
+    /// (stage-echo) arrives. Idempotent: a second receipt is a no-op.
+    pub fn mark_receipt(&mut self, uuid7: &str, module_name: &str) {
+        if let Some(entries) = self.pending.get_mut(uuid7) {
+            if let Some(entry) = entries.iter_mut().find(|e| e.module_name == module_name) {
+                entry.receipt_received = true;
+            }
+        }
+    }
+
+    /// Re-track a stage message after the engine resent it because the receipt
+    /// never arrived. `check_timeouts` DRAINS the expired entry out of `pending`,
+    /// so this re-adds a fresh one carrying the incremented resend count (the
+    /// resend keeps the message in flight with a full budget).
+    pub fn re_track(&mut self, entry: &PendingAck) {
+        let fresh = PendingAck {
+            uuid7: entry.uuid7.clone(),
+            stage: entry.stage.clone(),
+            module_name: entry.module_name.clone(),
+            sent_at: Instant::now(),
+            timeout: entry.timeout,
+            receipt_received: false,
+            resend_count: entry.resend_count + 1,
+        };
+        self.pending.entry(entry.uuid7.clone()).or_default().push(fresh);
     }
 
     pub fn ack(&mut self, uuid7: &str) -> Vec<PendingAck> {
@@ -1511,6 +1554,108 @@ impl PipelineOrchestrator {
         Ok(())
     }
 
+/// Resend a stage message whose receipt ping never arrived. Returns:
+    /// `Ok(true)` = resent + clock restarted, `Ok(false)` = the module isn't
+    /// connected (nothing to resend to), `Err` = rebuild/send failure.
+    async fn resend_stage(&self, entry: &PendingAck) -> Result<bool, Box<dyn std::error::Error>> {
+        let state = {
+            let states = self.pipeline_states.lock().await;
+            states.get(&entry.uuid7).cloned()
+        };
+        let Some(state) = state else {
+            // The message is gone (already completed/failed) — nothing to resend.
+            return Ok(false);
+        };
+
+        let container = match entry.stage.as_str() {
+            "pre_process" => ContainerForModule {
+                version: 2,
+                auth_token: String::new(),
+                module_instance_uuid7: String::new(),
+                payload: Some(ModulePayload::MessagePreProcess(
+                    cockatiel_protobuf::MessagePreProcess {
+                        message_uuid7: entry.uuid7.clone(),
+                        raw_message: Some(ChatMessage {
+                            platform: state.platform.clone(),
+                            raw_data: vec![],
+                            raw_message: state.raw_message.clone(),
+                            user_uuid7: state.user_uuid7.clone(),
+                            command: state.parsed_command.clone(),
+                            channel_id: state.channel_id.clone(),
+                            user_data: state.user_data.clone(),
+                        }),
+                        audio: Vec::new(),
+                        audio_type: String::new(),
+                    },
+                )),
+            },
+            "in_process" => ContainerForModule {
+                version: 2,
+                auth_token: String::new(),
+                module_instance_uuid7: String::new(),
+                payload: Some(ModulePayload::MessageInProcess(
+                    cockatiel_protobuf::MessageInProcess {
+                        message_uuid7: entry.uuid7.clone(),
+                        raw_message: Some(ChatMessage {
+                            platform: state.platform.clone(),
+                            raw_data: vec![],
+                            raw_message: state.raw_message.clone(),
+                            user_uuid7: state.user_uuid7.clone(),
+                            command: state.parsed_command.clone(),
+                            channel_id: state.channel_id.clone(),
+                            user_data: state.user_data.clone(),
+                        }),
+                        processed_message: state.processed_message.clone(),
+                        abandon_message: false,
+                        audio: Vec::new(),
+                        audio_type: String::new(),
+                    },
+                )),
+            },
+            "post_process" => ContainerForModule {
+                version: 2,
+                auth_token: String::new(),
+                module_instance_uuid7: String::new(),
+                payload: Some(ModulePayload::MessagePostProcess(
+                    cockatiel_protobuf::MessagePostProcess {
+                        message_uuid7: entry.uuid7.clone(),
+                        raw_message: Some(ChatMessage {
+                            platform: state.platform.clone(),
+                            raw_data: vec![],
+                            raw_message: state.raw_message.clone(),
+                            user_uuid7: state.user_uuid7.clone(),
+                            command: state.parsed_command.clone(),
+                            channel_id: state.channel_id.clone(),
+                            user_data: state.user_data.clone(),
+                        }),
+                        processed_message: state.processed_message.clone(),
+                        audio: Vec::new(),
+                        audio_type: String::new(),
+                    },
+                )),
+            },
+            _ => return Ok(false),
+        };
+
+        let outcome = send_to_module(
+            &self.module_senders,
+            &entry.module_name,
+            container,
+            entry.stage.as_str(),
+        )
+        .await;
+        match outcome {
+            SendOutcome::Sent => {
+                self.ack_tracker
+                    .lock()
+                    .await
+                    .re_track(entry);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub async fn handle_timeout(
         &self,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1534,6 +1679,30 @@ impl PipelineOrchestrator {
         };
 
         for entry in timed_out {
+            // RECEIPT RESEND: the module never confirmed it received the stage
+            // message. Resend it (capped) rather than assuming the module is
+            // dead — a lost frame on a busy adapter is common, and the receipt
+            // ping exists precisely so the engine can distinguish "didn't get
+            // it" from "got it but hasn't finished". The result path (stage-echo)
+            // is untouched: a module that DID send its receipt but is slow on
+            // the result still takes the normal timeout below.
+            if !entry.receipt_received && entry.resend_count < MAX_ACK_RESENDS {
+                match self.resend_stage(&entry).await {
+                    Ok(true) => continue,
+                    Ok(false) => {
+                        // Resend could not be queued (module disconnected) —
+                        // fall through to the normal timeout path.
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[pipeline] resend to '{}' for stage '{}' failed: {}",
+                            entry.module_name, entry.stage, e
+                        );
+                        continue;
+                    }
+                }
+            }
+
             let is_critical = cfg.critical_modules.contains(&entry.module_name);
             // Name the stalling module: a stage waits for EVERY one of its
             // modules, so one silent module turns every message into a timeout
@@ -1717,7 +1886,15 @@ impl PipelineOrchestrator {
                 if ack.message_uuid7.is_empty() {
                     return Ok(true);
                 }
-                self.handle_ack(&ack.message_uuid7, &container.module_name).await?;
+                // Receipt ping: the module confirms it RECEIVED the stage
+                // message. This does NOT advance the pipeline — the result
+                // (the stage-echo carrying the same message_uuid7) does. A
+                // receipt lets the engine stop resending and wait for the
+                // result instead.
+                self.ack_tracker
+                    .lock()
+                    .await
+                    .mark_receipt(&ack.message_uuid7, &container.module_name);
                 Ok(true)
             }
             _ => Ok(false),
@@ -1767,6 +1944,8 @@ mod timeout_sweep_tests {
                     module_name: "slow".into(),
                     sent_at: Instant::now() - Duration::from_secs(10),
                     timeout: Duration::from_millis(1),
+                    receipt_received: false,
+                    resend_count: 0,
                 },
                 PendingAck {
                     uuid7: "uuid-1".into(),
@@ -1774,6 +1953,8 @@ mod timeout_sweep_tests {
                     module_name: "live".into(),
                     sent_at: Instant::now(),
                     timeout: Duration::from_secs(30),
+                    receipt_received: true,
+                    resend_count: 0,
                 },
             ],
         );
@@ -1823,6 +2004,8 @@ mod timeout_sweep_tests {
             // Ten minutes ago — a pause, not a slow module.
             sent_at: Instant::now() - Duration::from_secs(600),
             timeout: Duration::from_secs(3),
+            receipt_received: true,
+            resend_count: 0,
         };
 
         // Without the rebase, the ten minutes are charged to the module.
