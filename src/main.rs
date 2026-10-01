@@ -2488,7 +2488,53 @@ let mut bytes = Vec::new();
                             shutdown.mark_answered();
                         }
                     }
-Some(EnginePayload::SendToPlatforms(send)) => {
+Some(EnginePayload::QueryRequest(req)) => {
+                        // The typed Phase-2 query surface: dispatch by QueryOp
+                        // and reply with a QueryResponse (not the legacy
+                        // DatabaseQueryResult envelope).
+                        let ctx = QueryContext {
+                            db: &db,
+                            auth_store: &auth_store,
+                            orchestrator: &orchestrator,
+                            ui_state: &ui_state,
+                            user_db_client: &user_db_client,
+                            config_state: &config_state,
+                            module_registry: &module_registry,
+                            discovered_registry: &discovered_registry,
+                            prompt_routes: &prompt_routes,
+                            channel_stats: &channel_stats,
+                            module_name: &module_name,
+                            instance_uuid7: &instance_uuid7,
+                            tx: &tx,
+                            shutdown: &shutdown,
+                            peer_loopback,
+                        };
+                        let outcome =
+                            queries::handle_query_request(&ctx, &req).await;
+                        let reply = ContainerForModule {
+                            version: 2,
+                            auth_token: container.auth_token.clone(),
+                            module_instance_uuid7: container.module_instance_uuid7.clone(),
+                            payload: Some(ModulePayload::QueryResponse(
+                                cockatiel_protobuf::QueryResponse {
+                                    request_id: req.request_id.clone(),
+                                    operation: req.operation,
+                                    success: outcome.success,
+                                    error: outcome.error,
+                                    result: Some(cockatiel_protobuf::QueryResult {
+                                        result_blob: outcome.result_blob,
+                                    }),
+                                },
+                            )),
+                        };
+                        let mut buf = Vec::new();
+                        if reply.encode(&mut buf).is_ok() {
+                            if let Err(e) = bounded_ws_send(&mut websocket, WsMessage::Binary(buf), bounds.send_timeout_secs).await {
+                                log_event_broadcast(&ui_state, format!("QueryResponse send failed: {}", e));
+                            }
+                        }
+                    }
+                    Some(EnginePayload::SendToPlatforms(send)) => {
                         // The actor (the human who triggered the send) must be
                         // verified against the user DB before anything routes.
                         let actor_lookup = if !send.actor_uuid7.is_empty() {

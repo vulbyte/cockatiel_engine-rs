@@ -36,7 +36,7 @@ use uuid::Uuid;
 use crate::auth::AuthStore;
 use crate::cockatiel_protobuf::{
     AuthVerify, ChatMessage, ContainerForModule, DatabaseQueryResult, Log, MessagePreProcess,
-    Prompt, Shutdown, container_for_module::Payload,
+    Prompt, QueryOp as WireQueryOp, QueryParams, Shutdown, container_for_module::Payload,
 };
 use crate::config::{Config, ConfigState, get_config};
 use crate::credentials::{
@@ -248,8 +248,12 @@ pub(crate) enum QueryRoute {
     SetCredentials,
     AudioForMessage,
     TestArchive,
-    /// The final `else`: the read-only SQL escape hatch.
-    ReadOnlySql,
+    /// One-shot timeline aggregates (total messages / users / commands,
+    /// platform counts and errors, recent chart buckets). Control surface.
+    Stats,
+    /// Any query the engine does not name. Denied outright — there is no raw
+    /// SQL fallback.
+    Unsupported,
 }
 
 impl QueryRoute {
@@ -285,7 +289,8 @@ impl QueryRoute {
             QueryRoute::SetCredentials => QueryOp::SetCredentials,
             QueryRoute::AudioForMessage => QueryOp::AudioForMessage,
             QueryRoute::TestArchive => QueryOp::TestArchive,
-            QueryRoute::ReadOnlySql => QueryOp::SelectSql,
+            QueryRoute::Stats => QueryOp::Unspecified,
+            QueryRoute::Unsupported => QueryOp::Unspecified,
         }
     }
 }
@@ -335,7 +340,11 @@ pub(crate) fn classify_query(query_id: &str) -> QueryRoute {
         "set_credentials" => QueryRoute::SetCredentials,
         "audio_for_message" => QueryRoute::AudioForMessage,
         "test_archive" => QueryRoute::TestArchive,
-        _ => QueryRoute::ReadOnlySql,
+        "stats" => QueryRoute::Stats,
+        // No raw-SQL escape hatch: a module that asks for something the engine
+        // does not name is denied, never handed arbitrary SQL. Phase 2 removed
+        // the ReadOnlySql fallback.
+        _ => QueryRoute::Unsupported,
     }
 }
 
@@ -396,6 +405,12 @@ pub(crate) fn caller_gate(route: QueryRoute, caller: &str) -> Option<&'static st
         QueryRoute::TestArchive => {
             (!is_test_runner(caller)).then_some("test_archive access denied: not the test runner")
         }
+        QueryRoute::Stats => {
+            (!is_control_surface(caller)).then_some("stats access denied: not the control surface")
+        }
+        // There is no raw-SQL escape hatch and no unknown-query path: a query
+        // the engine does not name is denied outright.
+        QueryRoute::Unsupported => Some("query denied: no such operation"),
         QueryRoute::DbStatus
         | QueryRoute::ModuleList
         | QueryRoute::EngineInfo
@@ -404,8 +419,7 @@ pub(crate) fn caller_gate(route: QueryRoute, caller: &str) -> Option<&'static st
         | QueryRoute::ChatReprimand
         | QueryRoute::ChatVerifyIdentity
         | QueryRoute::AudioForMessage
-        | QueryRoute::ChannelViewers
-        | QueryRoute::ReadOnlySql => None,
+        | QueryRoute::ChannelViewers => None,
     }
 }
 
@@ -524,6 +538,90 @@ pub(crate) async fn handle_query(
         return QueryOutcome::denied(denial);
     }
     dispatch(ctx, route, query_id, sql).await
+}
+
+/// Map a wire `QueryOp` to the route it answers. `None` for an operation the
+/// dispatcher has no branch for (or `Unspecified`).
+pub(crate) fn route_from_op(op: WireQueryOp) -> Option<QueryRoute> {
+    use WireQueryOp::*;
+    Some(match op {
+        DbStatus => QueryRoute::DbStatus,
+        ModuleList => QueryRoute::ModuleList,
+        EngineInfo => QueryRoute::EngineInfo,
+        PipelineSetPaused => QueryRoute::PipelineSetPaused,
+        EngineShutdown => QueryRoute::EngineShutdown,
+        TestRun => QueryRoute::TestRun,
+        TestProbe => QueryRoute::TestProbe,
+        AuditList => QueryRoute::AuditList,
+        AuditApprove => QueryRoute::AuditApprove,
+        AuditReject => QueryRoute::AuditReject,
+        ModCommend | ModReprimand | ModBan | ModTimeout => QueryRoute::ModFamily,
+        ChatCommend => QueryRoute::ChatCommend,
+        ChatReprimand => QueryRoute::ChatReprimand,
+        ChatVerifyIdentity => QueryRoute::ChatVerifyIdentity,
+        UserdbAdjustScore => QueryRoute::UserdbAdjustScore,
+        PredictionGetScore => QueryRoute::PredictionGetScore,
+        ChannelViewers => QueryRoute::ChannelViewers,
+        SetCredentials => QueryRoute::SetCredentials,
+        AudioForMessage => QueryRoute::AudioForMessage,
+        TestArchive => QueryRoute::TestArchive,
+        Stats => QueryRoute::Stats,
+        // The userdb family needs the exact operation name to pick the right
+        // handler, but the dispatcher runs them through `userdb_virtual_query`
+        // on the query_id string; map the named family ops to the family.
+        UserdbAddUser
+        | UserdbDeleteUser
+        | UserdbAddScore
+        | UserdbRemoveScore
+        | UserdbAddChannel
+        | UserdbRemoveChannel
+        | UserdbGetUser
+        | UserdbListUsers
+        | UserdbUpdateFlags
+        | UserdbSetRoles
+        | UserdbReadUserValue
+        | UserdbWriteUserValue
+        | UserdbDeleteUserValue
+        | UserdbListUserValues
+        | UserdbCommendation
+        | UserdbReprimand
+        | UserdbBan
+        | UserdbTimeout => QueryRoute::UserdbFamily,
+        // Timeline reads use the dedicated TimelineQuery payload, not this op.
+        TimelineRead => return None,
+        // There is no raw-SQL operation on the wire surface at all.
+        Unspecified => return None,
+    })
+}
+
+/// Build the `sql` string a dispatch branch parses, from a `QueryRequest`'s
+/// params. For the ops that still carry a JSON blob (the `mod_*`/`userdb_*`
+/// families, set_credentials, pipeline pause, test_archive) that blob is the
+/// `params.json` escape; the rest ignore params entirely.
+fn sql_from_params(params: Option<&QueryParams>) -> String {
+    params
+        .map(|p| p.json.clone())
+        .unwrap_or_default()
+}
+
+/// Answer one typed `QueryRequest` (the Phase-2 wire surface) and return the
+/// outcome. The connection loop ships it back as a `QueryResponse`.
+pub(crate) async fn handle_query_request(
+    ctx: &QueryContext<'_>,
+    req: &crate::cockatiel_protobuf::QueryRequest,
+) -> QueryOutcome {
+    let op = WireQueryOp::try_from(req.operation).unwrap_or(WireQueryOp::Unspecified);
+    let Some(route) = route_from_op(op) else {
+        return QueryOutcome::denied("query denied: no such operation");
+    };
+    if let Some(denial) = caller_gate(route, ctx.module_name) {
+        return QueryOutcome::denied(denial);
+    }
+    // For the ops that still parse a JSON blob, the params ride in `json`;
+    // everything else ignores params. The query_id is derived from the op so
+    // the branch internals that key off the string keep working.
+    let query_id = op.as_str_name().to_ascii_lowercase();
+    dispatch(ctx, route, &query_id, &sql_from_params(req.params.as_ref())).await
 }
 
 /// The body of each branch, reached only once [`caller_gate`] has admitted the
@@ -956,24 +1054,88 @@ async fn dispatch(
                 QueryOutcome::denied(format!("test_archive failed after {} inserts: {}", inserted, error))
             }
         }
-        QueryRoute::ReadOnlySql => {
-            // Regular database query — hard read-only boundary.
-            // Only SELECT/EXPLAIN may run; any write must
-            // go through the engine's own methods or a
-            // dedicated virtual query.
-            if is_read_only_sql(sql) {
-                match guarded_execute_query(db, sql).await {
-                    Ok(json) => QueryOutcome::success(json.into_bytes()),
-                    Err(e) => {
-                        let msg = format!("{}", e);
-                        log_event_broadcast(ui_state, format!("[{}] Query error: {}", module_name, msg));
-                        QueryOutcome::denied(msg)
-                    }
-                }
-            } else {
-                QueryOutcome::denied("Denied: only read-only SQL (SELECT/EXPLAIN) is allowed via DatabaseQuery — use a dedicated virtual query for writes")
+        QueryRoute::Stats => {
+            // One-shot timeline aggregates for the control surface (the TUI
+            // used to fire six raw-SQL stats queries every poll). Computed
+            // engine-internally — a module can never reach this SQL.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let five_min_ago = now_ms - (5 * 60 * 1000);
+            let bucket_ms = 10_000i64;
+
+            let mut out = serde_json::Map::new();
+
+            let total_messages = db
+                .execute_query(
+                    "SELECT COUNT(*) AS n FROM timeline_events WHERE pipeline_status != 'audit'",
+                )
+                .await
+                .ok()
+                .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok());
+            if let Some(v) = total_messages {
+                out.insert("total_messages".into(), v[0]["n"].clone());
             }
+            let total_users = db
+                .execute_query(
+                    "SELECT COUNT(DISTINCT user_uuid7) AS n FROM timeline_events WHERE user_uuid7 != '' AND user_uuid7 IS NOT NULL AND pipeline_status != 'audit'",
+                )
+                .await
+                .ok()
+                .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok());
+            if let Some(v) = total_users {
+                out.insert("total_users".into(), v[0]["n"].clone());
+            }
+            let total_commands = db
+                .execute_query(
+                    "SELECT COUNT(*) AS n FROM timeline_events WHERE command != '' AND command IS NOT NULL AND pipeline_status != 'audit'",
+                )
+                .await
+                .ok()
+                .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok());
+            if let Some(v) = total_commands {
+                out.insert("total_commands".into(), v[0]["n"].clone());
+            }
+            let platform_counts = db
+                .execute_query(
+                    "SELECT platform, COUNT(*) AS n FROM timeline_events WHERE pipeline_status != 'audit' GROUP BY platform",
+                )
+                .await
+                .ok()
+                .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok());
+            if let Some(v) = platform_counts {
+                out.insert("platform_counts".into(), v);
+            }
+            let platform_errors = db
+                .execute_query(
+                    "SELECT platform, COUNT(*) AS n FROM timeline_events WHERE pipeline_status = 'failed' GROUP BY platform",
+                )
+                .await
+                .ok()
+                .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok());
+            if let Some(v) = platform_errors {
+                out.insert("platform_errors".into(), v);
+            }
+            let chart_data = db
+                .execute_query(&format!(
+                    "SELECT (persisted_at / {bucket}) * {bucket} AS bucket, platform, COUNT(*) AS n FROM timeline_events WHERE persisted_at > {since} AND pipeline_status != 'audit' GROUP BY bucket, platform ORDER BY bucket ASC",
+                    bucket = bucket_ms,
+                    since = five_min_ago,
+                ))
+                .await
+                .ok()
+                .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok());
+            if let Some(v) = chart_data {
+                out.insert("chart_data".into(), v);
+            }
+
+            QueryOutcome::success(serde_json::to_string(&out).unwrap_or_default().into_bytes())
         }
+        // There is no raw-SQL escape hatch: a query the engine does not name is
+        // denied outright (this route is unreachable past the caller_gate, which
+        // denies Unsupported, but it exists so the match is exhaustive).
+        QueryRoute::Unsupported => QueryOutcome::denied("query denied: no such operation"),
     }
 }
 
@@ -1768,146 +1930,6 @@ fn module_position_from_config(config: &Config, name: &str) -> Option<String> {
     }
 }
 
-/// Read-only SQL boundary for the `DatabaseQuery` fallback. Strips leading
-/// whitespace and `--`/`/* */` comment lines, then requires the statement to
-/// begin with SELECT / EXPLAIN. Any other statement (INSERT, UPDATE, DELETE,
-/// DROP, ALTER, CREATE, PRAGMA, WITH, ...) is denied — modules can only read
-/// the timeline, never write to it through arbitrary SQL. A `WITH` block is not
-/// allowed up front because a `WITH x AS (...) INSERT/DELETE/...` CTE can smuggle
-/// a write through; as defense-in-depth the whole statement is also tokenized
-/// and rejected if any write keyword appears anywhere in it.
-pub(crate) fn is_read_only_sql(sql: &str) -> bool {
-    let mut s = sql.trim_start();
-    loop {
-        if let Some(rest) = s.strip_prefix("--") {
-            // Skip the whole comment line (not just the `--`).
-            s = match rest.find('\n') {
-                Some(end) => rest[end + 1..].trim_start(),
-                None => return false,
-            };
-            continue;
-        }
-        if let Some(rest) = s.strip_prefix("/*") {
-            match rest.find("*/") {
-                Some(end) => s = rest[end + 2..].trim_start(),
-                None => return false,
-            }
-            continue;
-        }
-        break;
-    }
-    // Leading keyword.
-    let mut kw = String::new();
-    for c in s.chars() {
-        if c.is_ascii_alphabetic() {
-            kw.push(c);
-        } else {
-            break;
-        }
-    }
-    // Reject multi-statement injection: a `;` outside string literals means a
-    // second statement (e.g. `SELECT 1; DROP TABLE …`) — never let it through.
-    let mut in_string = false;
-    let mut quote = ' ';
-    for c in s.chars() {
-        if in_string {
-            if c == quote {
-                in_string = false;
-            }
-            continue;
-        }
-        match c {
-            '\'' | '"' => {
-                in_string = true;
-                quote = c;
-            }
-            ';' => return false,
-            _ => {}
-        }
-    }
-    if !matches!(kw.to_ascii_uppercase().as_str(), "SELECT" | "EXPLAIN") {
-        return false;
-    }
-    // Defense-in-depth: a write keyword ANYWHERE in the statement is fatal
-    // (catches CTE-smuggled writes and anything the leading-keyword gate
-    // missed). Tokenize on any non-alphanumeric char and compare lowercased.
-    // Tokens inside a string literal are SKIPPED so a query like
-    // `WHERE name = 'delete'` isn't a false positive — the literal is data,
-    // not a statement.
-    const WRITE_TOKENS: &[&str] = &[
-        "insert",
-        "update",
-        "delete",
-        "replace",
-        "alter",
-        "drop",
-        "attach",
-        "vacuum",
-        "pragma",
-        "create",
-    ];
-    let mut in_string = false;
-    let mut quote = ' ';
-    let mut token = String::new();
-    for c in s.chars() {
-        if in_string {
-            if c == quote {
-                in_string = false;
-            }
-            continue;
-        }
-        match c {
-            '\'' | '"' => {
-                in_string = true;
-                quote = c;
-            }
-            c if c.is_ascii_alphanumeric() => token.push(c),
-            _ => {
-                if WRITE_TOKENS.contains(&token.to_ascii_lowercase().as_str()) {
-                    return false;
-                }
-                token.clear();
-            }
-        }
-    }
-    if WRITE_TOKENS.contains(&token.to_ascii_lowercase().as_str()) {
-        return false;
-    }
-    true
-}
-
-/// Run a module-supplied SQL query in a contained task so a turso/Limbo
-/// "not yet implemented" panic (e.g. `EXISTS`/subqueries the translator can't
-/// build) surfaces as a query error instead of killing the connection task.
-/// The engine's timeline DB uses the turso/Limbo driver, which panics on
-/// some SQL constructs — the read-only boundary protects writes, this protects
-/// the process from a panic.
-async fn guarded_execute_query(
-    db: &DatabaseManager,
-    sql: &str,
-) -> Result<String, String> {
-    let sql = sql.to_string();
-    let db = db.clone();
-    let spawn_db = db.clone();
-    let query_fut = async move { spawn_db.execute_query(&sql).await };
-    // Bound the query: a hung (not panicking) turso call must not block the
-    // calling module's read loop forever (a wedged read loop can't answer the
-    // engine's own AuthVerify probe and gets killed).
-    match tokio::time::timeout(Duration::from_secs(10), tokio::spawn(query_fut)).await {
-        Ok(Ok(Ok(json))) => Ok(json),
-        Ok(Ok(Err(e))) => Err(format!("{}", e)),
-        Ok(Err(join)) => {
-            // A panicking query poisons the turso connection — reopen a fresh
-            // one so the timeline DB stays usable.
-            let reopened = db.reopen_local().await;
-            match reopened {
-                Ok(()) => Err(format!("query panicked (unsupported SQL?); database reopened: {}", join)),
-                Err(re) => Err(format!("query panicked ({}); reopen failed: {}", join, re)),
-            }
-        }
-        Err(_) => Err("query timed out after 10s".to_string()),
-    }
-}
 
 /// Build a ContainerForModule payload of the requested probe type. `payload_json`
 /// carries optional fields (e.g. a log line, a SQL string). Unknown types
@@ -2184,10 +2206,14 @@ mod tests {
             ("chat_commend", NORMAL, true),
             ("chat_reprimand", NORMAL, true),
             ("chat_verify_identity", NORMAL, true),
-            // ── The read-only SQL fallback: open to any module, restricted by
-            // `is_read_only_sql` rather than by caller.
-            ("SELECT * FROM timeline_events", NORMAL, true),
-            ("", NORMAL, true),
+            // ── There is NO raw-SQL fallback: a query the engine doesn't name
+            // is denied for every caller.
+            ("SELECT * FROM timeline_events", NORMAL, false),
+            ("SELECT * FROM timeline_events", TUI, false),
+            ("", NORMAL, false),
+            // ── stats: the control surface only.
+            ("stats", TUI, true),
+            ("stats", NORMAL, false),
         ];
 
         for (query_id, caller, admitted) in matrix {
@@ -2351,6 +2377,8 @@ mod tests {
         ("userdb_timeout", QueryRoute::UserdbFamily),
         // Predictions read surface.
         ("prediction_get_score", QueryRoute::PredictionGetScore),
+        // One-shot timeline aggregates (control surface).
+        ("stats", QueryRoute::Stats),
     ];
 
     #[test]
@@ -2363,13 +2391,13 @@ mod tests {
     #[test]
     fn the_dispatcher_recognises_exactly_the_operations_it_used_to() {
         // Every route in the enum is reachable, and nothing extra answers: an
-        // unrecognised query_id is still the read-only SQL fallback, not a
-        // silent success.
+        // unrecognised query_id is denied (Unsupported) — there is no read-only
+        // SQL fallback anymore (Phase 2 removed it).
         //
         // The bare prefixes belong to their families — `mod_` and `userdb_` are
         // prefix matches, so they route to the family handler (which refuses
-        // them) rather than to the SQL fallback. That is the original's
-        // behaviour and it is why the families are modelled explicitly.
+        // them) rather than to the deny. That is the original's behaviour and
+        // it is why the families are modelled explicitly.
         let falls_through = ["", "nonsense", "chat_", "audit_", "set_credential", "userdbx"];
         let mut reachable: Vec<QueryRoute> = RECOGNISED.iter().map(|(_, r)| *r).collect();
         reachable.extend(falls_through.iter().map(|q| classify_query(q)));
@@ -2396,7 +2424,8 @@ mod tests {
             QueryRoute::SetCredentials,
             QueryRoute::AudioForMessage,
             QueryRoute::TestArchive,
-            QueryRoute::ReadOnlySql,
+            QueryRoute::Stats,
+            QueryRoute::Unsupported,
             QueryRoute::PredictionGetScore,
         ] {
             assert!(
@@ -2405,22 +2434,20 @@ mod tests {
             );
         }
 
-        // Unrecognised ids fall through to the read-only SQL path, exactly as
-        // the original `else` did. They are NOT rejected. Note the near-misses
-        // deliberately do NOT: the families claim their prefixes first.
+        // Unrecognised ids are denied — no raw-SQL fallback remains.
         for unknown in falls_through {
             assert_eq!(
                 classify_query(unknown),
-                QueryRoute::ReadOnlySql,
-                "unknown query_id {unknown:?} should fall through to read-only SQL"
+                QueryRoute::Unsupported,
+                "unknown query_id {unknown:?} must be denied, not executed"
             );
         }
         assert_eq!(classify_query("mod_"), QueryRoute::ModFamily);
         assert_eq!(classify_query("userdb_"), QueryRoute::UserdbFamily);
         // A prefix that merely looks similar is not claimed by a family.
-        assert_eq!(classify_query("userdbx"), QueryRoute::ReadOnlySql);
-        assert_eq!(classify_query("modules_list"), QueryRoute::ReadOnlySql);
-        assert_eq!(classify_query("set_credential"), QueryRoute::ReadOnlySql);
+        assert_eq!(classify_query("userdbx"), QueryRoute::Unsupported);
+        assert_eq!(classify_query("modules_list"), QueryRoute::Unsupported);
+        assert_eq!(classify_query("set_credential"), QueryRoute::Unsupported);
     }
 
     #[test]
@@ -2450,7 +2477,8 @@ mod tests {
             (QueryRoute::SetCredentials, QueryOp::SetCredentials),
             (QueryRoute::AudioForMessage, QueryOp::AudioForMessage),
             (QueryRoute::TestArchive, QueryOp::TestArchive),
-            (QueryRoute::ReadOnlySql, QueryOp::SelectSql),
+            (QueryRoute::Stats, QueryOp::Unspecified),
+            (QueryRoute::Unsupported, QueryOp::Unspecified),
         ];
         for (route, op) in expected {
             assert_eq!(route.op(), *op, "route {route:?} should map to {op:?}");
