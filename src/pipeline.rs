@@ -1290,20 +1290,28 @@ impl PipelineOrchestrator {
 
         let cfg = self.config_snapshot().await;
 
-        // Command routing: a post-process module only receives messages for the
-        // commands it registered (plus catch-alls receive everything). A module
-        // that registered specific commands it didn't get is skipped.
-        let targets = {
+        // Command routing: a message that carries a parsed command only reaches
+        // the post-process modules that own it (plus catch-alls). A message with
+        // NO command goes to EVERY configured post-process module — display
+        // modules (term-chat, audit-viewer) never register commands and must
+        // see every chat message, which is the whole point of a display. So the
+        // narrowing only applies when a command is actually attached.
+        let recipients: Vec<String> = {
             let registry = self.command_registry.lock().unwrap();
-            command_recipients(state.parsed_command.as_ref(), &registry, &cfg.post_process_modules)
-        };
-        let recipients: Vec<&String> = match &targets {
-            Some(list) => list.iter().collect(),
-            None => cfg.post_process_modules.iter().collect(),
+            if state.parsed_command.is_some() {
+                command_recipients(state.parsed_command.as_ref(), &registry, &cfg.post_process_modules)
+                    .unwrap_or_default()
+            } else {
+                // No command: every configured post-process module is a display
+                // and receives the message. (This is what makes term-chat work —
+                // it is invisible to the command registry, so the catch-all-only
+                // path would skip it for every plain chat message.)
+                cfg.post_process_modules.clone()
+            }
         };
 
         let mut sent_any = false;
-        for module_name in recipients {
+        for module_name in &recipients {
             // Cost gate: skip THIS post-process module if the user can't afford
             // its price / meet its min_rank (skip-that-module semantics).
             if !self.permit_module(&state.user_uuid7, module_name).await {

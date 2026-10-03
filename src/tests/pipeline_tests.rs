@@ -743,3 +743,61 @@ async fn module_authority_cascades_up_and_never_down() {
     let closed = ModuleGate { authority: AUTHORITY_MOD, min_rank: 0.0, price: 0 };
     assert!(!closed.is_open());
 }
+
+/// A post-process DISPLAY module (term-chat, audit-viewer) never registers
+/// commands — it is invisible to the command registry. A plain chat message
+/// (no command) must still reach it: the post-process stage sends to EVERY
+/// configured module when no command is attached, so displays see all chat.
+/// This is what makes term-chat work.
+#[tokio::test]
+async fn a_plain_message_reaches_a_non_catchall_post_process_module() {
+    let db = test_db().await;
+    let (orchestrator, mut rx) = wired_orchestrator(db.clone(), &["pre"], &["mid"], &["display"]);
+    // Make "display" NOT a catch-all: give it a specific command. Before the
+    // fix, a plain message (no command) would resolve to only catch-alls —
+    // which is empty here — and "display" would never receive it.
+    {
+        let mut registry = orchestrator.command_registry.lock().unwrap();
+        registry.register(
+            "display",
+            crate::cockatiel_protobuf::Commands {
+                commands: vec![crate::cockatiel_protobuf::Command {
+                    command_name: "show".into(),
+                    command_flag: "!".into(),
+                    command_description: String::new(),
+                    command_flags: vec![],
+                }],
+                alert_on_unknown_command: false,
+            },
+        );
+    }
+
+    orchestrator
+        .handle_message_from_module(&adapter_ingest("plain chat, no command"))
+        .await
+        .unwrap();
+    let uuid7 = take_broadcast(rx.get_mut("pre").unwrap());
+    orchestrator
+        .handle_message_from_module(&pre_reply("pre", &uuid7, "pre text"))
+        .await
+        .unwrap();
+    take_broadcast(rx.get_mut("mid").unwrap());
+    orchestrator
+        .handle_message_from_module(&in_reply("mid", &uuid7, "final", false))
+        .await
+        .unwrap();
+
+    // The plain message reaches the non-catch-all display module.
+    assert_eq!(
+        take_broadcast(rx.get_mut("display").unwrap()),
+        uuid7,
+        "a display module must receive a plain chat message even though it registered specific commands"
+    );
+
+    orchestrator
+        .handle_message_from_module(&post_reply("display", &uuid7, "final"))
+        .await
+        .unwrap();
+    let r = row(&db, &uuid7).await;
+    assert_eq!(r["pipeline_status"], "complete");
+}
