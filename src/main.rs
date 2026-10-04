@@ -40,6 +40,8 @@ use command_registry::{CommandRegistry, parse_command};
 mod module_registry;
 use module_registry::ModuleRegistryPersistence;
 
+mod auto_config;
+
 mod prompts;
 
 mod database;
@@ -1111,6 +1113,18 @@ cockatiel
     config::backfill_config_defaults(&config_state);
     let auth_store = AuthStore::new(jwt_secret);
     let module_registry = ModuleRegistryPersistence::load(&config_state);
+
+    // Auto-configure discovered modules: register them in modules.json, wire
+    // them into the pipeline ordering, and give each a connection config.json
+    // pointing at this engine (only filling missing keys — existing configs and
+    // operator choices always win). This makes a fresh clone's ./modules/
+    // self-sufficient without the TUI having to register/start each module.
+    {
+        let auto_log = auto_config::run(&config_state, &discovered_registry_inner);
+        for line in &auto_log {
+            log_event_broadcast(&ui_state, line.clone());
+        }
+    }
 
     let discovered_registry = Arc::new(Mutex::new(discovered_registry_inner));
 
