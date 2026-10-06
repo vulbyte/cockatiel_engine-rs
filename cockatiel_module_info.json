@@ -1,0 +1,49 @@
+{
+  "binary": {
+    "linux": {
+      "aarch64": "target/release/cockatiel-engine-rs",
+      "arm": "target/release/cockatiel-engine-rs",
+      "x86": "target/release/cockatiel-engine-rs",
+      "x86_64": "target/release/cockatiel-engine-rs"
+    },
+    "macos": {
+      "aarch64": "target/release/cockatiel-engine-rs",
+      "arm": "target/release/cockatiel-engine-rs",
+      "x86": "target/release/cockatiel-engine-rs",
+      "x86_64": "target/release/cockatiel-engine-rs"
+    },
+    "windows": {
+      "aarch64": "target/release/cockatiel-engine-rs.exe",
+      "arm": "target/release/cockatiel-engine-rs.exe",
+      "x86": "target/release/cockatiel-engine-rs.exe",
+      "x86_64": "target/release/cockatiel-engine-rs.exe"
+    }
+  },
+  "build_command": "cargo",
+  "build_flags": [
+    "build",
+    "--release"
+  ],
+  "command_flags": [
+    "run",
+    "--release"
+  ],
+  "kind": "engine",
+  "launch_command": "cargo",
+  "name": "engine",
+  "release": {
+    "assets": {
+      "macos": {
+        "aarch64": {
+          "file": "engine-0.1.0-macos-aarch64.tar.gz",
+          "sha256": "d01eca12eadb356bde46ce12aabad0f5ded79d850fc26b40b735b8e1a1322cd8"
+        }
+      }
+    },
+    "base_url": "https://github.com/vulbyte/cockatiel_engine-rs/releases/download",
+    "repo": "vulbyte/cockatiel_engine-rs",
+    "tag": "v0.1.0"
+  },
+  "root_file": "./src/main.rs",
+  "version": "0.1.0"
+}
