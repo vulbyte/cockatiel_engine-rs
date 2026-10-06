@@ -257,6 +257,7 @@ dependencies = [
  "jsonwebtoken",
  "prost 0.14.4",
  "prost-build 0.14.4",
+ "protoc-bin-vendored",
  "rcgen",
  "rustls-pemfile",
  "serde",

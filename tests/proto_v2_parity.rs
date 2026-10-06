@@ -161,7 +161,10 @@ fn load() -> Unified {
 
 #[test]
 fn the_unified_spec_compiles() {
-    let out = Command::new("protoc")
+    // Use the vendored protoc so the audit does not depend on a system install
+    // (CI has none, and cockatiel-proto builds with the vendored binary).
+    let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc");
+    let out = Command::new(protoc)
         .arg("--proto_path")
         .arg(lib_dir())
         .arg("--descriptor_set_out")

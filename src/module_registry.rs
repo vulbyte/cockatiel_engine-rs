@@ -8,10 +8,20 @@ use crate::config::ConfigState;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisteredModule {
     pub name: String,
+    // Every field below is `default`: a hand-written or CI-seeded `modules.json`
+    // entry may carry only `name` + `auto_auth` (name-only auto-approval), and a
+    // missing field must not make the WHOLE registry fail to parse (which would
+    // silently drop every approval). `instance_uuid7`/`auth_token` default empty;
+    // the pinned-identity reconnect path already treats empty as "no pin".
+    #[serde(default)]
     pub instance_uuid7: String,
+    #[serde(default)]
     pub position: String,
+    #[serde(default)]
     pub priority: i32,
+    #[serde(default)]
     pub auto_auth: bool,
+    #[serde(default)]
     pub auth_token: String,
 }
 
@@ -89,5 +99,24 @@ impl ModuleRegistryPersistence {
     pub fn values(&self) -> Vec<RegisteredModule> {
         let modules = self.modules.lock().unwrap();
         modules.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_partial_registry_entry_still_parses_and_auto_auths() {
+        // CI/hand-written seeds carry only name + auto_auth; a missing
+        // instance_uuid7/auth_token must not drop the whole registry.
+        let entries: Vec<RegisteredModule> =
+            serde_json::from_str(r#"[{"name":"banned-words","auto_auth":true}]"#)
+                .expect("partial entry must parse");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "banned-words");
+        assert!(entries[0].auto_auth);
+        assert!(entries[0].instance_uuid7.is_empty());
+        assert_eq!(entries[0].priority, 0);
     }
 }

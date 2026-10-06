@@ -25,3 +25,8 @@ rcgen = "0.13"
 
 [build-dependencies]
 prost-build = "0.14"
+
+[dev-dependencies]
+# The v2 parity audit shells out to protoc; use the vendored binary so the test
+# does not require a system protoc install (matching how cockatiel-proto builds).
+protoc-bin-vendored = "3"
