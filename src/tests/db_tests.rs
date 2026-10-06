@@ -510,3 +510,18 @@ async fn a_terminal_write_with_nothing_to_say_is_a_no_op() {
     assert_eq!(r["flags"], "held");
     assert!(r["processed_message"].is_null());
 }
+
+#[tokio::test]
+async fn query_timeline_filters_by_prefix() {
+    let db = test_db().await;
+    for i in 0..5 {
+        let u = format!("q-uuid-{:026}", i).into_bytes();
+        db.insert_event(&u, 1, "test", &[], &format!("screening-flood-x {}", i), "", "{}").await.unwrap();
+    }
+    let json = db
+        .query_timeline(None, Some(1), Some("test"), None, None, Some("screening-flood-x"), None, None, 500, 0)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 5);
+}

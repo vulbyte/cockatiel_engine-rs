@@ -882,9 +882,14 @@ impl DatabaseManager {
             sql.push_str(" AND pipeline_status = ?");
             args.push(Value::Text(ps.to_string()));
         }
-        sql.push_str(" ORDER BY persisted_at DESC LIMIT ? OFFSET ?");
-        args.push(Value::Integer(limit as i64));
-        args.push(Value::Integer(offset as i64));
+        // LIMIT/OFFSET are inlined as literals rather than bound: turso 0.1.5
+        // fails to step a query whose LIMIT/OFFSET are parameters
+        // (`Parse error: MustBeInt`). Both are i32 already clamped above, so
+        // formatting them cannot inject.
+        sql.push_str(&format!(
+            " ORDER BY persisted_at DESC LIMIT {} OFFSET {}",
+            limit, offset
+        ));
 
         let mut rows = conn
             .query(sql.as_str(), turso::params_from_iter(args))
