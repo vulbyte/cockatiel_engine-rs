@@ -1178,7 +1178,7 @@ async fn run_test_suite(
 
     // Locate the runner binary relative to the engine's working directory.
     let engine_dir = env::current_dir().unwrap_or_default();
-    let runner_dir = engine_dir.parent().unwrap_or(&engine_dir).join("cockatiel_test_runner-rs");
+    let runner_dir = engine_dir.parent().unwrap_or(&engine_dir).join("modules").join("cockatiel_module-test_runner-rs");
     let runner_bin = runner_dir.join("target").join("release").join("cockatiel-test-runner");
     let runner_bin = if runner_bin.exists() {
         runner_bin
@@ -2912,6 +2912,7 @@ fn current_autostart_reads_the_live_manifest_not_the_discovery_snapshot() {
             name: "m".into(),
             description: String::new(),
             version: String::new(),
+            kind: String::new(),
             capabilities: "postprocess".into(),
             root_file: String::new(),
             launch_command: String::new(),

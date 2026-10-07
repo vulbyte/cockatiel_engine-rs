@@ -50,6 +50,13 @@ pub struct ModuleManifest {
     #[serde(default)]
     pub version: String,
 
+    /// Non-empty for core components (engine/tui/user-db/test-runner); a
+    /// launchable plugin leaves it empty or sets `"module"`. Discovery skips
+    /// anything else — the engine's own `modules/` now holds the user-db
+    /// component, which must NOT be launched as a chat module.
+    #[serde(default)]
+    pub kind: String,
+
     #[serde(default)]
     pub capabilities: String,
 
@@ -226,6 +233,12 @@ impl ModuleRegistry {
                 "Module manifest {} has an empty name",
                 manifest_path.display()
             ));
+        }
+
+        // Only launchable plugin modules are discovered. A core component
+        // manifest (engine/tui/user-db/test-runner) carries a non-empty `kind`.
+        if !manifest.kind.is_empty() && manifest.kind != "module" {
+            return Ok(None);
         }
 
         Ok(Some(DiscoveredModule {
