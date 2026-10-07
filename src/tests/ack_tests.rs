@@ -16,7 +16,7 @@ fn stage_advances_only_when_all_recipients_ack() {
 
     // One recipient acks — the stage must NOT advance while module-b is pending.
     let stage = tracker.ack_module(&uuid, "module-a");
-    assert_eq!(stage.map(|(s, _)| s), Some("preprocess".to_string()));
+    assert_eq!(stage.map(|(s, _, _)| s), Some("preprocess".to_string()));
     assert!(
         tracker.has_pending(&uuid),
         "must not advance early while module-b has not acked"
@@ -24,7 +24,7 @@ fn stage_advances_only_when_all_recipients_ack() {
 
     // All recipients ack → nothing pending → the stage may advance.
     let stage = tracker.ack_module(&uuid, "module-b");
-    assert_eq!(stage.map(|(s, _)| s), Some("preprocess".to_string()));
+    assert_eq!(stage.map(|(s, _, _)| s), Some("preprocess".to_string()));
     assert!(!tracker.has_pending(&uuid));
 }
 
@@ -37,7 +37,7 @@ fn ack_module_ignores_unknown_recipients_and_is_idempotent() {
     assert_eq!(tracker.ack_module("u2", "module-other"), None);
     assert!(tracker.has_pending("u2"));
 
-    assert_eq!(tracker.ack_module("u2", "module-a").map(|(s, _)| s), Some("preprocess".to_string()));
+    assert_eq!(tracker.ack_module("u2", "module-a").map(|(s, _, _)| s), Some("preprocess".to_string()));
     assert!(!tracker.has_pending("u2"));
 
     // Acking again after removal is a no-op.
@@ -77,11 +77,63 @@ fn check_timeouts_yields_only_elapsed_entries() {
 
     let timed_out = tracker.check_timeouts();
     assert_eq!(timed_out.len(), 1, "only the elapsed entry may time out");
-    assert_eq!(timed_out[0].uuid7, "u-expired");
+    assert_eq!(timed_out[0].0.uuid7, "u-expired");
+    assert!(
+        !timed_out[0].1,
+        "the drain left nothing pending for that uuid, so the timeout completes the stage"
+    );
 
     // The expired uuid is dropped from pending; the fresh one remains pending.
     assert!(!tracker.has_pending("u-expired"));
     assert!(tracker.has_pending("u-fresh"));
+}
+
+/// The removal and the "anything still pending?" answer are ONE atomic step.
+/// Only the ack that drains the LAST entry reports the stage clear — this is the
+/// invariant that stops two near-simultaneous recipients from both advancing.
+#[test]
+fn ack_module_reports_the_stage_clear_only_once() {
+    let mut tracker = AckTracker::new();
+    tracker.track("u-atomic".to_string(), "preprocess".to_string(), "a".to_string(), 3000);
+    tracker.track("u-atomic".to_string(), "preprocess".to_string(), "b".to_string(), 3000);
+
+    let (_, _, still_a) = tracker.ack_module("u-atomic", "a").unwrap();
+    assert!(still_a, "b is still pending — the stage is not clear");
+    let (_, _, still_b) = tracker.ack_module("u-atomic", "b").unwrap();
+    assert!(!still_b, "the last ack is the one that clears the stage");
+
+    // A late duplicate has nothing to remove and reports no stage to advance.
+    assert_eq!(tracker.ack_module("u-atomic", "b"), None);
+}
+
+/// The same atomicity for the sweep: when two entries for one uuid expire in a
+/// single pass, both report that the stage is clear, and it is the handler's job
+/// to advance at most once. The snapshot must be the post-drain state.
+#[test]
+fn check_timeouts_reports_the_post_drain_pending_state() {
+    let mut tracker = AckTracker::new();
+    let expired = || PendingAck {
+        uuid7: "u-two".into(),
+        stage: "preprocess".into(),
+        module_name: String::new(),
+        sent_at: Instant::now() - Duration::from_secs(10),
+        timeout: Duration::from_millis(1),
+        receipt_received: true,
+        resend_count: 0,
+    };
+    let mut a = expired();
+    a.module_name = "a".into();
+    let mut b = expired();
+    b.module_name = "b".into();
+    tracker.inject("u-two".to_string(), vec![a, b]);
+
+    let timed_out = tracker.check_timeouts();
+    assert_eq!(timed_out.len(), 2);
+    assert!(
+        timed_out.iter().all(|(_, still_pending)| !*still_pending),
+        "both entries see the fully-drained uuid"
+    );
+    assert!(!tracker.has_pending("u-two"));
 }
 
 /// A receipt ping (`MessageAck`) confirms DELIVERY only — the pending entry
@@ -105,7 +157,7 @@ fn a_receipt_confirms_delivery_without_advancing() {
     assert!(tracker.has_pending("u-rcpt"));
 
     // Only the result (stage-echo) clears it.
-    assert_eq!(tracker.ack_module("u-rcpt", "module-a").map(|(s, _)| s), Some("preprocess".to_string()));
+    assert_eq!(tracker.ack_module("u-rcpt", "module-a").map(|(s, _, _)| s), Some("preprocess".to_string()));
     assert!(!tracker.has_pending("u-rcpt"));
 }
 
@@ -117,7 +169,7 @@ fn a_receipt_for_an_untracked_module_is_a_no_op() {
     tracker.track("u-x".to_string(), "preprocess".to_string(), "module-a".to_string(), 3000);
     tracker.mark_receipt("u-x", "ghost");
     assert!(tracker.has_pending("u-x"));
-    assert_eq!(tracker.ack_module("u-x", "module-a").map(|(s, _)| s), Some("preprocess".to_string()));
+    assert_eq!(tracker.ack_module("u-x", "module-a").map(|(s, _, _)| s), Some("preprocess".to_string()));
 }
 
 /// `re_track` re-adds a resent stage message with the incremented resend count
@@ -132,17 +184,17 @@ fn a_resend_restarts_the_clock_and_counts() {
     tracker.track("u-r".to_string(), "preprocess".to_string(), "module-c".to_string(), 0);
     let timed_out = tracker.check_timeouts();
     assert_eq!(timed_out.len(), 1);
-    assert_eq!(timed_out[0].resend_count, 0);
+    assert_eq!(timed_out[0].0.resend_count, 0);
     assert!(!tracker.has_pending("u-r"), "check_timeouts drains the expired entry");
 
     // Re-track after the resend: count bumps, the entry is pending again.
-    tracker.re_track(&timed_out[0]);
+    tracker.re_track(&timed_out[0].0);
     assert!(tracker.has_pending("u-r"));
-    assert_eq!(tracker.re_track(&timed_out[0]), ());
+    assert_eq!(tracker.re_track(&timed_out[0].0), ());
     assert!(tracker.has_pending("u-r"));
 
     // The result still clears it (the re-tracked entries are pending again).
     let cleared = tracker.ack_module("u-r", "module-c");
-    assert_eq!(cleared.map(|(s, _)| s), Some("preprocess".to_string()));
+    assert_eq!(cleared.map(|(s, _, _)| s), Some("preprocess".to_string()));
     assert!(!tracker.has_pending("u-r"));
 }

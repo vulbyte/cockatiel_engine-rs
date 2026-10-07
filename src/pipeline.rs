@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex};
@@ -348,10 +348,18 @@ impl AckTracker {
 
     /// Remove ONLY the acking module's pending entry for `uuid7` (a stage with
     /// several modules must wait for ALL of them to ack, not advance on the
-    /// first). Returns the stage that was acked AND the processing duration
+    /// first). Returns the stage that was acked, the processing duration
     /// (ms since the send) — the duration is what feeds the module's rolling
-    /// latency average. `None` if this module had no pending ack for the message.
-    pub fn ack_module(&mut self, uuid7: &str, module_name: &str) -> Option<(String, f32)> {
+    /// latency average — AND whether the message still has a pending entry
+    /// afterwards. `None` if this module had no pending ack for the message.
+    ///
+    /// The removal and the "anything still pending?" answer are computed in the
+    /// SAME call, under one lock acquisition by the caller. Splitting them (as
+    /// the old `ack_module` + `has_pending` pair did) let two recipients ack
+    /// near-simultaneously and BOTH observe "nothing pending", each advancing
+    /// the stage — double-dispatching the next stage and racing the terminal
+    /// write.
+    pub fn ack_module(&mut self, uuid7: &str, module_name: &str) -> Option<(String, f32, bool)> {
         let now = Instant::now();
         let (stage, elapsed_ms) = {
             let entries = self.pending.get(uuid7)?;
@@ -359,39 +367,50 @@ impl AckTracker {
             let elapsed_ms = now.duration_since(entry.sent_at).as_secs_f32() * 1000.0;
             (entry.stage.clone(), elapsed_ms)
         };
-        if let Some(entries) = self.pending.get_mut(uuid7) {
+        let still_pending = if let Some(entries) = self.pending.get_mut(uuid7) {
             entries.retain(|e| e.module_name != module_name);
             if entries.is_empty() {
                 self.pending.remove(uuid7);
+                false
+            } else {
+                true
             }
-        }
-        Some((stage, elapsed_ms))
+        } else {
+            false
+        };
+        Some((stage, elapsed_ms, still_pending))
     }
 
-    pub fn check_timeouts(&mut self) -> Vec<PendingAck> {
+    /// Drain every expired entry, reporting with each one whether the message
+    /// still has a pending ack AFTER the drain. That per-entry pending state is
+    /// captured under the same lock as the drain, so a concurrent `ack_module`
+    /// cannot slip between "remove the expired entry" and "is anything still
+    /// pending?" and let both paths advance the stage. Several entries for one
+    /// uuid can expire in a single pass (a stage with more than one silent
+    /// module); each carries the same post-drain snapshot.
+    pub fn check_timeouts(&mut self) -> Vec<(PendingAck, bool)> {
         let now = Instant::now();
-        let mut timed_out = Vec::new();
-        let mut to_remove = Vec::new();
+        let mut timed_out: Vec<(PendingAck, bool)> = Vec::new();
 
-        for (uuid7, entries) in &mut self.pending {
+        for entries in self.pending.values_mut() {
             let mut still_pending = Vec::new();
+            let mut expired = Vec::new();
             for entry in entries.drain(..) {
                 if now.duration_since(entry.sent_at) > entry.timeout {
-                    timed_out.push(entry);
+                    expired.push(entry);
                 } else {
                     still_pending.push(entry);
                 }
             }
-            if still_pending.is_empty() {
-                to_remove.push(uuid7.clone());
-            } else {
-                *entries = still_pending;
+            let has_pending_after = !still_pending.is_empty();
+            *entries = still_pending;
+            for entry in expired {
+                timed_out.push((entry, has_pending_after));
             }
         }
-
-        for uuid in to_remove {
-            self.pending.remove(&uuid);
-        }
+        // Drop the uuids whose entries were all expired (the drained `Vec` is
+        // left empty above rather than removed mid-iteration).
+        self.pending.retain(|_, entries| !entries.is_empty());
 
         timed_out
     }
@@ -400,6 +419,22 @@ impl AckTracker {
         self.pending
             .get(uuid7)
             .map(|v| !v.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Whether `module_name` holds a pending ack for `uuid7` at `stage`. This is
+    /// the ownership check a stage reply must pass before it may mutate the
+    /// message's in-memory state: a module with no pending entry for that
+    /// uuid+stage is answering something that is not its to answer, and its
+    /// processed text / audio must be ignored.
+    pub fn is_pending_for(&self, uuid7: &str, module_name: &str, stage: &str) -> bool {
+        self.pending
+            .get(uuid7)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .any(|e| e.module_name == module_name && e.stage == stage)
+            })
             .unwrap_or(false)
     }
 
@@ -1037,16 +1072,14 @@ impl PipelineOrchestrator {
             command_recipients(state.parsed_command.as_ref(), &registry, &cfg.pre_process_modules)
         };
 
-        let mut ack_guard = self.ack_tracker.lock().await;
-
-        let recipients: Vec<&String> = match &targets {
-            Some(list) => list.iter().collect(),
-            None => cfg.pre_process_modules.iter().collect(),
+        let recipients: Vec<String> = match &targets {
+            Some(list) => list.clone(),
+            None => cfg.pre_process_modules.clone(),
         };
         let recipients_empty = recipients.is_empty();
 
         let mut sent_any = false;
-        for module_name in recipients {
+        for module_name in &recipients {
             // Cost gate: skip THIS module if the user can't afford its price or
             // doesn't meet its min_rank. The rest of the fanout + message are
             // unaffected (skip-that-module semantics).
@@ -1060,7 +1093,11 @@ impl PipelineOrchestrator {
             match send_to_module(&self.module_senders, module_name, container.clone(), "pre_process").await {
                 SendOutcome::Sent => {
                     sent_any = true;
-                    ack_guard.track(
+                    // The tracker lock is taken ONLY for this mutation — never
+                    // held across the user-db round-trip (`permit_module`) or the
+                    // channel send above. A slow user-db must not stall every
+                    // ack and the timeout sweep behind the tracker mutex.
+                    self.ack_tracker.lock().await.track(
                         uuid7.to_string(),
                         "pre_process".into(),
                         module_name.clone(),
@@ -1076,7 +1113,6 @@ impl PipelineOrchestrator {
                 SendOutcome::NotConnected => {}
             }
         }
-        drop(ack_guard);
 
         // No pre-process module is connected — there is nobody to ack, so
         // advance immediately instead of leaving the message stuck in
@@ -1100,8 +1136,10 @@ impl PipelineOrchestrator {
             return Ok(());
         }
 
-        // Held-for-audit messages are not advanced or shown.
-        if self.db.is_audited(&uuid7_string_to_bytes(uuid7)).await.unwrap_or(false) {
+        // Held-for-audit messages are not advanced or shown. A read error fails
+        // CLOSED — `?` propagates instead of treating "could not read the hold"
+        // as "not held", which would let an audited message advance.
+        if self.db.is_audited(&uuid7_string_to_bytes(uuid7)).await? {
             return Ok(());
         }
         let state = {
@@ -1242,8 +1280,10 @@ impl PipelineOrchestrator {
             return Ok(());
         }
 
-        // Held-for-audit messages are not advanced or shown.
-        if self.db.is_audited(&uuid7_string_to_bytes(uuid7)).await.unwrap_or(false) {
+        // Held-for-audit messages are not advanced or shown. A read error fails
+        // CLOSED — `?` propagates instead of treating "could not read the hold"
+        // as "not held", which would let an audited message advance.
+        if self.db.is_audited(&uuid7_string_to_bytes(uuid7)).await? {
             return Ok(());
         }
         let state = {
@@ -1411,6 +1451,30 @@ impl PipelineOrchestrator {
         }
     }
 
+    /// If `uuid7` is held for audit, land the run's accumulated result on the
+    /// row WITHOUT touching the hold, and report that the terminal path must
+    /// stop. The state and the pending acks are left in place, exactly as the
+    /// completion path always did. A read error propagates (fails closed): an
+    /// unknown hold state must never let a held message be published.
+    ///
+    /// Every terminal path (complete / failed / dropped) funnels through this,
+    /// so a critical-module timeout or a module abandon preserves an operator's
+    /// hold instead of clobbering it with `failed`/`dropped`.
+    async fn preserve_audit_hold(
+        &self,
+        uuid7: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let uuid7_bytes = uuid7_string_to_bytes(uuid7);
+        if !self.db.is_audited(&uuid7_bytes).await? {
+            return Ok(false);
+        }
+        let held = self.result_snapshot(uuid7).await;
+        self.db
+            .write_terminal_outcome(&uuid7_bytes, &PipelineOutcome::AuditHeld, &held)
+            .await?;
+        Ok(true)
+    }
+
     async fn mark_complete(
         &self,
         uuid7: &str,
@@ -1418,15 +1482,9 @@ impl PipelineOrchestrator {
         let uuid7_bytes = uuid7_string_to_bytes(uuid7);
 
         // Held-for-audit messages stay held, not completed. The run's
-        // accumulated result still lands on the row (the per-stage writes used
-        // to leave it there), but the hold itself is untouched: only
-        // `release_audit` may release it. The state and the pending acks are
-        // left in place, exactly as this path always did.
-        if self.db.is_audited(&uuid7_bytes).await.unwrap_or(false) {
-            let held = self.result_snapshot(uuid7).await;
-            self.db
-                .write_terminal_outcome(&uuid7_bytes, &PipelineOutcome::AuditHeld, &held)
-                .await?;
+        // accumulated result still lands on the row, but the hold itself is
+        // untouched: only `release_audit` may release it.
+        if self.preserve_audit_hold(uuid7).await? {
             return Ok(());
         }
 
@@ -1452,6 +1510,12 @@ impl PipelineOrchestrator {
         error: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let uuid7_bytes = uuid7_string_to_bytes(uuid7);
+
+        // A critical timeout must not clobber an operator's hold: preserve it
+        // and stop, exactly like a normal completion on a held message.
+        if self.preserve_audit_hold(uuid7).await? {
+            return Ok(());
+        }
 
         // Everything the run got as far as producing lands with the failure —
         // the per-stage writes had already mirrored it onto the row by the time
@@ -1483,6 +1547,10 @@ impl PipelineOrchestrator {
         uuid7: &str,
         reason: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // A module abandon must not clobber an operator's hold either.
+        if self.preserve_audit_hold(uuid7).await? {
+            return Ok(());
+        }
         let Some(result) = self.take_result(uuid7).await else {
             return Ok(());
         };
@@ -1504,12 +1572,16 @@ impl PipelineOrchestrator {
         module_name: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cfg = self.config_snapshot().await;
+        // Remove this module's entry AND learn whether anything is still pending
+        // in ONE lock acquisition. The two facts have to come from the same
+        // snapshot: two recipients acking near-simultaneously must not both see
+        // "nothing pending" and both advance the stage.
         let completed_stage = {
             let mut ack_guard = self.ack_tracker.lock().await;
             ack_guard.ack_module(uuid7, module_name)
         };
 
-        let (stage, elapsed_ms) = match completed_stage {
+        let (stage, elapsed_ms, still_pending) = match completed_stage {
             Some(v) => v,
             None => return Ok(()),
         };
@@ -1519,11 +1591,6 @@ impl PipelineOrchestrator {
         // messages (an ack is the module saying "done"), so the average is
         // purely how long a module takes on the messages it actually handled.
         self.module_timings.lock().await.record(module_name, elapsed_ms);
-
-        let still_pending = {
-            let ack_guard = self.ack_tracker.lock().await;
-            ack_guard.has_pending(uuid7)
-        };
 
         match stage.as_str() {
             "pre_process" => {
@@ -1686,7 +1753,21 @@ impl PipelineOrchestrator {
             ack_guard.check_timeouts()
         };
 
-        for entry in timed_out {
+        // Several entries for one uuid can expire together (a stage with more
+        // than one silent module), and each carries the same post-drain "nothing
+        // pending" snapshot. Advance the message at most ONCE per sweep, never
+        // after a critical timeout failed it, and never while a resend left a
+        // fresh entry pending.
+        let critical_uuids: HashSet<String> = timed_out
+            .iter()
+            .filter(|(e, _)| cfg.critical_modules.contains(&e.module_name))
+            .map(|(e, _)| e.uuid7.clone())
+            .collect();
+        let mut advanced: HashSet<String> = HashSet::new();
+        let mut failed: HashSet<String> = HashSet::new();
+        let mut resent: HashSet<String> = HashSet::new();
+
+        for (entry, still_pending) in timed_out {
             // RECEIPT RESEND: the module never confirmed it received the stage
             // message. Resend it (capped) rather than assuming the module is
             // dead — a lost frame on a busy adapter is common, and the receipt
@@ -1696,7 +1777,12 @@ impl PipelineOrchestrator {
             // the result still takes the normal timeout below.
             if !entry.receipt_received && entry.resend_count < MAX_ACK_RESENDS {
                 match self.resend_stage(&entry).await {
-                    Ok(true) => continue,
+                    Ok(true) => {
+                        // A resend re-tracks the entry, so the message is still
+                        // pending even though this sweep drained it.
+                        resent.insert(entry.uuid7.clone());
+                        continue;
+                    }
                     Ok(false) => {
                         // Resend could not be queued (module disconnected) —
                         // fall through to the normal timeout path.
@@ -1723,46 +1809,47 @@ impl PipelineOrchestrator {
             );
 
             if is_critical {
-                self.mark_failed(
-                    &entry.uuid7,
-                    &format!("Critical module '{}' timed out at stage '{}'", entry.module_name, entry.stage),
-                ).await?;
-            } else {
-                let still_pending = {
-                    let ack_guard = self.ack_tracker.lock().await;
-                    ack_guard.has_pending(&entry.uuid7)
-                };
+                // Fail the message once, however many critical entries expired
+                // together.
+                if failed.insert(entry.uuid7.clone()) {
+                    self.mark_failed(
+                        &entry.uuid7,
+                        &format!("Critical module '{}' timed out at stage '{}'", entry.module_name, entry.stage),
+                    ).await?;
+                }
+            } else if !still_pending
+                && !resent.contains(&entry.uuid7)
+                && !critical_uuids.contains(&entry.uuid7)
+                && advanced.insert(entry.uuid7.clone())
+            {
+                match entry.stage.as_str() {
+                    "pre_process" => {
+                        self.note_pre_process_completed(&entry.uuid7).await;
+                        self.start_in_process(&entry.uuid7).await?;
+                    }
+                    "in_process" => {
+                        self.note_in_process_completed(&entry.uuid7).await;
 
-                if !still_pending {
-                    match entry.stage.as_str() {
-                        "pre_process" => {
-                            self.note_pre_process_completed(&entry.uuid7).await;
+                        let next_index = {
+                            let mut states = self.pipeline_states.lock().await;
+                            if let Some(state) = states.get_mut(&entry.uuid7) {
+                                state.current_in_process_index += 1;
+                                state.current_in_process_index
+                            } else {
+                                continue;
+                            }
+                        };
+
+                        if next_index >= cfg.in_process_modules.len() {
+                            self.start_post_process(&entry.uuid7).await?;
+                        } else {
                             self.start_in_process(&entry.uuid7).await?;
                         }
-                        "in_process" => {
-                            self.note_in_process_completed(&entry.uuid7).await;
-
-                            let next_index = {
-                                let mut states = self.pipeline_states.lock().await;
-                                if let Some(state) = states.get_mut(&entry.uuid7) {
-                                    state.current_in_process_index += 1;
-                                    state.current_in_process_index
-                                } else {
-                                    continue;
-                                }
-                            };
-
-                            if next_index >= cfg.in_process_modules.len() {
-                                self.start_post_process(&entry.uuid7).await?;
-                            } else {
-                                self.start_in_process(&entry.uuid7).await?;
-                            }
-                        }
-                        "post_process" => {
-                            self.mark_complete(&entry.uuid7).await?;
-                        }
-                        _ => {}
                     }
+                    "post_process" => {
+                        self.mark_complete(&entry.uuid7).await?;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1804,6 +1891,16 @@ impl PipelineOrchestrator {
         Ok(())
     }
 
+    /// Whether `module_name` owns a pending ack for `uuid7` at `stage`. A stage
+    /// reply that fails this check is not the sender's to make: it must not be
+    /// allowed to overwrite another in-flight message's processed text/audio.
+    async fn owns_pending_stage(&self, uuid7: &str, module_name: &str, stage: &str) -> bool {
+        self.ack_tracker
+            .lock()
+            .await
+            .is_pending_for(uuid7, module_name, stage)
+    }
+
     pub async fn handle_message_from_module(
         &self,
         container: &ContainerForEngine,
@@ -1832,6 +1929,15 @@ impl PipelineOrchestrator {
                     return Ok(true);
                 }
 
+                // Ownership gate: only a module with a tracked pending ack for
+                // this uuid+stage may write the message's state. Without it any
+                // authenticated module could overwrite another message's
+                // processed text/audio before `handle_ack` noticed it had no
+                // entry to clear.
+                if !self.owns_pending_stage(&msg.message_uuid7, &container.module_name, "pre_process").await {
+                    return Ok(true);
+                }
+
                 let processed = msg.raw_message.as_ref()
                     .map(|cm| cm.raw_message.clone())
                     .unwrap_or_default();
@@ -1849,6 +1955,10 @@ impl PipelineOrchestrator {
             }
             Some(EnginePayload::MessageInProcess(msg)) => {
                 if msg.message_uuid7.is_empty() {
+                    return Ok(true);
+                }
+
+                if !self.owns_pending_stage(&msg.message_uuid7, &container.module_name, "in_process").await {
                     return Ok(true);
                 }
 
@@ -1876,6 +1986,10 @@ impl PipelineOrchestrator {
             }
             Some(EnginePayload::MessagePostProcess(msg)) => {
                 if msg.message_uuid7.is_empty() {
+                    return Ok(true);
+                }
+
+                if !self.owns_pending_stage(&msg.message_uuid7, &container.module_name, "post_process").await {
                     return Ok(true);
                 }
 
@@ -1968,14 +2082,14 @@ mod timeout_sweep_tests {
         );
         let timed_out = tracker.check_timeouts();
         assert_eq!(timed_out.len(), 1, "only the expired entry times out");
-        assert_eq!(timed_out[0].module_name, "slow");
+        assert_eq!(timed_out[0].0.module_name, "slow");
         assert!(
             tracker.has_pending("uuid-1"),
             "the message must NOT be considered acked while 'live' is still pending"
         );
 
         // Once the survivor acks, the message is free to advance.
-        assert_eq!(tracker.ack_module("uuid-1", "live").map(|(s, _)| s), Some("pre_process".into()));
+        assert_eq!(tracker.ack_module("uuid-1", "live").map(|(s, _, _)| s), Some("pre_process".into()));
         assert!(!tracker.has_pending("uuid-1"));
     }
 
@@ -1992,7 +2106,7 @@ mod timeout_sweep_tests {
         );
         let timed_out = tracker.check_timeouts();
         assert_eq!(timed_out.len(), 1);
-        let e = &timed_out[0];
+        let e = &timed_out[0].0;
         assert_eq!(e.module_name, "tts-service");
         assert_eq!(e.stage, "post_process");
     }
@@ -2045,7 +2159,7 @@ mod timeout_sweep_tests {
         );
         let timed_out = rebased.check_timeouts();
         assert_eq!(timed_out.len(), 1);
-        assert_eq!(timed_out[0].stage, "post_process");
+        assert_eq!(timed_out[0].0.stage, "post_process");
     }
 }
 

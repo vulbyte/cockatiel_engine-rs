@@ -1797,7 +1797,7 @@ where
 
     let container = ContainerForEngine::decode(data.as_ref())?;
 
-    let EnginePayload::ConnectionRequest(request) = container.payload.as_ref().unwrap() else {
+    let Some(EnginePayload::ConnectionRequest(request)) = container.payload.as_ref() else {
         log_event(
             &ui_state,
             format!(

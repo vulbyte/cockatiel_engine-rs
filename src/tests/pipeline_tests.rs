@@ -801,3 +801,153 @@ async fn a_plain_message_reaches_a_non_catchall_post_process_module() {
     let r = row(&db, &uuid7).await;
     assert_eq!(r["pipeline_status"], "complete");
 }
+
+/// Regression: two recipients acking the same message near-simultaneously must
+/// advance the stage exactly ONCE. Before the fix, `handle_ack` released the
+/// tracker lock between removing the acking module's entry and checking
+/// `has_pending`, so both acks could observe "nothing pending" and each dispatch
+/// the next stage — a double-send to in-process (and, at the tail, a `complete`
+/// then `failed` terminal write).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_acks_advance_the_stage_exactly_once() {
+    const ITERATIONS: usize = 25;
+    let db = test_db().await;
+    let (orchestrator, mut rx) = wired_orchestrator(db.clone(), &["pre-a", "pre-b"], &["mid"], &[]);
+
+    for _ in 0..ITERATIONS {
+        orchestrator
+            .handle_message_from_module(&adapter_ingest("raw text"))
+            .await
+            .unwrap();
+        let uuid7 = take_broadcast(rx.get_mut("pre-a").unwrap());
+        assert_eq!(take_broadcast(rx.get_mut("pre-b").unwrap()), uuid7);
+
+        let a = orchestrator.clone();
+        let b = orchestrator.clone();
+        let ua = uuid7.clone();
+        let ub = uuid7.clone();
+        let h1 = tokio::spawn(async move { a.handle_ack(&ua, "pre-a").await.unwrap() });
+        let h2 = tokio::spawn(async move { b.handle_ack(&ub, "pre-b").await.unwrap() });
+        h1.await.unwrap();
+        h2.await.unwrap();
+
+        // Exactly one dispatch to in-process; the second ack must have seen the
+        // first's removal atomically and done nothing.
+        assert_eq!(
+            take_broadcast(rx.get_mut("mid").unwrap()),
+            uuid7,
+            "the in-process stage was dispatched more than once"
+        );
+        assert!(
+            nothing_left(rx.get_mut("mid").unwrap()),
+            "the in-process stage was dispatched more than once"
+        );
+    }
+}
+
+/// A module with no pending ack for a message must not be able to overwrite its
+/// in-memory state: only the module that was actually sent the stage may write
+/// the processed text/audio.
+#[tokio::test]
+async fn an_untracked_module_cannot_mutate_another_messages_state() {
+    let db = test_db().await;
+    let (orchestrator, mut rx) = wired_orchestrator(db.clone(), &["pre"], &["mid"], &[]);
+    orchestrator
+        .handle_message_from_module(&adapter_ingest("raw text"))
+        .await
+        .unwrap();
+    let uuid7 = take_broadcast(rx.get_mut("pre").unwrap());
+
+    // "rogue" owes no ack for this uuid — its reply must be ignored entirely.
+    orchestrator
+        .handle_message_from_module(&pre_reply("rogue", &uuid7, "HIJACKED"))
+        .await
+        .unwrap();
+
+    {
+        let states = orchestrator.pipeline_states.lock().await;
+        let state = states.get(&uuid7).expect("the message is still in flight");
+        assert_eq!(
+            state.processed_message, "raw text",
+            "an untracked module must not mutate the message state"
+        );
+    }
+
+    // The owning module's reply still drives the chain exactly as before.
+    orchestrator
+        .handle_message_from_module(&pre_reply("pre", &uuid7, "pre text"))
+        .await
+        .unwrap();
+    assert_eq!(take_broadcast(rx.get_mut("mid").unwrap()), uuid7);
+}
+
+/// A critical-module timeout must not clobber an operator's audit hold: the row
+/// stays 'audit' with its reason, exactly as a normal completion on a held row.
+#[tokio::test]
+async fn a_critical_timeout_does_not_clobber_an_audit_hold() {
+    let db = test_db().await;
+    let (orchestrator, mut rx) = wired_orchestrator(db.clone(), &["pre"], &["mid"], &[]);
+    let mut cfg = orchestrator.config_snapshot().await;
+    cfg.critical_modules = vec!["mid".to_string()];
+    orchestrator.set_config(cfg).await;
+
+    orchestrator
+        .handle_message_from_module(&adapter_ingest("raw text"))
+        .await
+        .unwrap();
+    let uuid7 = take_broadcast(rx.get_mut("pre").unwrap());
+    orchestrator
+        .handle_message_from_module(&pre_reply("pre", &uuid7, "pre text"))
+        .await
+        .unwrap();
+    assert_eq!(take_broadcast(rx.get_mut("mid").unwrap()), uuid7);
+
+    // Held while 'mid' is in flight, then 'mid' times out critically.
+    db.mark_audit(uuid7.as_bytes(), "needs a moderator").await.unwrap();
+    orchestrator.ack_tracker.lock().await.inject(
+        uuid7.clone(),
+        vec![PendingAck {
+            uuid7: uuid7.clone(),
+            stage: "in_process".into(),
+            module_name: "mid".into(),
+            sent_at: Instant::now() - Duration::from_secs(30),
+            timeout: Duration::from_millis(1),
+            receipt_received: true,
+            resend_count: 0,
+        }],
+    );
+    orchestrator.handle_timeout().await.unwrap();
+
+    let r = row(&db, &uuid7).await;
+    assert_eq!(r["pipeline_status"], "audit", "a hold must survive a critical timeout");
+    assert_eq!(r["flags"], "needs a moderator");
+    assert!(r["error_message"].is_null(), "the hold must not record the timeout as an error");
+}
+
+/// A module abandon must not clobber an audit hold either.
+#[tokio::test]
+async fn an_abandon_does_not_clobber_an_audit_hold() {
+    let db = test_db().await;
+    let (orchestrator, mut rx) = wired_orchestrator(db.clone(), &["pre"], &["mid"], &[]);
+    orchestrator
+        .handle_message_from_module(&adapter_ingest("raw text"))
+        .await
+        .unwrap();
+    let uuid7 = take_broadcast(rx.get_mut("pre").unwrap());
+    orchestrator
+        .handle_message_from_module(&pre_reply("pre", &uuid7, "pre text"))
+        .await
+        .unwrap();
+    assert_eq!(take_broadcast(rx.get_mut("mid").unwrap()), uuid7);
+
+    db.mark_audit(uuid7.as_bytes(), "hold me").await.unwrap();
+    orchestrator
+        .handle_message_from_module(&in_reply("mid", &uuid7, "no thanks", true))
+        .await
+        .unwrap();
+
+    let r = row(&db, &uuid7).await;
+    assert_eq!(r["pipeline_status"], "audit", "a hold must survive an abandon");
+    assert_eq!(r["flags"], "hold me");
+    assert!(r["error_message"].is_null());
+}
