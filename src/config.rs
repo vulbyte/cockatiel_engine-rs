@@ -336,12 +336,13 @@ pub fn get_pin(state: &Arc<Mutex<ConfigState>>) -> u32 {
     state.lock().unwrap().pin
 }
 
-/// Startup backfill (house convention): write any NEW config keys into
-/// config.json with their code defaults so they are explicit and editable on
-/// disk. Missing keys already resolve to the same defaults in memory via
-/// `#[serde(default)]`; this only persists them. All other keys are preserved
-/// untouched, and the file is only rewritten (atomically) when something was
-/// actually added.
+/// Startup backfill + migrations (house convention): write any NEW config keys
+/// into config.json with their code defaults so they are explicit and editable
+/// on disk (missing keys already resolve to the same defaults in memory via
+/// `#[serde(default)]`; this only persists them), and migrate the legacy
+/// in-folder timeline backup default to the home-directory default. All other
+/// keys are preserved untouched, and the file is only rewritten (atomically)
+/// when something actually changed.
 pub fn backfill_config_defaults(state: &Arc<Mutex<ConfigState>>) {
     let cfg_path = state.lock().unwrap().path.clone();
     let Ok(data) = fs::read_to_string(&cfg_path) else {
@@ -373,6 +374,21 @@ pub fn backfill_config_defaults(state: &Arc<Mutex<ConfigState>>) {
         }
     }
 
+    // Migrate the legacy in-folder backup default (`./cockatiel_backup.db`,
+    // which sat NEXT TO the timeline DB) to the home-directory default, and
+    // fill an empty value. A deleted or moved working folder must not take the
+    // only backup with it. Idempotent: once the value is the home path (or any
+    // other explicit path) this leaves it alone.
+    if let Some(home) =
+        migrated_backup_path(obj.get("timeline_database_backup_location").and_then(|v| v.as_str()))
+    {
+        obj.insert(
+            "timeline_database_backup_location".to_string(),
+            serde_json::json!(home),
+        );
+        changed = true;
+    }
+
     if changed {
         if let Ok(pretty) = serde_json::to_string_pretty(&root) {
             let _ = write_atomic(&cfg_path, &pretty);
@@ -380,20 +396,60 @@ pub fn backfill_config_defaults(state: &Arc<Mutex<ConfigState>>) {
     }
 }
 
-pub fn create_config(directory: PathBuf) -> Result<String, String> {
-    let target = directory.join("config.json");
+/// The user's home directory from the environment: `$HOME` on unix,
+/// `%USERPROFILE%` on Windows. `None` when neither is set (a stripped
+/// service/CI environment).
+pub fn home_dir() -> Option<PathBuf> {
+    let non_empty = |key: &str| env::var_os(key).filter(|v| !v.is_empty());
+    non_empty("HOME")
+        .or_else(|| non_empty("USERPROFILE"))
+        .map(PathBuf::from)
+}
 
-    // Never overwrite an existing config — regenerating would rotate the
-    // engine's settings and invalidate module ordering.
-    if let Ok(content) = fs::read_to_string(&target) {
-        return Ok(content);
-    }
+/// The default directory for database backups: `<home>/.cockatiel/backups`.
+///
+/// Deliberately OUTSIDE the working folder, so a deleted or moved working
+/// folder cannot take the only backup with it. Falls back to
+/// `./.cockatiel/backups` (relative to the cwd) when the home directory cannot
+/// be resolved, so a backup is still attempted rather than skipped.
+pub fn default_backup_dir() -> PathBuf {
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cockatiel")
+        .join("backups")
+}
 
-    // NOTE: secrets (PIN, JWT secret) intentionally live in `.env`, created by
-    // `ensure_secrets` — config.json holds settings only.
-    let config = r#"{
+/// The default timeline backup file (see [`default_backup_dir`]).
+pub fn default_timeline_backup_path() -> PathBuf {
+    default_backup_dir().join("cockatiel_backup.db")
+}
+
+/// The home-directory timeline backup path to migrate TO, or `None` when the
+/// current value is already an explicit path (leave it alone). A missing or
+/// empty value, and the legacy in-folder default `./cockatiel_backup.db`, all
+/// migrate. Pure so the migration rule is pinned by a test.
+fn migrated_backup_path(current: Option<&str>) -> Option<String> {
+    const LEGACY: &str = "./cockatiel_backup.db";
+    let needs_migration = current
+        .map(|v| v.trim().is_empty() || v == LEGACY)
+        .unwrap_or(true);
+    needs_migration.then(|| default_timeline_backup_path().to_string_lossy().to_string())
+}
+
+/// The timeline backup location to actually USE at runtime: the configured
+/// value, unless it is the legacy in-folder default or empty, in which case the
+/// home-directory default. This is the same rule [`backfill_config_defaults`]
+/// migrates the file to, applied to the in-memory config so the first boot
+/// after the upgrade uses the home path immediately (not just the next one).
+pub fn effective_timeline_backup_location(configured: &str) -> String {
+    migrated_backup_path(Some(configured)).unwrap_or_else(|| configured.to_string())
+}
+
+/// The `config.json` template. `__TIMELINE_BACKUP__` is replaced with the
+/// resolved default timeline backup path at creation time.
+const CONFIG_TEMPLATE: &str = r#"{
     "timeline_database_location": "./cockatiel_data.db",
-    "timeline_database_backup_location": "./cockatiel_backup.db",
+    "timeline_database_backup_location": "__TIMELINE_BACKUP__",
     "port": 9734,
     "inputs": [],
     "preprocessModules": [],
@@ -410,8 +466,26 @@ pub fn create_config(directory: PathBuf) -> Result<String, String> {
     "start_paused": true,
     "shutdown_on_request": false,
     "prediction_creator_role": "mod"
-}"#
-    .to_string();
+}"#;
+
+pub fn create_config(directory: PathBuf) -> Result<String, String> {
+    let target = directory.join("config.json");
+
+    // Never overwrite an existing config — regenerating would rotate the
+    // engine's settings and invalidate module ordering.
+    if let Ok(content) = fs::read_to_string(&target) {
+        return Ok(content);
+    }
+
+    // NOTE: secrets (PIN, JWT secret) intentionally live in `.env`, created by
+    // `ensure_secrets` — config.json holds settings only. The default backup
+    // lives in the home directory (outside the working folder); JSON-escape it
+    // so a Windows path with backslashes stays valid.
+    let backup = default_timeline_backup_path()
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let config = CONFIG_TEMPLATE.replace("__TIMELINE_BACKUP__", &backup);
 
     fs::write(&target, &config).map_err(|e| e.to_string())?;
 
@@ -608,4 +682,58 @@ pub fn add_module_to_config(
 
         list.sort_by_key(|entry| entry.priority);
     });
+}
+
+#[cfg(test)]
+mod backup_path_tests {
+    use super::*;
+
+    #[test]
+    fn default_backup_dir_is_outside_the_working_folder() {
+        let dir = default_backup_dir();
+        assert!(dir.ends_with(".cockatiel/backups"), "got {dir:?}");
+        assert_eq!(
+            default_timeline_backup_path(),
+            dir.join("cockatiel_backup.db")
+        );
+    }
+
+    #[test]
+    fn legacy_and_empty_backup_paths_migrate_to_home() {
+        let home = default_timeline_backup_path().to_string_lossy().to_string();
+        // Missing / empty / the legacy in-folder default all migrate.
+        assert_eq!(migrated_backup_path(None), Some(home.clone()));
+        assert_eq!(migrated_backup_path(Some("")), Some(home.clone()));
+        assert_eq!(migrated_backup_path(Some("   ")), Some(home.clone()));
+        assert_eq!(migrated_backup_path(Some("./cockatiel_backup.db")), Some(home));
+        // An explicit path (the home default itself, or anything else) is kept.
+        assert_eq!(migrated_backup_path(Some("/mnt/backups/tl.db")), None);
+        assert_eq!(
+            migrated_backup_path(Some(&default_timeline_backup_path().to_string_lossy())),
+            None
+        );
+    }
+
+    #[test]
+    fn effective_location_migrates_legacy_but_keeps_explicit() {
+        let home = default_timeline_backup_path().to_string_lossy().to_string();
+        assert_eq!(effective_timeline_backup_location("./cockatiel_backup.db"), home);
+        assert_eq!(effective_timeline_backup_location(""), home);
+        assert_eq!(effective_timeline_backup_location("/mnt/backups/tl.db"), "/mnt/backups/tl.db");
+    }
+
+    #[test]
+    fn create_config_embeds_the_home_backup_path_and_is_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!("ckt-cfg-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let content = create_config(dir.clone()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            v["timeline_database_backup_location"].as_str().unwrap(),
+            default_timeline_backup_path().to_string_lossy()
+        );
+        // A second call must not overwrite the existing file.
+        assert_eq!(create_config(dir.clone()).unwrap(), content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -115,13 +115,18 @@ enum PromptOutcome {
     TimedOut,
 }
 
-/// Per-peer-IP failed-PIN tracker: 5 consecutive failures lock that IP out for
-/// 60s. A correct PIN resets the counter. Modules share one PIN, so an attacker
-/// brute-forcing from a single address gets throttled while a legit module
-/// (different IP) is unaffected.
+/// Failed-PIN tracker keyed by `(peer IP, module name)`: 5 consecutive failures
+/// lock that identity out for 60s; a correct PIN resets it.
+///
+/// The key is `(IP, name)` and NOT the IP alone. The engine binds loopback by
+/// default, so EVERY local module and the TUI share `127.0.0.1`; a per-IP lock
+/// would let one misbehaving (or stale) module lock out the operator's own TUI
+/// and every healthy module with it. Keying by identity bounds the damage to the
+/// offender while still throttling brute force (a remote attacker must now vary
+/// the claimed module name, and each name gets only 5 tries).
 #[derive(Default, Clone)]
 struct PinGate {
-    inner: Arc<Mutex<HashMap<std::net::IpAddr, PinAttempt>>>,
+    inner: Arc<Mutex<HashMap<(std::net::IpAddr, String), PinAttempt>>>,
 }
 
 #[derive(Default)]
@@ -131,37 +136,41 @@ struct PinAttempt {
 }
 
 impl PinGate {
-    /// Whether a PIN attempt from `ip` is currently allowed.
-    fn check(&self, ip: std::net::IpAddr) -> bool {
+    /// Whether a PIN attempt for `(ip, name)` is currently allowed.
+    fn check(&self, ip: std::net::IpAddr, name: &str) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let inner = self.inner.lock().unwrap();
-        match inner.get(&ip) {
+        match inner.get(&(ip, name.to_string())) {
             Some(attempt) => attempt.locked_until_ms <= now,
             None => true,
         }
     }
 
-    /// Record a wrong PIN. After 5 consecutive failures the IP is locked for
-    /// 60s (checked via `locked_until_ms`).
-    fn record_failure(&self, ip: std::net::IpAddr) {
+    /// Record a wrong PIN for `(ip, name)`. After 5 consecutive failures that
+    /// identity is locked for 60s (checked via `locked_until_ms`).
+    fn record_failure(&self, ip: std::net::IpAddr, name: &str) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let mut inner = self.inner.lock().unwrap();
-        let attempt = inner.entry(ip).or_default();
+        // Bound the map: a flood of distinct names must not grow it forever.
+        if inner.len() >= 4096 {
+            inner.retain(|_, a| a.locked_until_ms > now);
+        }
+        let attempt = inner.entry((ip, name.to_string())).or_default();
         attempt.failures = attempt.failures.saturating_add(1);
         if attempt.failures >= 5 {
             attempt.locked_until_ms = now + 60_000;
         }
     }
 
-    /// Record a correct PIN: clear the per-IP failure state.
-    fn record_success(&self, ip: std::net::IpAddr) {
-        self.inner.lock().unwrap().remove(&ip);
+    /// Record a correct PIN: clear the failure state for `(ip, name)`.
+    fn record_success(&self, ip: std::net::IpAddr, name: &str) {
+        self.inner.lock().unwrap().remove(&(ip, name.to_string()));
     }
 }
 
@@ -602,11 +611,34 @@ pub async fn enrich_chat_user(
         Ok(r) => r,
         Err(_) => return,
     };
-    if !resp.success {
-        return;
-    }
-    let Some(user) = resp.user else {
-        return;
+    // Found → use it. Not found → CREATE the record so every chatter is tracked
+    // (score/rank/message accounting accrues from their first message). Every
+    // real adapter's identifier is a platform handle, so storing it as both
+    // `channel_id` and `handle` makes the NEXT lookup find this record instead
+    // of creating a duplicate. If the user-db is unreachable the create also
+    // fails and `user_data` simply stays unset.
+    let user = match resp.user {
+        Some(u) => u,
+        None => {
+            let username = chat
+                .user_data
+                .as_ref()
+                .map(|ud| ud.username.clone())
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| uid.clone());
+            let channel = crate::user_db_client::proto::ChannelRef {
+                platform: chat.platform.clone(),
+                channel_id: uid.clone(),
+                handle: uid.clone(),
+            };
+            match client.add_user(&username, Some(&channel)).await {
+                Ok(r) => match r.user {
+                    Some(u) => u,
+                    None => return,
+                },
+                Err(_) => return,
+            }
+        }
     };
 
     // Name color: check a "name_color" user value (e.g. set by mod tools).
@@ -643,6 +675,8 @@ pub async fn enrich_chat_user(
     css.insert("rank_value".to_string(), format!("{:.6}", user.rank));
     // Expose the raw score too, so displays can apply their own trust level.
     css.insert("score".to_string(), user.score.to_string());
+    // Expose the lifetime total score so displays can show long-term standing.
+    css.insert("total_score".to_string(), user.total_score.to_string());
     // Expose the rating counters so displays can show a reprimand indicator.
     css.insert("reprimands".to_string(), user.reprimands.to_string());
     css.insert("commendations".to_string(), user.commendations.to_string());
@@ -1131,12 +1165,34 @@ cockatiel
     // Database
     let db_config = DatabaseConfig {
         local_path: PathBuf::from(&config.timeline_database_location),
-        remote_url: Some(config.timeline_database_backup_location.clone()),
+        // Apply the same legacy→home migration rule the config backfill wrote
+        // to disk, so the FIRST boot after the upgrade already backs up to the
+        // home directory (not just the next one).
+        remote_url: Some(config::effective_timeline_backup_location(
+            &config.timeline_database_backup_location,
+        )),
         sync_interval_secs: 15,
         local_target_mb: config.timeline_database_target_mb,
     };
     let db = DatabaseManager::new(db_config);
-    db.initialize().await?;
+    // A missing/unusable timeline DB no longer kills the engine. It starts
+    // BLOCKED: it accepts connections and serves `db_status` (which reads only
+    // config, never the connection), dispatches nothing, and a retry task below
+    // opens the DB and unblocks the moment the path becomes usable.
+    let mut startup_block: Option<crate::pipeline::BlockedReason> = None;
+    match crate::database::timeline_db_path_problem(&config.timeline_database_location) {
+        Some(reason) => {
+            log_event_broadcast(&ui_state, format!("Timeline DB unavailable: {} — engine BLOCKED", reason));
+            startup_block = Some(crate::pipeline::BlockedReason::TimelineDb);
+        }
+        None => match db.initialize().await {
+            Ok(()) => {}
+            Err(e) => {
+                log_event_broadcast(&ui_state, format!("Timeline DB init failed: {} — engine BLOCKED", e));
+                startup_block = Some(crate::pipeline::BlockedReason::TimelineDb);
+            }
+        },
+    }
 
     // User database client (remote-only service, engine-internal). The token is
     // a real secret — never fall back to a known constant. The TUI supervisor
@@ -1362,23 +1418,109 @@ cockatiel
         log_event_broadcast(&ui_state, "Pipeline: running (COCKATIEL_START_PAUSED is off)");
     }
 
-    // Normalize any TEXT-stored uuid7 rows to BLOB (all keyed queries bind
-    // bytes; a BLOB param never equals a TEXT column in SQLite). Do this
-    // before the recovery drain so stranded rows are found and progressed.
-    match db.normalize_uuid_storage().await {
-        Ok(n) if n > 0 => log_event_broadcast(&ui_state, format!("Recovery: normalized {} uuid columns to BLOB", n)),
-        _ => {}
+    // A missing timeline DB blocks dispatch. The user-db reachability task
+    // spawned below adds its own block if the user database is down.
+    if let Some(reason) = startup_block {
+        orchestrator.set_block(reason).await;
     }
 
-    // Restart recovery: any 'processing' rows were mid-flight when the engine
-    // died — they can never complete, so mark them failed. Stranded 'queued'
-    // rows (inserted but never started) are drained by the recovery task
-    // spawned below.
-    match db.mark_all_processing_as_failed("interrupted by engine restart").await {
-        Ok(count) if count > 0 => {
-            log_event_broadcast(&ui_state, format!("Recovery: marked {} interrupted messages failed", count));
+    // DB-dependent startup steps are skipped while blocked: every one of them
+    // hits the (uninitialized) timeline DB. The retry task below runs them the
+    // moment the DB opens.
+    if startup_block.is_none() {
+        // Normalize any TEXT-stored uuid7 rows to BLOB (all keyed queries bind
+        // bytes; a BLOB param never equals a TEXT column in SQLite). Do this
+        // before the recovery drain so stranded rows are found and progressed.
+        match db.normalize_uuid_storage().await {
+            Ok(n) if n > 0 => log_event_broadcast(&ui_state, format!("Recovery: normalized {} uuid columns to BLOB", n)),
+            _ => {}
         }
-        _ => {}
+
+        // Restart recovery: any 'processing' rows were mid-flight when the engine
+        // died — they can never complete, so mark them failed. Stranded 'queued'
+        // rows (inserted but never started) are drained by the recovery task
+        // spawned below.
+        match db.mark_all_processing_as_failed("interrupted by engine restart").await {
+            Ok(count) if count > 0 => {
+                log_event_broadcast(&ui_state, format!("Recovery: marked {} interrupted messages failed", count));
+            }
+            _ => {}
+        }
+    }
+
+    // Timeline-DB retry: while blocked on a bad timeline path, poll until it is
+    // usable, open the DB, run the deferred startup steps, and unblock. When the
+    // operator had asked to resume (or auto-start had), the engine opens the gate
+    // itself.
+    if let Some(reason) = startup_block {
+        let db = db.clone();
+        let orchestrator = orchestrator.clone();
+        let config_state = Arc::clone(&config_state);
+        let ui_state = Arc::clone(&ui_state);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let config = get_config(&config_state);
+                if crate::database::timeline_db_path_problem(&config.timeline_database_location).is_some() {
+                    continue;
+                }
+                if db.initialize().await.is_ok() {
+                    match db.normalize_uuid_storage().await {
+                        Ok(n) if n > 0 => log_event_broadcast(&ui_state, format!("Recovery: normalized {} uuid columns to BLOB", n)),
+                        _ => {}
+                    }
+                    match db.mark_all_processing_as_failed("interrupted by engine restart").await {
+                        Ok(count) if count > 0 => log_event_broadcast(&ui_state, format!("Recovery: marked {} interrupted messages failed", count)),
+                        _ => {}
+                    }
+                    log_event_broadcast(&ui_state, "Timeline DB available — engine unblocked");
+                    if orchestrator.clear_block(reason).await {
+                        let outcome = orchestrator.resume().await;
+                        log_event_broadcast(&ui_state, format!("[pipeline] resumed after unblock — releasing {} held message(s)", outcome.resumed_messages));
+                    }
+                    break;
+                }
+            }
+        });
+    }
+
+    // User-database reachability: a missing user DB blocks dispatch too. The TUI
+    // owns building/launching the service; the engine only observes the port and
+    // unblocks (resuming if a resume was requested) once it is reachable.
+    {
+        let orchestrator = orchestrator.clone();
+        let ui_state = Arc::clone(&ui_state);
+        let host = user_db_host.clone();
+        let port = user_db_port;
+        tokio::spawn(async move {
+            let mut prev: Option<bool> = None;
+            loop {
+                let up = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    tokio::net::TcpStream::connect((host.as_str(), port)),
+                )
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false);
+                if !up {
+                    orchestrator.set_block(crate::pipeline::BlockedReason::UserDb).await;
+                    if prev == Some(true) {
+                        log_event_broadcast(&ui_state, format!("User database unreachable at {}:{} — engine BLOCKED", host, port));
+                    }
+                } else {
+                    let resume = orchestrator.clear_block(crate::pipeline::BlockedReason::UserDb).await;
+                    if prev == Some(false) {
+                        log_event_broadcast(&ui_state, "User database reachable — engine unblocked");
+                    }
+                    if resume {
+                        let outcome = orchestrator.resume().await;
+                        log_event_broadcast(&ui_state, format!("[pipeline] resumed after unblock — releasing {} held message(s)", outcome.resumed_messages));
+                    }
+                }
+                prev = Some(up);
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        });
     }
 
     // Spawn sync + timeout task
@@ -1420,6 +1562,12 @@ cockatiel
             let mut ticks_since_checkpoint = 0u32;
             loop {
                 interval.tick().await;
+                // While the timeline DB is uninitialized (engine BLOCKED), every
+                // sync/checkpoint call would just error. Skip the tick; the
+                // retry task opens the DB and the loop resumes normally.
+                if !db.is_initialized().await {
+                    continue;
+                }
                 match db.sync_to_remote().await {
                     Ok(0) => {}
                     Ok(n) => println!("[Sync] Synced {} events to backup", n),
@@ -1470,11 +1618,17 @@ cockatiel
     // row: all of them are in the snapshot, and a row inserted after it is one
     // the live pipeline owns and drives itself.
     {
+        let db = db.clone();
         let orchestrator = orchestrator.clone();
         let ui_state = ui_state.clone();
         let grace = config::get_config(&config_state).recovery_grace_secs;
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(grace as u64)).await;
+            // A timeline-DB block means there is nothing to drain yet; wait for
+            // the retry task to open the DB rather than erroring every pass.
+            while !db.is_initialized().await {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
             match orchestrator.drain_queued_once().await {
                 Ok(drain) => {
                     for (uuid, error) in drain.failures {
@@ -1549,6 +1703,18 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
     // Per-channel viewer/member counts, fed by the platform adapters and read
     // by other modules via the `channel_viewers` virtual query.
     let channel_stats: SharedChannelStats = Arc::new(Mutex::new(HashMap::new()));
+
+    // Latest stream leaderboard, pushed by the `stream-leaderboard` module and
+    // read by the TUI via the `stream_leaderboard` virtual query.
+    let leaderboard: queries::SharedLeaderboard = Arc::new(Mutex::new(None));
+
+    // Desired stream control (title / scheduled start / thumbnail), set by the
+    // TUI via `stream_control` and polled by the adapters via `stream_schedule`.
+    // Persisted next to the engine's config so a schedule survives a restart.
+    let stream_schedule: queries::SharedStreamSchedule =
+        Arc::new(Mutex::new(queries::StreamSchedule::load(
+            std::path::PathBuf::from("stream_schedule.json"),
+        )));
 
     // Control-surface shutdown signal. Parked at Idle until an accepted
     // `engine_shutdown` request moves it to Requested; the accept loop below
@@ -1630,6 +1796,8 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
         let user_db_client = Arc::clone(&user_db_client);
         let prompt_routes = Arc::clone(&prompt_routes);
         let channel_stats = Arc::clone(&channel_stats);
+        let leaderboard = Arc::clone(&leaderboard);
+        let stream_schedule = Arc::clone(&stream_schedule);
         let kill_map = Arc::clone(&kill_map);
         let cmd_registry = Arc::clone(&cmd_registry);
         let pin_gate = pin_gate.clone();
@@ -1666,6 +1834,8 @@ Duration::from_secs(bounds.handshake_timeout_secs as u64),
                         user_db_client,
                         prompt_routes,
                         channel_stats,
+                        leaderboard,
+                        stream_schedule,
                         kill_map,
                         cmd_registry,
                         shutdown,
@@ -1755,6 +1925,8 @@ async fn handle_connection<S>(
     user_db_client: SharedUserDbClient,
     prompt_routes: SharedPromptRoutes,
     channel_stats: SharedChannelStats,
+    leaderboard: queries::SharedLeaderboard,
+    stream_schedule: queries::SharedStreamSchedule,
     kill_map: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
     cmd_registry: Arc<Mutex<CommandRegistry>>,
     shutdown: SharedShutdown,
@@ -1808,6 +1980,34 @@ where
         log_to_timeline(&db, "module_reject", &container.module_name, "first message was not a ConnectionRequest").await;
         return Ok(());
     };
+
+    // Reject anything the module pipelined BEFORE it was authorized: the module
+    // must wait for its ConnectionRequestReturn (token) before sending anything.
+    // This runs BEFORE the return is sent, so a well-behaved module's first
+    // payload — which it sends only after receiving the return — is never
+    // discarded. (It used to run AFTER the return, which raced: a module that
+    // registered commands immediately after connecting had them dropped, so the
+    // engine never learned which commands it owned.)
+    for _ in 0..32 {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(40),
+            websocket.next(),
+        )
+        .await
+        {
+            Ok(Some(Ok(WsMessage::Binary(_)))) => {
+                log_event_broadcast(
+                    &ui_state,
+                    format!(
+                        "Discarded payload from '{}' sent before authorization",
+                        container.module_name
+                    ),
+                );
+                // keep draining — the module may have pipelined several.
+            }
+            _ => break,
+        }
+    }
 
     // ── Check if this is a reconnection (has auth_token) or new (has PIN) ──
 
@@ -1893,12 +2093,14 @@ where
         response.encode(&mut bytes)?;
         bounded_ws_send(&mut websocket, WsMessage::Binary(bytes), bounds.send_timeout_secs).await?;
     } else {
-        // New connection: validate PIN (throttled per peer IP — 5 consecutive
-        // failures lock the address out for 60s to blunt brute-force).
-        if !pin_gate.check(peer_ip) {
+        // New connection: validate PIN (throttled per (peer IP, module name) —
+        // 5 consecutive failures lock that identity out for 60s). Keying by
+        // identity rather than IP keeps one bad module from locking out every
+        // other loopback peer (the TUI included).
+        if !pin_gate.check(peer_ip, &container.module_name) {
             log_event(
                 &ui_state,
-                format!("PIN locked out for {}", peer_ip),
+                format!("PIN locked out for {} ({})", peer_ip, container.module_name),
             );
             let response = ContainerForModule {
                 version: 2,
@@ -1918,7 +2120,7 @@ where
             return Ok(());
         }
         if !verify_pin(request.pin, config::get_pin(&config_state)) {
-            pin_gate.record_failure(peer_ip);
+            pin_gate.record_failure(peer_ip, &container.module_name);
             log_event(
                 &ui_state,
                 format!("Rejected: invalid PIN from '{}'", container.module_name),
@@ -1941,7 +2143,7 @@ where
             websocket.close(None).await?;
             return Ok(());
         }
-        pin_gate.record_success(peer_ip);
+        pin_gate.record_success(peer_ip, &container.module_name);
 
         // Containment: reject the placeholder "unnamed_module" identity. The
         // client defaults to it when no name is configured, and if two modules
@@ -2190,29 +2392,6 @@ let mut bytes = Vec::new();
     // (running the normal cleanup) when the module goes unresponsive.
     let (kill_tx, mut kill_rx) = tokio::sync::watch::channel(false);
     kill_map.lock().await.insert(instance_uuid7.clone(), kill_tx);
-
-    // Reject anything the module pipelined BEFORE it was authorized: the only
-    // valid first payload after a fresh connection is nothing — the module must
-    // wait for its ConnectionRequestReturn (token) before sending anything. Any
-    // message that arrived while the approval was pending is discarded so a
-    // not-yet-authorized module can never inject a payload.
-    for _ in 0..32 {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(40),
-            websocket.next(),
-        )
-        .await
-        {
-            Ok(Some(Ok(WsMessage::Binary(_)))) => {
-                log_event_broadcast(
-                    &ui_state,
-                    format!("Discarded payload from '{}' sent before authorization", module_name),
-                );
-                // keep draining — the module may have pipelined several.
-            }
-            _ => break,
-        }
-    }
 
     // Set once this connection has queued the answer to an accepted
     // `engine_shutdown` request. The answer is, by construction, the next
@@ -2466,6 +2645,8 @@ let mut bytes = Vec::new();
                             discovered_registry: &discovered_registry,
                             prompt_routes: &prompt_routes,
                             channel_stats: &channel_stats,
+                            leaderboard: &leaderboard,
+                            stream_schedule: &stream_schedule,
                             module_name: &module_name,
                             instance_uuid7: &instance_uuid7,
                             tx: &tx,
@@ -2520,6 +2701,8 @@ Some(EnginePayload::QueryRequest(req)) => {
                             discovered_registry: &discovered_registry,
                             prompt_routes: &prompt_routes,
                             channel_stats: &channel_stats,
+                            leaderboard: &leaderboard,
+                            stream_schedule: &stream_schedule,
                             module_name: &module_name,
                             instance_uuid7: &instance_uuid7,
                             tx: &tx,

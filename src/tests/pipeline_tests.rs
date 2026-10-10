@@ -744,18 +744,17 @@ async fn module_authority_cascades_up_and_never_down() {
     assert!(!closed.is_open());
 }
 
-/// A post-process DISPLAY module (term-chat, audit-viewer) never registers
-/// commands — it is invisible to the command registry. A plain chat message
-/// (no command) must still reach it: the post-process stage sends to EVERY
-/// configured module when no command is attached, so displays see all chat.
-/// This is what makes term-chat work.
+/// A post-process module that registered specific commands (command-scoped)
+/// only handles the commands it owns. A plain chat message (no command) must
+/// NOT reach it — otherwise its price gate is charged for a message it would
+/// ignore. Displays/scorers/censors never register commands, so they still get
+/// plain chat; this pins the SKIP side of that rule.
 #[tokio::test]
-async fn a_plain_message_reaches_a_non_catchall_post_process_module() {
+async fn a_command_scoped_post_process_module_is_skipped_for_plain_messages() {
     let db = test_db().await;
     let (orchestrator, mut rx) = wired_orchestrator(db.clone(), &["pre"], &["mid"], &["display"]);
-    // Make "display" NOT a catch-all: give it a specific command. Before the
-    // fix, a plain message (no command) would resolve to only catch-alls —
-    // which is empty here — and "display" would never receive it.
+    // Make "display" command-scoped: give it a specific command. A plain message
+    // (no command) must then skip it.
     {
         let mut registry = orchestrator.command_registry.lock().unwrap();
         registry.register(
@@ -787,19 +786,128 @@ async fn a_plain_message_reaches_a_non_catchall_post_process_module() {
         .await
         .unwrap();
 
-    // The plain message reaches the non-catch-all display module.
-    assert_eq!(
-        take_broadcast(rx.get_mut("display").unwrap()),
-        uuid7,
-        "a display module must receive a plain chat message even though it registered specific commands"
+    // The command-scoped post-process module is skipped for a plain message.
+    assert!(
+        nothing_left(rx.get_mut("display").unwrap()),
+        "a command-scoped module must not receive a plain chat message"
+    );
+
+    // With no recipients left in the post-process stage the message completes
+    // without waiting on an ack that will never come.
+    let r = row(&db, &uuid7).await;
+    assert_eq!(r["pipeline_status"], "complete");
+}
+
+/// The bug this pins: a command-scoped module (one that registered specific
+/// commands) must not be charged its price gate for a plain message. With empty
+/// pre/in stages the message goes straight to post-process; there `tts` is
+/// command-scoped and `display` is a catch-all, so only `display` receives it.
+/// Before the fix, the no-command path fanned out to every post-process module,
+/// charging `tts`'s price for a message it ignores.
+#[tokio::test]
+async fn a_plain_message_skips_a_command_scoped_post_process_module() {
+    let db = test_db().await;
+    let (orchestrator, mut rx) = wired_orchestrator(db.clone(), &[], &[], &["tts", "display"]);
+    // Replace the helper's auto catch-all registration for "tts" with a specific
+    // command, making it command-scoped. "display" stays a catch-all.
+    {
+        let mut registry = orchestrator.command_registry.lock().unwrap();
+        registry.register(
+            "tts",
+            crate::cockatiel_protobuf::Commands {
+                commands: vec![crate::cockatiel_protobuf::Command {
+                    command_name: "tts".into(),
+                    command_flag: "!".into(),
+                    command_description: String::new(),
+                    command_flags: vec![],
+                }],
+                alert_on_unknown_command: false,
+            },
+        );
+    }
+
+    orchestrator
+        .handle_message_from_module(&adapter_ingest("hello there"))
+        .await
+        .unwrap();
+
+    // The catch-all display receives it; the command-scoped tts does not — so
+    // permit_module (its price gate) is never consulted for tts.
+    let uuid7 = take_broadcast(rx.get_mut("display").unwrap());
+    assert!(
+        nothing_left(rx.get_mut("tts").unwrap()),
+        "a command-scoped module must not be charged for a plain message"
     );
 
     orchestrator
-        .handle_message_from_module(&post_reply("display", &uuid7, "final"))
+        .handle_message_from_module(&post_reply("display", &uuid7, "hello there"))
         .await
         .unwrap();
     let r = row(&db, &uuid7).await;
     assert_eq!(r["pipeline_status"], "complete");
+}
+
+/// A post-process DISPLAY must see command messages too — it renders `!tts`,
+/// `!ban`, … and, for a generator like `tts-rs`, plays the inline audio the
+/// command produced. Before the fix the post-process stage narrowed a command to
+/// owner + catch-alls, so a display that never registers commands (term-chat)
+/// received no `!tts` message at all. A command-scoped module still only sees
+/// the command it owns.
+#[tokio::test]
+async fn a_command_reaches_post_process_displays_and_its_owner_but_not_a_foreign_module() {
+    let db = test_db().await;
+    let (orchestrator, mut rx) =
+        wired_orchestrator(db.clone(), &[], &[], &["display", "owner-mod", "other-cmd"]);
+    {
+        let mut registry = orchestrator.command_registry.lock().unwrap();
+        registry.register("owner-mod", command_set("foo"));
+        registry.register("other-cmd", command_set("bar"));
+        // "display" keeps the helper's catch-all: it never registers commands.
+    }
+
+    // Ingest a message carrying the `!foo` command (the pipeline tests don't run
+    // the ingest-time parser, so attach it directly).
+    let mut ingest = adapter_ingest("!foo hi");
+    if let Some(EnginePayload::MessagePreProcess(pre)) = ingest.payload.as_mut()
+        && let Some(chat) = pre.raw_message.as_mut()
+    {
+        chat.command = Some(crate::cockatiel_protobuf::Command {
+            command_name: "foo".into(),
+            command_flag: "!".into(),
+            command_description: String::new(),
+            command_flags: vec![],
+        });
+    }
+    orchestrator
+        .handle_message_from_module(&ingest)
+        .await
+        .unwrap();
+
+    // The display AND the owning module both receive it; the foreign
+    // command-scoped module does not.
+    let uuid7 = take_broadcast(rx.get_mut("display").unwrap());
+    assert_eq!(
+        take_broadcast(rx.get_mut("owner-mod").unwrap()),
+        uuid7,
+        "the command owner must receive its command"
+    );
+    assert!(
+        nothing_left(rx.get_mut("other-cmd").unwrap()),
+        "a module that owns a different command must not receive this one"
+    );
+}
+
+/// A one-command `Commands` registration for routing tests.
+fn command_set(name: &str) -> crate::cockatiel_protobuf::Commands {
+    crate::cockatiel_protobuf::Commands {
+        commands: vec![crate::cockatiel_protobuf::Command {
+            command_name: name.into(),
+            command_flag: "!".into(),
+            command_description: String::new(),
+            command_flags: vec![],
+        }],
+        alert_on_unknown_command: false,
+    }
 }
 
 /// Regression: two recipients acking the same message near-simultaneously must
@@ -922,6 +1030,90 @@ async fn a_critical_timeout_does_not_clobber_an_audit_hold() {
     assert_eq!(r["pipeline_status"], "audit", "a hold must survive a critical timeout");
     assert_eq!(r["flags"], "needs a moderator");
     assert!(r["error_message"].is_null(), "the hold must not record the timeout as an error");
+}
+
+/// The bug this pins: `refresh_user_data` re-reads the message owner's CURRENT
+/// score so downstream stages / displays see what the in-process scorer just
+/// did. It used to run at the pre-process boundary; scoring moved into the
+/// in-process stage, so the refresh must now run when the LAST in-process module
+/// acks — right before the handoff to post-process — in BOTH the ack path and
+/// the timeout sweep. Structural because a missing user-db (as in every test
+/// here) makes the helper a silent no-op, so behavior alone can't observe it.
+#[test]
+fn refresh_user_data_moved_to_the_in_process_to_post_process_boundary() {
+    // Collapse all whitespace so the assertions don't depend on indentation.
+    let src: String = include_str!("../pipeline.rs")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+
+    // Present: the refresh immediately precedes `start_post_process` in both the
+    // handle_ack path and the timeout sweep.
+    for needle in [
+        "self.refresh_user_data(uuid7).await;self.start_post_process(uuid7).await?;",
+        "self.refresh_user_data(&entry.uuid7).await;self.start_post_process(&entry.uuid7).await?;",
+    ] {
+        assert!(
+            src.contains(needle),
+            "refresh must precede start_post_process at the in-process boundary: {needle:?}"
+        );
+    }
+
+    // Gone: the refresh must no longer sit on the pre-process -> in-process edge.
+    for gone in [
+        "self.note_pre_process_completed(uuid7).await;self.refresh_user_data(uuid7).await;",
+        "self.note_pre_process_completed(&entry.uuid7).await;self.refresh_user_data(&entry.uuid7).await;",
+    ] {
+        assert!(
+            !src.contains(gone),
+            "refresh must have left the pre-process boundary: {gone:?}"
+        );
+    }
+
+    // Exactly the two boundary call sites — not added to the empty-in-process
+    // path or anywhere else. (The definition is `fn refresh_user_data(&self`,
+    // which does not match this pattern.)
+    assert_eq!(
+        src.matches("self.refresh_user_data(").count(),
+        2,
+        "refresh_user_data must be called at exactly the two in-process->post edges"
+    );
+}
+
+/// The in-process -> post-process handoff the refresh now sits on: with a single
+/// in-process module, post-process must not be dispatched until that module acks,
+/// and that last ack is what dispatches it. (`refresh_user_data` runs on this
+/// edge — see the structural test above — so the last in-process ack is the
+/// moment downstream stages get the refreshed user.)
+#[tokio::test]
+async fn the_last_in_process_ack_hands_off_to_post_process() {
+    let db = test_db().await;
+    let (orchestrator, mut rx) = wired_orchestrator(db.clone(), &["pre"], &["mid"], &["post"]);
+
+    orchestrator
+        .handle_message_from_module(&adapter_ingest("raw text"))
+        .await
+        .unwrap();
+    let uuid7 = take_broadcast(rx.get_mut("pre").unwrap());
+    orchestrator
+        .handle_message_from_module(&pre_reply("pre", &uuid7, "raw text"))
+        .await
+        .unwrap();
+
+    // The in-process head got it; post-process must wait for the ack.
+    assert_eq!(take_broadcast(rx.get_mut("mid").unwrap()), uuid7);
+    assert!(
+        nothing_left(rx.get_mut("post").unwrap()),
+        "post-process must wait for the in-process stage to finish"
+    );
+
+    orchestrator
+        .handle_message_from_module(&in_reply("mid", &uuid7, "scored text", false))
+        .await
+        .unwrap();
+
+    // The in-process completion is what dispatches post-process.
+    assert_eq!(take_broadcast(rx.get_mut("post").unwrap()), uuid7);
 }
 
 /// A module abandon must not clobber an audit hold either.

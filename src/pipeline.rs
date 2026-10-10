@@ -22,25 +22,34 @@ const MAX_ACK_RESENDS: u32 = 3;
 ///
 /// A message with a parsed command goes ONLY to the owning module + any
 /// catch-all modules (modules that registered an empty command set). A message
-/// with NO command goes ONLY to catch-alls. Anything else — a module that
-/// registered specific commands it didn't get — is skipped, so no module is
-/// burdened with packages it doesn't need (and the fanout doesn't spend
-/// network/ack time on them).
+/// with NO command goes to every module in the stage EXCEPT command-scoped ones
+/// (modules that registered specific commands): those only handle their own
+/// commands, so sending them plain chat would waste work they ignore AND charge
+/// their price gate for a message they do not process. Catch-alls and
+/// never-registered displays/scorers/censors still receive every plain message.
 ///
 /// `stage_modules` is the stage's configured module list, so the result is
-/// always a subset of it (a command owner registered for a different stage is
-/// naturally absent). Returns `None` when scoping is inapplicable (the message
-/// should go to every module in the stage) — currently never, but kept as a
-/// deliberate escape hatch.
+/// always a subset of it. Returns `None` only for the (currently unused)
+/// escape hatch meaning "every module in the stage".
 pub(crate) fn command_recipients(
     parsed_command: Option<&Command>,
     registry: &CommandRegistry,
     stage_modules: &[String],
 ) -> Option<Vec<String>> {
+    let Some(cmd) = parsed_command else {
+        // No command: every stage module that is NOT command-scoped. Catch-alls
+        // and never-registered modules (scorers, censors, displays) receive it;
+        // command-scoped modules are skipped so their price gate is not charged.
+        return Some(
+            stage_modules
+                .iter()
+                .filter(|m| !registry.is_command_scoped(m))
+                .cloned()
+                .collect(),
+        );
+    };
     let mut targets: Vec<String> = Vec::new();
-    if let Some(cmd) = parsed_command
-        && let Some(owner) = registry.owner(&cmd.command_flag, &cmd.command_name)
-    {
+    if let Some(owner) = registry.owner(&cmd.command_flag, &cmd.command_name) {
         targets.push(owner);
     }
     targets.extend(registry.catch_alls());
@@ -147,7 +156,43 @@ pub enum HoldPoint {
     PostProcess,
 }
 
-/// The engine's pause state, and the messages a pause is holding.
+/// A required dependency the engine cannot run without. While one is missing the
+/// engine is BLOCKED: it accepts connections and ingests, but dispatches
+/// nothing (exactly like a pause) until the dependency appears.
+///
+/// Reported to the UIs through `db_status` so the operator sees WHY nothing is
+/// moving, instead of a misleading PAUSED badge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockedReason {
+    /// The user database service is not reachable. The TUI owns its lifecycle
+    /// (builds/launches it); the engine only observes reachability.
+    UserDb,
+    /// The configured timeline database location is unusable (empty path, or
+    /// its parent directory is missing and cannot be created).
+    TimelineDb,
+}
+
+impl BlockedReason {
+    /// The wire string reported in `db_status`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlockedReason::UserDb => "user_db",
+            BlockedReason::TimelineDb => "timeline_db",
+        }
+    }
+
+    /// Higher outranks lower when both are missing: a broken timeline DB is the
+    /// more fundamental fault, so it is the reason reported while both are down.
+    fn priority(self) -> u8 {
+        match self {
+            BlockedReason::TimelineDb => 2,
+            BlockedReason::UserDb => 1,
+        }
+    }
+}
+
+/// The engine's pause state, the messages a pause is holding, and whether a
+/// required dependency is currently blocking dispatch.
 ///
 /// `held` is keyed by uuid7 in a `BTreeMap` so the resume order is uuid7 order,
 /// which is time order for uuid7s — the same ordering the recovery drain gets
@@ -156,6 +201,13 @@ pub enum HoldPoint {
 struct PauseState {
     paused: bool,
     held: BTreeMap<String, HoldPoint>,
+    /// The missing dependency gating dispatch, if any. `None` = not blocked.
+    blocked: Option<BlockedReason>,
+    /// When a block clears, should the engine resume automatically? Set when the
+    /// operator (or auto-start) asks to resume WHILE blocked; cleared when the
+    /// operator asks to pause while blocked. Drives the UI's
+    /// "will resume on clear" / "will stay paused after clear" wording.
+    resume_when_unblocked: bool,
 }
 
 /// What a resume did, for the control surface's response and the log line.
@@ -713,9 +765,70 @@ impl PipelineOrchestrator {
     // message while paused is persisted as 'queued' and joins the held set, so
     // nothing is lost and resume is just "work through a bigger queue".
 
-    /// Is the pipeline holding every dispatch to every module?
+    /// Is the pipeline holding every dispatch to every module? This is the
+    /// OPERATOR pause flag specifically; `is_gated` also folds in a missing
+    /// dependency block.
     pub async fn is_paused(&self) -> bool {
         self.pause_state.lock().await.paused
+    }
+
+    /// The missing dependency gating dispatch, if any (for `db_status`).
+    pub async fn blocked_reason(&self) -> Option<BlockedReason> {
+        self.pause_state.lock().await.blocked
+    }
+
+    /// Whether the engine will resume automatically when the block clears.
+    pub async fn will_resume_on_unblock(&self) -> bool {
+        self.pause_state.lock().await.resume_when_unblocked
+    }
+
+    /// Is dispatch held, either by an operator pause or a dependency block?
+    pub async fn is_gated(&self) -> bool {
+        let state = self.pause_state.lock().await;
+        state.paused || state.blocked.is_some()
+    }
+
+    /// Block dispatch on a missing dependency. A higher-priority reason (a
+    /// broken timeline DB) is not overwritten by a lower one (a missing user
+    /// DB), so the reported cause is the more fundamental fault.
+    pub async fn set_block(&self, reason: BlockedReason) {
+        let mut state = self.pause_state.lock().await;
+        let replace = match state.blocked {
+            None => true,
+            Some(current) => reason.priority() > current.priority(),
+        };
+        if replace {
+            state.blocked = Some(reason);
+        }
+    }
+
+    /// Clear the block if it matches `reason`. Returns `true` when the caller
+    /// should now run [`Self::resume`] — i.e. the block cleared and the operator
+    /// had asked to resume (or auto-start had). A block that stays paused after
+    /// clearing returns `false`, and the operator resumes normally.
+    pub async fn clear_block(&self, reason: BlockedReason) -> bool {
+        let mut state = self.pause_state.lock().await;
+        if state.blocked != Some(reason) {
+            return false;
+        }
+        state.blocked = None;
+        let resume = state.resume_when_unblocked;
+        state.resume_when_unblocked = false;
+        resume
+    }
+
+    /// The operator (or auto-start) asked to resume while blocked: remember the
+    /// intent so the engine opens the gate the moment the block clears.
+    pub async fn defer_resume(&self) {
+        self.pause_state.lock().await.resume_when_unblocked = true;
+    }
+
+    /// The operator asked to pause (or stay paused) while blocked: record that
+    /// the engine must NOT auto-resume when the block clears, and hold now.
+    pub async fn defer_pause(&self) {
+        let mut state = self.pause_state.lock().await;
+        state.resume_when_unblocked = false;
+        state.paused = true;
     }
 
     /// How many messages are waiting on a resume, for the control surface.
@@ -740,14 +853,16 @@ impl PipelineOrchestrator {
 
     /// The one gate every dispatch point asks before it touches a module's
     /// socket. `true` means HELD — the caller must return without dispatching.
+    /// Holds on either an operator pause OR a missing-dependency block; the two
+    /// are indistinguishable to a message, and both release through `resume`.
     ///
     /// `uuid7`/`point` are recorded so [`Self::resume`] can replay exactly the
     /// dispatch that was skipped. One message is held at one point: the ack that
     /// advanced it to that point consumed the tracker's entry, so no second ack
     /// can advance the same stage and re-hold it.
-    async fn hold_if_paused(&self, uuid7: &str, point: HoldPoint) -> bool {
+    async fn hold_if_gated(&self, uuid7: &str, point: HoldPoint) -> bool {
         let mut state = self.pause_state.lock().await;
-        if !state.paused {
+        if !state.paused && state.blocked.is_none() {
             return false;
         }
         state.held.insert(uuid7.to_string(), point);
@@ -1025,7 +1140,7 @@ impl PipelineOrchestrator {
         // this same fanout from `HoldPoint::Entry`. Both entries into the chain
         // funnel through here (live ingest and crash recovery), so one gate
         // covers both.
-        if self.hold_if_paused(uuid7, HoldPoint::Entry).await {
+        if self.hold_if_gated(uuid7, HoldPoint::Entry).await {
             return Ok(());
         }
 
@@ -1062,10 +1177,10 @@ impl PipelineOrchestrator {
         };
 
         // Command routing: a message with a registered command goes ONLY to the
-        // owning module + any catch-all modules; a message with no command goes
-        // ONLY to catch-alls. A module that registered specific commands it
-        // didn't get is skipped — it is never burdened with packages it
-        // doesn't need.
+        // owning module + any catch-all modules; a message with NO command goes
+        // to EVERY module in the stage (scorers, censors and displays all need
+        // plain chat). A module that registered specific commands it didn't get
+        // is skipped — it is never burdened with commands it doesn't handle.
         let cfg = self.config_snapshot().await;
         let targets = {
             let registry = self.command_registry.lock().unwrap();
@@ -1132,7 +1247,7 @@ impl PipelineOrchestrator {
         // state and its `current_in_process_index`, so the replay sends it to the
         // module it was about to reach — and the audit check, the stage stamp
         // and the send all wait for the resume rather than half-happening.
-        if self.hold_if_paused(uuid7, HoldPoint::InProcess).await {
+        if self.hold_if_gated(uuid7, HoldPoint::InProcess).await {
             return Ok(());
         }
 
@@ -1185,10 +1300,10 @@ impl PipelineOrchestrator {
             )),
         };
 
-        // Command routing: an in-process module only processes messages for the
-        // commands it registered (plus catch-alls). If THIS module isn't a
-        // recipient, skip it without sending — it shouldn't bear packages it
-        // doesn't need.
+        // Command routing: a COMMAND message is only processed by the module
+        // that registered it (plus catch-alls); a message with NO command is
+        // processed by every in-process module, in order. If THIS module isn't a
+        // recipient, skip it without sending.
         let is_recipient = {
             let registry = self.command_registry.lock().unwrap();
             let targets =
@@ -1276,7 +1391,7 @@ impl PipelineOrchestrator {
         // state, let the replay finish it. Note this also covers the
         // no-module-connected completion below, so a message cannot reach a
         // terminal 'complete' write while the pipeline is held.
-        if self.hold_if_paused(uuid7, HoldPoint::PostProcess).await {
+        if self.hold_if_gated(uuid7, HoldPoint::PostProcess).await {
             return Ok(());
         }
 
@@ -1330,24 +1445,24 @@ impl PipelineOrchestrator {
 
         let cfg = self.config_snapshot().await;
 
-        // Command routing: a message that carries a parsed command only reaches
-        // the post-process modules that own it (plus catch-alls). A message with
-        // NO command goes to EVERY configured post-process module — display
-        // modules (term-chat, audit-viewer) never register commands and must
-        // see every chat message, which is the whole point of a display. So the
-        // narrowing only applies when a command is actually attached.
+        // Post-process modules are display/archival CONSUMERS: they see EVERY
+        // message, commands included — that is the whole point of a display
+        // (term-chat, audit-viewer never register commands, yet must render
+        // `!tts`, `!ban`, …). The only exception is a command-scoped module,
+        // which handles only the command it owns and must never be sent a
+        // message it ignores (that would charge its price gate for nothing).
+        // So: every non-command-scoped post-process module + the command owner.
         let recipients: Vec<String> = {
             let registry = self.command_registry.lock().unwrap();
-            if state.parsed_command.is_some() {
-                command_recipients(state.parsed_command.as_ref(), &registry, &cfg.post_process_modules)
-                    .unwrap_or_default()
-            } else {
-                // No command: every configured post-process module is a display
-                // and receives the message. (This is what makes term-chat work —
-                // it is invisible to the command registry, so the catch-all-only
-                // path would skip it for every plain chat message.)
-                cfg.post_process_modules.clone()
-            }
+            let owner = state
+                .parsed_command
+                .as_ref()
+                .and_then(|c| registry.owner(&c.command_flag, &c.command_name));
+            cfg.post_process_modules
+                .iter()
+                .filter(|m| !registry.is_command_scoped(m) || owner.as_deref() == Some(m.as_str()))
+                .cloned()
+                .collect()
         };
 
         let mut sent_any = false;
@@ -1566,6 +1681,34 @@ impl PipelineOrchestrator {
         Ok(())
     }
 
+    /// Re-read the message owner's enriched `user_data` after the pre-process
+    /// stage. The ingest-time enrichment captures the user's score BEFORE any
+    /// pre-process scorer module (score-messages) adjusted it, so without this
+    /// the downstream stages — and displays like term-chat — would show a score
+    /// one message behind. Best-effort: a failure leaves the ingest value.
+    async fn refresh_user_data(&self, uuid7: &str) {
+        let Some(client) = self.user_db.as_ref() else { return };
+        let (platform, user_uuid7) = {
+            let states = self.pipeline_states.lock().await;
+            match states.get(uuid7) {
+                Some(s) if !s.user_uuid7.is_empty() => (s.platform.clone(), s.user_uuid7.clone()),
+                _ => return,
+            }
+        };
+        let mut chat = cockatiel_protobuf::ChatMessage {
+            platform,
+            user_uuid7,
+            ..Default::default()
+        };
+        crate::enrich_chat_user(client, &mut chat).await;
+        if chat.user_data.is_some() {
+            let mut states = self.pipeline_states.lock().await;
+            if let Some(state) = states.get_mut(uuid7) {
+                state.user_data = chat.user_data;
+            }
+        }
+    }
+
     pub async fn handle_ack(
         &self,
         uuid7: &str,
@@ -1613,6 +1756,7 @@ impl PipelineOrchestrator {
                 };
 
                 if next_index >= cfg.in_process_modules.len() {
+                    self.refresh_user_data(uuid7).await;
                     self.start_post_process(uuid7).await?;
                 } else {
                     self.start_in_process(uuid7).await?;
@@ -1742,8 +1886,9 @@ impl PipelineOrchestrator {
         // advance at all while paused, and `resume` restarts every pending
         // ack's clock before running it — each in-flight message then gets its
         // FULL budget from the moment processing resumes, and one that really
-        // has a dead module still times out.
-        if self.is_paused().await {
+        // has a dead module still times out. A dependency block gates the sweep
+        // the same way (and `clear_block` + `resume` restart the clocks).
+        if self.is_gated().await {
             return Ok(());
         }
 
@@ -1841,6 +1986,7 @@ impl PipelineOrchestrator {
                         };
 
                         if next_index >= cfg.in_process_modules.len() {
+                            self.refresh_user_data(&entry.uuid7).await;
                             self.start_post_process(&entry.uuid7).await?;
                         } else {
                             self.start_in_process(&entry.uuid7).await?;

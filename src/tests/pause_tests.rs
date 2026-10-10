@@ -20,7 +20,7 @@ use super::pipeline_tests::{
     ModuleRx, adapter_ingest, in_reply, nothing_left, post_reply, pre_reply, row, take_broadcast,
     test_db, wired_orchestrator,
 };
-use crate::pipeline::PipelineOrchestrator;
+use crate::pipeline::{BlockedReason, PipelineOrchestrator};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -535,4 +535,101 @@ async fn a_paused_engine_defers_recovered_rows_to_the_resume() {
     orchestrator.resume().await;
     let drained = wait_for_broadcasts(rx.get_mut("pre").unwrap(), 1, "the deferred recovery").await;
     assert_eq!(drained, vec![stranded]);
+}
+
+// ── Dependency blocks gate dispatch exactly like a pause ──────────────
+
+/// A missing required dependency (user DB / timeline DB) blocks dispatch, but
+/// is NOT an operator pause: `is_paused` stays false while `is_gated` is true,
+/// so the UI can say BLOCKED rather than PAUSED.
+#[tokio::test]
+async fn a_block_gates_dispatch_and_is_distinct_from_a_pause() {
+    let (orchestrator, mut rx) = orchestrator_with(3000, false).await;
+    assert!(orchestrator.blocked_reason().await.is_none());
+    assert!(!orchestrator.is_gated().await);
+
+    orchestrator.set_block(BlockedReason::UserDb).await;
+    assert_eq!(orchestrator.blocked_reason().await, Some(BlockedReason::UserDb));
+    assert!(orchestrator.is_gated().await, "a block gates dispatch");
+    assert!(!orchestrator.is_paused().await, "a block is not an operator pause");
+
+    orchestrator
+        .handle_message_from_module(&adapter_ingest("blocked at the door"))
+        .await
+        .unwrap();
+    no_module_saw_anything(&mut rx);
+    assert_eq!(orchestrator.held_count().await, 1, "held, not lost");
+    // The ack sweep is gated while blocked, same as a pause.
+    orchestrator.handle_timeout().await.unwrap();
+}
+
+/// A resume requested while blocked is deferred: clearing the block then signals
+/// the caller to resume (the UI's "will resume on clear").
+#[tokio::test]
+async fn clear_block_signals_a_resume_when_one_was_deferred() {
+    let (orchestrator, _rx) = orchestrator_with(3000, true).await;
+    orchestrator.set_block(BlockedReason::UserDb).await;
+    orchestrator.defer_resume().await;
+    assert!(orchestrator.will_resume_on_unblock().await);
+
+    assert!(
+        orchestrator.clear_block(BlockedReason::UserDb).await,
+        "clearing after a deferred resume must signal a resume"
+    );
+    assert!(orchestrator.blocked_reason().await.is_none());
+    assert!(
+        !orchestrator.will_resume_on_unblock().await,
+        "the deferred intent is consumed by the clear"
+    );
+}
+
+/// A pause requested while blocked means the engine must STAY paused after the
+/// block clears (the UI's "will stay paused after clear").
+#[tokio::test]
+async fn clear_block_stays_paused_when_a_pause_was_deferred() {
+    let (orchestrator, _rx) = orchestrator_with(3000, false).await;
+    orchestrator.set_block(BlockedReason::UserDb).await;
+    orchestrator.defer_pause().await;
+    assert!(orchestrator.is_paused().await, "defer_pause holds immediately");
+    assert!(!orchestrator.will_resume_on_unblock().await);
+
+    assert!(
+        !orchestrator.clear_block(BlockedReason::UserDb).await,
+        "a deferred pause must not auto-resume"
+    );
+    assert!(orchestrator.blocked_reason().await.is_none());
+    assert!(orchestrator.is_paused().await, "stays paused after the block clears");
+}
+
+/// Timeline-DB is the more fundamental fault, so it outranks a user-DB block and
+/// is what gets reported while both are down. Clearing a different reason is a
+/// no-op.
+#[tokio::test]
+async fn timeline_block_outranks_user_db_and_clears_independently() {
+    let (orchestrator, _rx) = orchestrator_with(3000, false).await;
+    orchestrator.set_block(BlockedReason::UserDb).await;
+    orchestrator.set_block(BlockedReason::TimelineDb).await;
+    assert_eq!(
+        orchestrator.blocked_reason().await,
+        Some(BlockedReason::TimelineDb),
+        "timeline-db outranks user-db"
+    );
+
+    // A lower-priority block must not overwrite the higher one.
+    orchestrator.set_block(BlockedReason::UserDb).await;
+    assert_eq!(
+        orchestrator.blocked_reason().await,
+        Some(BlockedReason::TimelineDb)
+    );
+
+    // Clearing a DIFFERENT reason is a no-op.
+    assert!(!orchestrator.clear_block(BlockedReason::UserDb).await);
+    assert_eq!(
+        orchestrator.blocked_reason().await,
+        Some(BlockedReason::TimelineDb)
+    );
+
+    // Clearing the matching reason works (no resume was deferred).
+    assert!(!orchestrator.clear_block(BlockedReason::TimelineDb).await);
+    assert!(orchestrator.blocked_reason().await.is_none());
 }

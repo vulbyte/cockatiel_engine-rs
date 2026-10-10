@@ -151,47 +151,70 @@ impl ModuleRegistry {
                 continue;
             }
 
-            let entries = match fs::read_dir(root) {
-                Ok(entries) => entries,
+            self.discover_in(root, &mut errors);
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Recursively walk `dir`, collecting launchable module manifests.
+    ///
+    /// A directory that contains a `cockatiel_module_info.json` is a LEAF:
+    /// whether it loads as a valid module or not (core `kind`, invalid JSON,
+    /// empty name), we never descend into its internals (`src/`, `target/`, …).
+    /// A directory without a manifest is scanned recursively. Non-directory
+    /// entries are ignored.
+    fn discover_in(&mut self, dir: &Path, errors: &mut Vec<String>) {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                errors.push(format!(
+                    "Could not read module directory {}: {}",
+                    dir.display(),
+                    error
+                ));
+                return;
+            }
+        };
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
                 Err(error) => {
-                    errors.push(format!(
-                        "Could not read module directory {}: {}",
-                        root.display(),
-                        error
-                    ));
+                    errors.push(format!("Could not read module directory entry: {}", error));
                     continue;
                 }
             };
 
-            for entry in entries {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(error) => {
-                        errors.push(format!("Could not read module directory entry: {}", error));
-                        continue;
-                    }
-                };
+            let path = entry.path();
 
-                let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
 
-                if !path.is_dir() {
-                    continue;
-                }
-
+            let manifest_path = path.join("cockatiel_module_info.json");
+            if manifest_path.exists() {
+                // A directory with a manifest is a leaf — never scan its
+                // internals for more modules.
                 match Self::load_manifest(&path) {
                     Ok(Some(module)) => {
                         let name = module.manifest.name.clone();
 
-                        if self.modules.contains_key(&name) {
+                        if let std::collections::hash_map::Entry::Vacant(slot) =
+                            self.modules.entry(name.clone())
+                        {
+                            slot.insert(module);
+                        } else {
                             errors.push(format!(
                                 "Duplicate module manifest for '{}': {}",
                                 name,
                                 path.display()
                             ));
-                            continue;
                         }
-
-                        self.modules.insert(name, module);
                     }
 
                     Ok(None) => {}
@@ -200,13 +223,9 @@ impl ModuleRegistry {
                         errors.push(error);
                     }
                 }
+            } else {
+                self.discover_in(&path, errors);
             }
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
         }
     }
 
@@ -257,5 +276,105 @@ impl ModuleRegistry {
 
     pub fn len(&self) -> usize {
         self.modules.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ckt-modmgr-{}-{}", tag, uuid::Uuid::now_v7()))
+    }
+
+    fn write_manifest(dir: &Path, name: &str, kind: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("cockatiel_module_info.json"),
+            format!(r#"{{"name":"{}","kind":"{}"}}"#, name, kind),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn discovers_a_module_nested_two_levels_deep() {
+        let root = temp_root("nested");
+        write_manifest(&root.join("group").join("deep-module"), "deep-module", "module");
+
+        let mut registry = ModuleRegistry::new();
+        registry
+            .discover(std::slice::from_ref(&root))
+            .expect("discovery succeeds");
+
+        assert!(registry.get("deep-module").is_some());
+        assert_eq!(registry.len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_directory_with_a_manifest_is_a_leaf() {
+        let root = temp_root("leaf");
+        // The outer plugin is a leaf; its internals (e.g. `target/`) must not
+        // be scanned even though they contain another manifest.
+        write_manifest(&root.join("plugin-a"), "plugin-a", "module");
+        write_manifest(
+            &root.join("plugin-a").join("target").join("nested"),
+            "should-not-be-found",
+            "module",
+        );
+
+        let mut registry = ModuleRegistry::new();
+        registry
+            .discover(std::slice::from_ref(&root))
+            .expect("discovery succeeds");
+
+        assert!(registry.get("plugin-a").is_some());
+        assert!(
+            registry.get("should-not-be-found").is_none(),
+            "a plugin directory must be a leaf"
+        );
+        assert_eq!(registry.len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn core_kind_components_are_skipped_and_do_not_block_walk() {
+        let root = temp_root("core");
+        write_manifest(&root.join("core-component"), "engine", "engine");
+        write_manifest(&root.join("real-module"), "real-module", "module");
+
+        let mut registry = ModuleRegistry::new();
+        registry
+            .discover(std::slice::from_ref(&root))
+            .expect("discovery succeeds");
+
+        assert!(registry.get("engine").is_none(), "core kind must be skipped");
+        assert!(registry.get("real-module").is_some());
+        assert_eq!(registry.len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn non_directory_entries_are_ignored() {
+        let root = temp_root("files");
+        fs::create_dir_all(&root).unwrap();
+        // A stray file, even one named like a manifest, is not a directory.
+        fs::write(root.join("readme.txt"), "hello").unwrap();
+        fs::write(
+            root.join("cockatiel_module_info.json"),
+            r#"{"name":"not-a-dir"}"#,
+        )
+        .unwrap();
+        write_manifest(&root.join("actual-module"), "actual-module", "module");
+
+        let mut registry = ModuleRegistry::new();
+        registry
+            .discover(std::slice::from_ref(&root))
+            .expect("discovery succeeds");
+
+        assert!(registry.get("not-a-dir").is_none());
+        assert!(registry.get("actual-module").is_some());
+        assert_eq!(registry.len(), 1);
+        let _ = fs::remove_dir_all(&root);
     }
 }

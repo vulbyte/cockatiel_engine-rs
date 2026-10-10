@@ -166,6 +166,95 @@ impl ShutdownSignal {
 /// The fields are the same `Arc`/`Mutex` shapes the loop already held; this
 /// only gives the query code a name for them instead of reaching into the
 /// loop's locals.
+/// The latest stream leaderboard JSON, pushed by the `stream-leaderboard`
+/// module (`leaderboard_report`) and served to the control surface
+/// (`stream_leaderboard`). `None` until the module reports.
+pub(crate) type SharedLeaderboard = Arc<Mutex<Option<serde_json::Value>>>;
+
+/// The operator's desired stream control (title / scheduled start / thumbnail),
+/// set by the TUI via `stream_control`. Platform adapters poll `stream_schedule`
+/// and apply it. `revision` bumps on every change so an adapter can tell whether
+/// it has already applied the current values.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StreamControl {
+    #[serde(default)]
+    pub title: String,
+    /// Scheduled start, epoch milliseconds. `0` = no schedule.
+    #[serde(default)]
+    pub scheduled_start_ms: i64,
+    /// Local filesystem path to a thumbnail image (the service uploads it).
+    #[serde(default)]
+    pub thumbnail_path: String,
+    /// Bumped on every `stream_control` write.
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+}
+
+/// An adapter's report of applying a `StreamControl` revision.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StreamControlStatus {
+    pub platform: String,
+    pub revision: u64,
+    pub ok: bool,
+    pub message: String,
+    pub applied_at_ms: i64,
+}
+
+/// The engine's stream-control state: the desired control plus each adapter's
+/// last apply status, keyed by platform.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StreamSchedule {
+    pub control: StreamControl,
+    pub statuses: HashMap<String, StreamControlStatus>,
+    /// Where the control is persisted (set at startup). `None` disables
+    /// persistence — used by tests, which must not write to the cwd.
+    pub persist_path: Option<std::path::PathBuf>,
+}
+
+/// Shared stream-control state (see [`StreamSchedule`]).
+pub(crate) type SharedStreamSchedule = Arc<Mutex<StreamSchedule>>;
+
+impl StreamSchedule {
+    /// Load the persisted control from `path` (if present) and remember it for
+    /// future saves. A missing/corrupt file yields a fresh empty schedule.
+    pub fn load(path: std::path::PathBuf) -> Self {
+        let mut schedule = Self::default();
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            schedule.control = serde_json::from_str::<StreamControl>(&data).unwrap_or_default();
+        }
+        schedule.persist_path = Some(path);
+        schedule
+    }
+
+    /// The JSON the TUI reads (`stream_schedule`) and the adapters poll: the
+    /// desired control plus every adapter's last status.
+    fn to_json(&self) -> serde_json::Value {
+        let statuses: Vec<serde_json::Value> = self
+            .statuses
+            .values()
+            .map(|s| {
+                serde_json::json!({
+                    "platform": s.platform,
+                    "revision": s.revision,
+                    "ok": s.ok,
+                    "message": s.message,
+                    "applied_at_ms": s.applied_at_ms,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "title": self.control.title,
+            "scheduled_start_ms": self.control.scheduled_start_ms,
+            "thumbnail_path": self.control.thumbnail_path,
+            "revision": self.control.revision,
+            "updated_at_ms": self.control.updated_at_ms,
+            "statuses": statuses,
+        })
+    }
+}
+
 pub(crate) struct QueryContext<'a> {
     /// The timeline database.
     pub db: &'a DatabaseManager,
@@ -187,6 +276,12 @@ pub(crate) struct QueryContext<'a> {
     pub prompt_routes: &'a SharedPromptRoutes,
     /// Per-channel viewer/member counts, for `channel_viewers`.
     pub channel_stats: &'a SharedChannelStats,
+    /// Latest stream leaderboard report, for `stream_leaderboard` /
+    /// `leaderboard_report`.
+    pub leaderboard: &'a SharedLeaderboard,
+    /// Desired stream control + adapter statuses, for `stream_control` /
+    /// `stream_schedule` / `stream_control_status`.
+    pub stream_schedule: &'a SharedStreamSchedule,
     /// The calling module — this is what every gate keys off.
     pub module_name: &'a str,
     /// The calling module's instance uuid, echoed on the response.
@@ -230,17 +325,36 @@ pub(crate) enum QueryRoute {
     ChatCommend,
     ChatReprimand,
     ChatVerifyIdentity,
+    /// Engine-originated platform reply on behalf of a module (the engine
+    /// authors the message, so there is no actor gate). Restricted to the
+    /// `clip` module and the control surface.
+    ChatReply,
     UserdbAdjustScore,
     /// Read a user's current score. Predictions module + control surface only.
     PredictionGetScore,
     /// Read the engine's in-memory per-channel viewer/member counts. Open to
     /// every authenticated module — the data is public stream information.
     ChannelViewers,
+    /// Read the cached stream leaderboard (the `stream-leaderboard` module's
+    /// last report). Control surface only.
+    StreamLeaderboard,
+    /// The `stream-leaderboard` module's report of the current per-stream
+    /// leaderboard; the engine caches it and serves it via `stream_leaderboard`.
+    /// Restricted to that module.
+    StreamLeaderboardReport,
+    /// Set the desired stream control (title / scheduled start / thumbnail).
+    /// Control surface only.
+    StreamControl,
+    /// Read the desired stream control + each adapter's apply status. Open to
+    /// every authenticated module — the adapters poll it.
+    StreamSchedule,
+    /// An adapter's report of applying a `stream_control` revision. Restricted
+    /// to the platform adapters.
+    StreamControlStatus,
     /// Any `userdb_`-prefixed query_id, after the exact `userdb_adjust_score`
     /// match above has had its chance.
     UserdbFamily,
     SetCredentials,
-    AudioForMessage,
     TestArchive,
     /// One-shot timeline aggregates (total messages / users / commands,
     /// platform counts and errors, recent chart buckets). Control surface.
@@ -288,13 +402,18 @@ pub(crate) fn classify_query(query_id: &str) -> QueryRoute {
         "chat_commend" => QueryRoute::ChatCommend,
         "chat_reprimand" => QueryRoute::ChatReprimand,
         "chat_verify_identity" => QueryRoute::ChatVerifyIdentity,
+        "chat_reply" => QueryRoute::ChatReply,
         // Must precede the `userdb_` prefix test below — see the doc comment.
         "userdb_adjust_score" => QueryRoute::UserdbAdjustScore,
         _ if query_id.starts_with("userdb_") => QueryRoute::UserdbFamily,
         "prediction_get_score" => QueryRoute::PredictionGetScore,
         "channel_viewers" => QueryRoute::ChannelViewers,
+        "stream_leaderboard" => QueryRoute::StreamLeaderboard,
+        "leaderboard_report" => QueryRoute::StreamLeaderboardReport,
+        "stream_control" => QueryRoute::StreamControl,
+        "stream_schedule" => QueryRoute::StreamSchedule,
+        "stream_control_status" => QueryRoute::StreamControlStatus,
         "set_credentials" => QueryRoute::SetCredentials,
-        "audio_for_message" => QueryRoute::AudioForMessage,
         "test_archive" => QueryRoute::TestArchive,
         "stats" => QueryRoute::Stats,
         // No raw-SQL escape hatch: a module that asks for something the engine
@@ -319,9 +438,23 @@ pub(crate) fn classify_query(query_id: &str) -> QueryRoute {
 /// `chat_verify_identity` to `term-chat` (`chat_verify_identity_virtual_query`),
 /// and `audit_approve`/`audit_reject` require a `uuid7` in the payload.
 /// Operations with no dispatcher gate at all — `db_status`, `module_list`,
-/// `engine_info`, `audio_for_message` — are open to any connected module;
+/// `engine_info` — are open to any connected module;
 /// `engine_info` and `module_list` redact the secrets a normal module may not
 /// see, and `db_status` exposes no secrets at all.
+/// Whether `caller` is one of the platform adapters allowed to report stream
+/// control status. The `stream-manager-stub` module (which exercises the flow
+/// without real platform credentials) is included.
+fn is_stream_adapter(caller: &str) -> bool {
+    matches!(
+        caller,
+        "twitch-adapter"
+            | "youtube-adapter"
+            | "kick-adapter"
+            | "discord-adapter"
+            | "stream-manager-stub"
+    )
+}
+
 pub(crate) fn caller_gate(route: QueryRoute, caller: &str) -> Option<&'static str> {
     match route {
         QueryRoute::TestRun => (!is_control_surface(caller))
@@ -348,6 +481,10 @@ pub(crate) fn caller_gate(route: QueryRoute, caller: &str) -> Option<&'static st
             (!is_control_surface(caller) && caller != "score-messages" && caller != "events")
                 .then_some("userdb_adjust_score denied: not the TUI, score-messages, or events")
         }
+        QueryRoute::ChatReply => {
+            (!is_control_surface(caller) && caller != "clip")
+                .then_some("chat_reply denied: not the clip module or the TUI")
+        }
         QueryRoute::PredictionGetScore => {
             (!is_control_surface(caller) && caller != "events")
                 .then_some("prediction_get_score denied: not the events module")
@@ -364,6 +501,20 @@ pub(crate) fn caller_gate(route: QueryRoute, caller: &str) -> Option<&'static st
         QueryRoute::Stats => {
             (!is_control_surface(caller)).then_some("stats access denied: not the control surface")
         }
+        QueryRoute::StreamLeaderboard => {
+            (!is_control_surface(caller)).then_some("stream_leaderboard denied: not the TUI")
+        }
+        QueryRoute::StreamLeaderboardReport => {
+            (caller != "stream-leaderboard")
+                .then_some("leaderboard_report denied: not the stream-leaderboard module")
+        }
+        QueryRoute::StreamControl => {
+            (!is_control_surface(caller)).then_some("stream_control denied: not the TUI")
+        }
+        QueryRoute::StreamControlStatus => {
+            (!is_stream_adapter(caller))
+                .then_some("stream_control_status denied: not a platform adapter")
+        }
         // There is no raw-SQL escape hatch and no unknown-query path: a query
         // the engine does not name is denied outright.
         QueryRoute::Unsupported => Some("query denied: no such operation"),
@@ -374,7 +525,7 @@ pub(crate) fn caller_gate(route: QueryRoute, caller: &str) -> Option<&'static st
         | QueryRoute::ChatCommend
         | QueryRoute::ChatReprimand
         | QueryRoute::ChatVerifyIdentity
-        | QueryRoute::AudioForMessage
+        | QueryRoute::StreamSchedule
         | QueryRoute::ChannelViewers => None,
     }
 }
@@ -482,6 +633,36 @@ fn current_autostart(discovered: &crate::module_manager::DiscoveredModule) -> bo
         .unwrap_or(discovered.manifest.autostart)
 }
 
+/// The LIVE gate fields (`price`, `min_rank`, `authority`) for a discovered
+/// module, re-read from its manifest on disk. The TUI edits a module's manifest
+/// at runtime (price / rank gate / authority); the cached discovery snapshot
+/// would otherwise report the OLD values and the TUI's optimistic edit would
+/// revert on the next `module_list` poll — the same reason `current_autostart`
+/// reads the live file. Falls back to the discovery snapshot if the file is
+/// missing or a field is absent.
+fn live_gate(discovered: &crate::module_manager::DiscoveredModule) -> (u32, f32, u32) {
+    let path = discovered.directory.join("cockatiel_module_info.json");
+    let parsed = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok());
+    let price = parsed
+        .as_ref()
+        .and_then(|m| m.get("price").and_then(|v| v.as_u64()))
+        .map(|v| v as u32)
+        .unwrap_or(discovered.manifest.price);
+    let min_rank = parsed
+        .as_ref()
+        .and_then(|m| m.get("min_rank").and_then(|v| v.as_f64()))
+        .map(|v| v as f32)
+        .unwrap_or(discovered.manifest.min_rank);
+    let authority = parsed
+        .as_ref()
+        .and_then(|m| m.get("authority").and_then(|v| v.as_u64()))
+        .map(|v| v as u32)
+        .unwrap_or(discovered.manifest.authority);
+    (price, min_rank, authority)
+}
+
 /// Answer one `DatabaseQuery` and return the result triple. The single entry
 /// point the connection loop calls.
 pub(crate) async fn handle_query(
@@ -519,7 +700,6 @@ pub(crate) fn route_from_op(op: WireQueryOp) -> Option<QueryRoute> {
         PredictionGetScore => QueryRoute::PredictionGetScore,
         ChannelViewers => QueryRoute::ChannelViewers,
         SetCredentials => QueryRoute::SetCredentials,
-        AudioForMessage => QueryRoute::AudioForMessage,
         TestArchive => QueryRoute::TestArchive,
         Stats => QueryRoute::Stats,
         // The userdb family needs the exact operation name to pick the right
@@ -545,6 +725,9 @@ pub(crate) fn route_from_op(op: WireQueryOp) -> Option<QueryRoute> {
         | UserdbTimeout => QueryRoute::UserdbFamily,
         // Timeline reads use the dedicated TimelineQuery payload, not this op.
         TimelineRead => return None,
+        // The audio side-channel is gone: the op remains on the wire contract
+        // but the engine answers it with no route, so the caller is denied.
+        AudioForMessage => return None,
         // There is no raw-SQL operation on the wire surface at all.
         Unspecified => return None,
     })
@@ -618,12 +801,20 @@ async fn dispatch(
             // stats), whereas `engine_info` is a once-on-connect metadata read —
             // a pause that began after the UI connected would be invisible. The
             // field exposes no secret, so it stays ungated for every module.
+            // `blocked_reason` is a missing required dependency (timeline DB or
+            // user DB). While set, dispatch is held exactly like a pause, but the
+            // UIs show BLOCKED rather than PAUSED so the operator knows the cause.
+            // `resume_when_unblocked` says whether the engine will open the gate
+            // by itself once the dependency appears.
+            let blocked = orchestrator.blocked_reason().await;
             let status = serde_json::json!({
                 "timeline_backup": db.backup_configured(),
                 "userdb_backup": userdb_backup,
                 "timeline_db_size_bytes": db.db_size_bytes(),
                 "timeline_db_target_mb": db.target_mb(),
                 "pipeline_paused": orchestrator.is_paused().await,
+                "blocked_reason": blocked.map(|r| r.as_str()),
+                "resume_when_unblocked": orchestrator.will_resume_on_unblock().await,
             });
             QueryOutcome::success(status.to_string().into_bytes())
         }
@@ -665,6 +856,7 @@ async fn dispatch(
             // them. Other modules get the structural list redacted.
             let expose_creds = may_read_other_credentials(module_name);
             for (name, discovered) in discovered_registry.lock().unwrap().iter() {
+                let (price, min_rank, authority) = live_gate(discovered);
                 let cred_values = credential_values_map(discovered);
                 let config_complete = is_config_complete(&discovered.manifest.credentials, &cred_values);
                 let exposed_values = if expose_creds {
@@ -681,9 +873,9 @@ async fn dispatch(
                         "position": "unknown",
                         "priority": null,
                         "autostart": current_autostart(discovered),
-                        "price": discovered.manifest.price,
-                        "min_rank": discovered.manifest.min_rank,
-                        "authority": discovered.manifest.authority,
+                        "price": price,
+                        "min_rank": min_rank,
+                        "authority": authority,
                         "avg_ms": module_timings.get(name.as_str()).copied(),
                         "connected_at": null,
                         "shutdown_at": null,
@@ -752,6 +944,27 @@ async fn dispatch(
                     serde_json::json!(pending_prompts.contains(&s.module_name));
             }
 
+            // Refresh the in-memory gates from the LIVE manifests so a
+            // price/rank/authority edit made in the TUI takes effect without an
+            // engine restart. `module_list` is the TUI's 2s control poll, so the
+            // staleness window is bounded to that. The lock is dropped before
+            // `set_module_gates` (which takes its own lock) — never nested.
+            {
+                let gates: std::collections::HashMap<String, crate::pipeline::ModuleGate> = {
+                    let reg = discovered_registry.lock().unwrap();
+                    reg.iter()
+                        .map(|(name, m)| {
+                            let (price, min_rank, authority) = live_gate(m);
+                            (
+                                name.clone(),
+                                crate::pipeline::ModuleGate { authority, min_rank, price },
+                            )
+                        })
+                        .collect()
+                };
+                orchestrator.set_module_gates(gates);
+            }
+
             let mut list: Vec<serde_json::Value> = entries.into_values().collect();
             sort_module_list(&config, &mut list);
             let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string());
@@ -788,8 +1001,18 @@ async fn dispatch(
             let Some(paused) = payload.get("paused").and_then(|v| v.as_bool()) else {
                 return QueryOutcome::denied("pipeline_set_paused requires paused: true or false");
             };
+            let blocked = orchestrator.blocked_reason().await;
             if paused {
-                let changed = orchestrator.pause().await;
+                if blocked.is_some() {
+                    // While blocked the gate is already held; record that the
+                    // engine must STAY paused once the block clears.
+                    orchestrator.defer_pause().await;
+                }
+                let changed = if blocked.is_some() {
+                    false
+                } else {
+                    orchestrator.pause().await
+                };
                 if changed {
                     log_event_broadcast(ui_state, "[pipeline] paused by the control surface — messages are queued but nothing is dispatched");
                 }
@@ -797,6 +1020,27 @@ async fn dispatch(
                     "paused": true,
                     "changed": changed,
                     "held_messages": orchestrator.held_count().await,
+                    "blocked_reason": blocked.map(|r| r.as_str()),
+                    "resume_when_unblocked": orchestrator.will_resume_on_unblock().await,
+                }).to_string();
+                QueryOutcome::success(json.into_bytes())
+            } else if let Some(reason) = blocked {
+                // A resume request while blocked does NOT open the gate (the
+                // dependency is still missing); it records the intent so the
+                // engine resumes itself the moment the block clears.
+                orchestrator.defer_resume().await;
+                log_event_broadcast(
+                    ui_state,
+                    format!(
+                        "[pipeline] resume deferred — engine is BLOCKED ({}); will resume when it clears",
+                        reason.as_str()
+                    ),
+                );
+                let json = serde_json::json!({
+                    "paused": true,
+                    "changed": false,
+                    "blocked_reason": reason.as_str(),
+                    "resume_when_unblocked": true,
                 }).to_string();
                 QueryOutcome::success(json.into_bytes())
             } else {
@@ -815,6 +1059,8 @@ async fn dispatch(
                     "changed": outcome.was_paused,
                     "resumed_messages": outcome.resumed_messages,
                     "errors": outcome.errors,
+                    "blocked_reason": serde_json::Value::Null,
+                    "resume_when_unblocked": false,
                 }).to_string();
                 QueryOutcome::success(json.into_bytes())
             }
@@ -881,6 +1127,26 @@ async fn dispatch(
             // Identity bootstrap / write-through — term-chat only.
             chat_verify_identity_virtual_query(user_db_client, sql, ui_state, module_name).await.into()
         }
+        QueryRoute::ChatReply => {
+            // Engine-originated platform reply on behalf of a module. The engine
+            // (not the module) authors the message, so there is no actor gate —
+            // the query gate above restricts WHICH module may ask. Payload:
+            // { "platform": "twitch", "channel_id": "...", "message": "..." }.
+            let payload: serde_json::Value =
+                serde_json::from_str(sql).unwrap_or(serde_json::json!({}));
+            let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
+            let channel_id = payload.get("channel_id").and_then(|v| v.as_str()).unwrap_or("");
+            let message = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            if platform.is_empty() || message.is_empty() {
+                QueryOutcome::denied("chat_reply requires platform and message")
+            } else {
+                crate::engine_reply_to_platform(orchestrator, ui_state, platform, channel_id, message)
+                    .await;
+                QueryOutcome::success(
+                    serde_json::json!({ "sent": true }).to_string().into_bytes(),
+                )
+            }
+        }
         QueryRoute::UserdbAdjustScore => {
             // Real arbitrary score delta for the score-messages
             // module (no ±1 clamp, no user-db rating cooldown).
@@ -900,6 +1166,29 @@ async fn dispatch(
             // Public stream data, so no caller gate — any authenticated module
             // may read it on demand.
             channel_viewers_virtual_query(ctx.channel_stats, sql).into()
+        }
+        QueryRoute::StreamLeaderboardReport => {
+            // The `stream-leaderboard` module pushes its current ranking here.
+            // The engine only caches the last report and echoes it back to the
+            // TUI; it never computes the ranking itself.
+            leaderboard_report(ctx.leaderboard, sql)
+        }
+        QueryRoute::StreamLeaderboard => {
+            // Serve the last report to the control surface, or an empty
+            // leaderboard before the module has reported.
+            leaderboard_read(ctx.leaderboard)
+        }
+        QueryRoute::StreamControl => {
+            // The TUI sets the desired title / scheduled start / thumbnail.
+            stream_control_write(ctx.stream_schedule, sql)
+        }
+        QueryRoute::StreamSchedule => {
+            // Any module may read the desired control (the adapters poll it).
+            stream_schedule_read(ctx.stream_schedule)
+        }
+        QueryRoute::StreamControlStatus => {
+            // A platform adapter reports the result of applying a revision.
+            stream_control_status_write(ctx.stream_schedule, sql)
         }
         QueryRoute::UserdbFamily => {
             // User database is engine-internal — only the TUI
@@ -955,25 +1244,6 @@ async fn dispatch(
                 }
             }
             result
-        }
-        QueryRoute::AudioForMessage => {
-            // Fetch a message's rendered audio (raw bytes) so
-            // displays can play it. Any module may read it.
-            //
-            // NOTE: the blob is the raw audio, not JSON. Displays base64 it
-            // themselves. Preserved as-is.
-            let payload: serde_json::Value =
-                serde_json::from_str(sql).unwrap_or(serde_json::json!({}));
-            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            if uuid7.is_empty() {
-                QueryOutcome::denied("audio_for_message requires uuid7")
-            } else {
-                match db.get_audio(uuid7.as_bytes()).await {
-                    Ok(Some((_audio_type, bytes))) => QueryOutcome::success(bytes),
-                    Ok(None) => QueryOutcome::success(Vec::new()),
-                    Err(e) => QueryOutcome::denied(format!("audio_for_message failed: {}", e)),
-                }
-            }
         }
         QueryRoute::TestArchive => {
             // Compliance-test archival — test-runner only. The
@@ -1522,6 +1792,108 @@ fn channel_viewers_virtual_query(
     (true, json.into_bytes(), String::new())
 }
 
+/// Store the `stream-leaderboard` module's latest ranking report.
+fn leaderboard_report(store: &SharedLeaderboard, sql: &str) -> QueryOutcome {
+    match serde_json::from_str::<serde_json::Value>(sql) {
+        Ok(value) => {
+            *store.lock().unwrap() = Some(value);
+            QueryOutcome::success(b"{\"success\":true}".to_vec())
+        }
+        Err(e) => QueryOutcome::denied(format!("leaderboard_report: invalid JSON: {e}")),
+    }
+}
+
+/// Serve the cached leaderboard report (or an empty one before any report).
+fn leaderboard_read(store: &SharedLeaderboard) -> QueryOutcome {
+    let current = store.lock().unwrap().clone();
+    let value = current.unwrap_or_else(|| serde_json::json!({ "entries": [] }));
+    QueryOutcome::success(value.to_string().into_bytes())
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Merge a `stream_control` payload into the schedule, bump the revision, drop
+/// stale adapter statuses (a new revision invalidates them), persist, and return
+/// the new schedule JSON. Absent keys leave the current value.
+fn stream_control_write(store: &SharedStreamSchedule, sql: &str) -> QueryOutcome {
+    let payload: serde_json::Value = match serde_json::from_str(sql) {
+        Ok(v) => v,
+        Err(e) => return QueryOutcome::denied(format!("stream_control: invalid JSON: {e}")),
+    };
+    let mut st = store.lock().unwrap();
+    if let Some(t) = payload.get("title").and_then(|v| v.as_str()) {
+        st.control.title = t.to_string();
+    }
+    if let Some(ms) = payload.get("scheduled_start_ms").and_then(|v| v.as_i64()) {
+        st.control.scheduled_start_ms = ms;
+    }
+    if let Some(p) = payload.get("thumbnail_path").and_then(|v| v.as_str()) {
+        st.control.thumbnail_path = p.to_string();
+    }
+    st.control.revision = st.control.revision.wrapping_add(1);
+    st.control.updated_at_ms = now_ms();
+    st.statuses.clear();
+    let json = st.to_json();
+    save_schedule(&st);
+    QueryOutcome::success(json.to_string().into_bytes())
+}
+
+/// Serve the current schedule (control + adapter statuses) to the caller.
+fn stream_schedule_read(store: &SharedStreamSchedule) -> QueryOutcome {
+    let st = store.lock().unwrap();
+    QueryOutcome::success(st.to_json().to_string().into_bytes())
+}
+
+/// Record an adapter's report of applying a `stream_control` revision.
+fn stream_control_status_write(store: &SharedStreamSchedule, sql: &str) -> QueryOutcome {
+    let payload: serde_json::Value = match serde_json::from_str(sql) {
+        Ok(v) => v,
+        Err(e) => return QueryOutcome::denied(format!("stream_control_status: invalid JSON: {e}")),
+    };
+    let platform = payload
+        .get("platform")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if platform.is_empty() {
+        return QueryOutcome::denied("stream_control_status: missing 'platform'");
+    }
+    let status = StreamControlStatus {
+        platform: platform.clone(),
+        revision: payload.get("revision").and_then(|v| v.as_u64()).unwrap_or(0),
+        ok: payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+        message: payload
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        applied_at_ms: now_ms(),
+    };
+    let mut st = store.lock().unwrap();
+    st.statuses.insert(platform, status);
+    QueryOutcome::success(b"{\"success\":true}".to_vec())
+}
+
+/// Persist the control (not the statuses — those are transient) to disk.
+fn save_schedule(st: &StreamSchedule) {
+    let Some(path) = &st.persist_path else { return };
+    let value = serde_json::json!({
+        "title": st.control.title,
+        "scheduled_start_ms": st.control.scheduled_start_ms,
+        "thumbnail_path": st.control.thumbnail_path,
+        "revision": st.control.revision,
+        "updated_at_ms": st.control.updated_at_ms,
+    });
+    if let Ok(pretty) = serde_json::to_string_pretty(&value) {
+        let _ = std::fs::write(path, pretty);
+    }
+}
+
 /// Handle a `mod_*` virtual query from an adapter (e.g. a mod typing a command
 /// in chat). The adapter identifies the target by platform + handle; the engine
 /// resolves the user DB record and applies the action.
@@ -2022,6 +2394,7 @@ mod tests {
     const SCORE_MESSAGES: &str = "score-messages";
     const TERM_CHAT: &str = "term-chat";
     const EVENTS: &str = "events";
+    const CLIP: &str = "clip";
     /// An ordinary adapter: authenticated, not a control surface, not the
     /// runner, not the automated scorer.
     const NORMAL: &str = "twitch-adapter";
@@ -2126,6 +2499,18 @@ mod tests {
             ("prediction_get_score", TERM_CHAT, false),
             ("prediction_get_score", NORMAL, false),
             ("prediction_get_score", "", false),
+            // ── chat_reply: the engine-originated reply path. Only the `clip`
+            // module (which asks the engine to say something on its behalf) and
+            // the TUI control surface may ask; there is no actor gate because the
+            // engine authors the message. Everything else is refused.
+            ("chat_reply", CLIP, true),
+            ("chat_reply", TUI, true),
+            ("chat_reply", TUI_CHILD, true),
+            ("chat_reply", TEST_RUNNER, false),
+            ("chat_reply", TERM_CHAT, false),
+            ("chat_reply", SCORE_MESSAGES, false),
+            ("chat_reply", NORMAL, false),
+            ("chat_reply", "", false),
             // ── The rest of the userdb family: the TUI ONLY. score-messages is
             // NOT special here — only adjust_score has the three-way gate.
             ("userdb_get_user", TUI, true),
@@ -2142,11 +2527,6 @@ mod tests {
             ("set_credentials", TUI, true),
             ("set_credentials", TERM_CHAT, false),
             ("set_credentials", NORMAL, false),
-            // ── Ungated, but note: audio_for_message is open to any module, and
-            // the TUI being able to call test_archive would be a privilege the
-            // original never granted.
-            ("audio_for_message", NORMAL, true),
-            ("audio_for_message", TUI, true),
             // ── channel_viewers: public stream data — open to every
             // authenticated module, including a brand-new one.
             ("channel_viewers", NORMAL, true),
@@ -2155,6 +2535,28 @@ mod tests {
             ("channel_viewers", TEST_RUNNER, true),
             ("channel_viewers", TUI, true),
             ("channel_viewers", "", true),
+            // ── stream_leaderboard: the cached report is the control surface's
+            // to read; the module pushes its own report and nobody else may.
+            ("stream_leaderboard", TUI, true),
+            ("stream_leaderboard", NORMAL, false),
+            ("stream_leaderboard", TERM_CHAT, false),
+            ("leaderboard_report", "stream-leaderboard", true),
+            ("leaderboard_report", NORMAL, false),
+            ("leaderboard_report", TUI, false),
+            // ── stream control: the TUI sets it; every module may read it; only
+            // the platform adapters (and the stub) may report a status.
+            ("stream_control", TUI, true),
+            ("stream_control", NORMAL, false),
+            ("stream_control", TERM_CHAT, false),
+            ("stream_schedule", TUI, true),
+            ("stream_schedule", NORMAL, true),
+            ("stream_schedule", TERM_CHAT, true),
+            ("stream_control_status", "youtube-adapter", true),
+            // NORMAL is `"twitch-adapter"` — an adapter, so admitted here.
+            ("stream_control_status", NORMAL, true),
+            ("stream_control_status", "stream-manager-stub", true),
+            ("stream_control_status", TERM_CHAT, false),
+            ("stream_control_status", TUI, false),
             // ── Gated in the handler, not here: the dispatcher admits these and
             // the helper refuses. Asserted so the two layers stay distinct.
             ("mod_commend", NORMAL, true),
@@ -2288,7 +2690,6 @@ mod tests {
         ("module_list", QueryRoute::ModuleList),
         ("engine_info", QueryRoute::EngineInfo),
         ("set_credentials", QueryRoute::SetCredentials),
-        ("audio_for_message", QueryRoute::AudioForMessage),
         // Pipeline control.
         ("pipeline_set_paused", QueryRoute::PipelineSetPaused),
         // Engine lifecycle.
@@ -2310,6 +2711,7 @@ mod tests {
         ("chat_commend", QueryRoute::ChatCommend),
         ("chat_reprimand", QueryRoute::ChatReprimand),
         ("chat_verify_identity", QueryRoute::ChatVerifyIdentity),
+        ("chat_reply", QueryRoute::ChatReply),
         // The arbitrary score delta, which must beat the `userdb_` prefix.
         ("userdb_adjust_score", QueryRoute::UserdbAdjustScore),
         // The user database family, matched by the `userdb_` prefix.
@@ -2378,7 +2780,6 @@ mod tests {
             QueryRoute::UserdbAdjustScore,
             QueryRoute::UserdbFamily,
             QueryRoute::SetCredentials,
-            QueryRoute::AudioForMessage,
             QueryRoute::TestArchive,
             QueryRoute::Stats,
             QueryRoute::Unsupported,
@@ -2829,10 +3230,9 @@ mod tests {
 
     #[test]
     fn a_success_with_no_payload_stays_a_success() {
-        // `audio_for_message` for a message with no audio is a SUCCESS with an
-        // empty blob, not a failure. Easy to conflate with a denial; the
-        // distinction is what lets a display distinguish "silent" from
-        // "refused", so it is asserted here.
+        // An empty-blob success is a SUCCESS, not a failure. Easy to conflate
+        // with a denial; the distinction is what lets a caller distinguish
+        // "nothing to return" from "refused", so it is asserted here.
         let outcome = QueryOutcome::success(Vec::new());
         assert!(outcome.success);
         assert!(outcome.result_blob.is_empty());
@@ -2943,6 +3343,81 @@ fn current_autostart_reads_the_live_manifest_not_the_discovery_snapshot() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(test)]
+fn stale_gate_discovered(dir: &std::path::Path) -> crate::module_manager::DiscoveredModule {
+    crate::module_manager::DiscoveredModule {
+        manifest: crate::module_manager::ModuleManifest {
+            name: "m".into(),
+            description: String::new(),
+            version: String::new(),
+            kind: String::new(),
+            capabilities: "postprocess".into(),
+            root_file: String::new(),
+            launch_command: String::new(),
+            command_flags: vec![],
+            autostart: false,
+            terminal: false,
+            credentials: vec![],
+            unresponsive_timeout_secs: 0,
+            probe_response_secs: 0,
+            // STALE discovery snapshot: the TUI has not edited these yet.
+            price: 0,
+            min_rank: 0.0,
+            authority: 0,
+        },
+        directory: dir.to_path_buf(),
+    }
+}
+
+#[test]
+fn live_gate_reads_the_live_manifest_not_the_discovery_snapshot() {
+    // The TUI edits a module's price / rank gate / authority by rewriting the
+    // manifest at runtime. `live_gate` must report the file's values, not the
+    // cached discovery snapshot (which would make the TUI's optimistic edit
+    // revert on the next `module_list` poll).
+    let dir = std::env::temp_dir().join(format!("cockatiel-livegate-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("cockatiel_module_info.json"),
+        r#"{"price":42,"min_rank":0.5,"authority":1}"#,
+    )
+    .unwrap();
+    let discovered = stale_gate_discovered(&dir);
+
+    assert_eq!(
+        live_gate(&discovered),
+        (42, 0.5, 1),
+        "must read the live manifest, not the snapshot"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn live_gate_falls_back_to_the_snapshot_when_the_manifest_is_missing_or_partial() {
+    let dir = std::env::temp_dir().join(format!("cockatiel-livegate-fallback-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let discovered = stale_gate_discovered(&dir);
+
+    // A missing file falls back to the snapshot values.
+    assert_eq!(
+        live_gate(&discovered),
+        (0, 0.0, 0),
+        "missing manifest falls back to the discovery snapshot"
+    );
+
+    // A partial manifest falls back per-field: the absent fields use the
+    // snapshot, the present ones are read live.
+    std::fs::write(dir.join("cockatiel_module_info.json"), r#"{"price":7}"#).unwrap();
+    assert_eq!(
+        live_gate(&discovered),
+        (7, 0.0, 0),
+        "absent fields fall back to the snapshot, present fields are live"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn channel_viewers_returns_stored_counts_and_honours_filter() {
     let stats: SharedChannelStats = Arc::new(Mutex::new(HashMap::new()));
@@ -3005,4 +3480,97 @@ fn channel_viewers_returns_stored_counts_and_honours_filter() {
     assert!(ok);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["channels"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn leaderboard_report_then_read_round_trips() {
+    let store: SharedLeaderboard = Arc::new(Mutex::new(None));
+
+    // Before any report, the reader serves an empty leaderboard (never errors).
+    let read = leaderboard_read(&store);
+    assert!(read.success);
+    let json: serde_json::Value = serde_json::from_slice(&read.result_blob).unwrap();
+    assert_eq!(json["entries"].as_array().unwrap().len(), 0);
+
+    // The module's report replaces the cache and is echoed verbatim.
+    let report = leaderboard_report(
+        &store,
+        r#"{"entries":[{"username":"vulbyte","earned":42,"score":100}]}"#,
+    );
+    assert!(report.success, "report rejected: {}", report.error);
+    let read = leaderboard_read(&store);
+    let json: serde_json::Value = serde_json::from_slice(&read.result_blob).unwrap();
+    assert_eq!(json["entries"][0]["username"], "vulbyte");
+    assert_eq!(json["entries"][0]["earned"], 42);
+
+    // A malformed report is refused AND does not clobber the cache.
+    let bad = leaderboard_report(&store, "not-json");
+    assert!(!bad.success);
+    let read = leaderboard_read(&store);
+    let json: serde_json::Value = serde_json::from_slice(&read.result_blob).unwrap();
+    assert_eq!(json["entries"][0]["username"], "vulbyte", "cache survived a bad report");
+}
+
+#[test]
+fn stream_control_round_trips_and_statuses_reset_on_write() {
+    let store: SharedStreamSchedule = Arc::new(Mutex::new(StreamSchedule::default()));
+
+    // Empty initially.
+    let read = stream_schedule_read(&store);
+    let json: serde_json::Value = serde_json::from_slice(&read.result_blob).unwrap();
+    assert_eq!(json["title"], "");
+    assert_eq!(json["revision"], 0);
+
+    // A write sets fields and bumps the revision.
+    let w = stream_control_write(
+        &store,
+        r#"{"title":"Coffee & Code","scheduled_start_ms":1700000000000}"#,
+    );
+    assert!(w.success, "write failed: {}", w.error);
+    let json: serde_json::Value = serde_json::from_slice(&w.result_blob).unwrap();
+    assert_eq!(json["title"], "Coffee & Code");
+    assert_eq!(json["scheduled_start_ms"], 1_700_000_000_000i64);
+    assert_eq!(json["revision"], 1);
+
+    // An adapter reports a status.
+    let s = stream_control_status_write(
+        &store,
+        r#"{"platform":"youtube","revision":1,"ok":true,"message":"title set"}"#,
+    );
+    assert!(s.success, "status failed: {}", s.error);
+    let read = stream_schedule_read(&store);
+    let json: serde_json::Value = serde_json::from_slice(&read.result_blob).unwrap();
+    assert_eq!(json["statuses"][0]["platform"], "youtube");
+    assert_eq!(json["statuses"][0]["ok"], true);
+
+    // A second write bumps the revision and drops the now-stale status.
+    let w = stream_control_write(&store, r#"{"title":"New Title"}"#);
+    let json: serde_json::Value = serde_json::from_slice(&w.result_blob).unwrap();
+    assert_eq!(json["title"], "New Title");
+    assert_eq!(json["scheduled_start_ms"], 1_700_000_000_000i64, "unset field kept");
+    assert_eq!(json["revision"], 2);
+    assert_eq!(json["statuses"].as_array().unwrap().len(), 0, "stale statuses cleared");
+
+    // Malformed payloads are refused, and so is a status with no platform.
+    assert!(!stream_control_write(&store, "not-json").success);
+    assert!(!stream_control_status_write(&store, r#"{"ok":true}"#).success);
+}
+
+#[test]
+fn stream_schedule_load_round_trips_through_disk() {
+    let dir = std::env::temp_dir().join(format!("ckt-sched-{}", Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("stream_schedule.json");
+
+    let store: SharedStreamSchedule = Arc::new(Mutex::new(StreamSchedule::load(path.clone())));
+    stream_control_write(&store, r#"{"title":"Persisted","thumbnail_path":"/tmp/t.png"}"#);
+
+    // Reload from disk: the control survives (statuses are transient, not saved).
+    let reloaded = StreamSchedule::load(path.clone());
+    assert_eq!(reloaded.control.title, "Persisted");
+    assert_eq!(reloaded.control.thumbnail_path, "/tmp/t.png");
+    assert_eq!(reloaded.control.revision, 1);
+    assert!(reloaded.statuses.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

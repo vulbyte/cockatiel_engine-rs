@@ -104,6 +104,17 @@ impl CommandRegistry {
         self.modules.contains_key(module)
     }
 
+    /// Whether `module` registered a NON-EMPTY command set — i.e. it only
+    /// handles the specific commands it owns, as opposed to a catch-all or a
+    /// module that never registered commands (both of which receive every
+    /// message).
+    pub fn is_command_scoped(&self, module: &str) -> bool {
+        self.modules
+            .get(module)
+            .map(|r| !r.commands.is_empty())
+            .unwrap_or(false)
+    }
+
     /// A module that owns `flag` and has `alert_on_unknown_command` set, so an
     /// unregistered command under that flag gets the apology reply.
     pub fn alert_owner_for(&self, flag: &str) -> Option<String> {
@@ -414,8 +425,15 @@ mod tests {
         assert!(targets.contains(&"display".to_string()));
         assert!(!targets.contains(&"other".to_string()), "a module outside the stage is excluded");
 
-        // A plain message (no command) -> catch-alls only.
-        let targets = command_recipients(None, &r, &stage).unwrap();
-        assert_eq!(targets, vec!["display".to_string()], "only the catch-all receives plain messages");
+        // A plain message (no command) -> every stage module EXCEPT the
+        // command-scoped one. Catch-alls and never-registered modules get it;
+        // "tts-service" (which owns !tts) does not, so its price is not charged.
+        let plain = command_recipients(None, &r, &stage).unwrap();
+        assert!(plain.contains(&"display".to_string()));
+        assert!(plain.contains(&"other".to_string()));
+        assert!(
+            !plain.contains(&"tts-service".to_string()),
+            "command-scoped modules must be skipped for plain messages"
+        );
     }
 }

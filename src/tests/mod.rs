@@ -14,3 +14,6 @@ mod db_tests;
 mod config_tests;
 mod shutdown_tests;
 mod prediction_tests;
+mod pin_gate_tests;
+mod e2e_pipeline_tests;
+mod handshake_tests;

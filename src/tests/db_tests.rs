@@ -127,6 +127,40 @@ async fn sync_to_remote_writes_a_consistent_reusable_backup() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A backup path whose parent directory does not exist yet — the home-default
+/// case (`~/.cockatiel/backups/…`) — must have the directory created by
+/// `sync_to_remote`, not fail the snapshot. Also pins the owner-only file mode.
+#[tokio::test]
+async fn sync_to_remote_creates_a_missing_backup_directory() {
+    let dir = std::env::temp_dir().join(format!("cockatiel-backup-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let local_path = dir.join("data.db");
+    // Nested dirs that do not exist yet.
+    let backup_path = dir.join(".cockatiel").join("backups").join("cockatiel_backup.db");
+
+    let db = DatabaseManager::new(DatabaseConfig {
+        local_path,
+        remote_url: Some(backup_path.to_string_lossy().into_owned()),
+        sync_interval_secs: 15,
+        local_target_mb: 50,
+    });
+    db.initialize().await.unwrap();
+    let uuid = b"backup-dir-uuid-00000001".to_vec();
+    db.insert_event(&uuid, 1, "twitch", &[], "hi", "", "{}").await.unwrap();
+
+    assert_eq!(db.sync_to_remote().await.unwrap(), 1);
+    assert!(backup_path.exists(), "backup written into the created directory");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&backup_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "backup must be owner-only, got {mode:o}");
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ── The consolidated terminal write ─────────────────────────────────────
 //
 // The engine used to rewrite the same row over and over while a message moved
@@ -524,4 +558,50 @@ async fn query_timeline_filters_by_prefix() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v.as_array().unwrap().len(), 5);
+}
+
+/// turso 0.1.5's WAL panics ("cannot start a new read tx without ending an
+/// existing one") when two read transactions overlap. The engine issues reads
+/// from many tasks at once, so `execute_query`/`checkpoint_wal` MUST serialize
+/// on the single connection. Before that, concurrent reads panicked the WAL; the
+/// leaked read transaction then made EVERY later read panic and the engine went
+/// unusable — the TUI's reconnect loop and the "Rejected non-TLS ...
+/// DecryptError" log spam were downstream of that. This pins the serialization.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_reads_and_writes_do_not_panic_the_wal() {
+    let dir = std::env::temp_dir().join(format!("ckt-wal-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = DatabaseManager::new(DatabaseConfig {
+        local_path: dir.join("timeline.db"),
+        remote_url: None,
+        sync_interval_secs: 15,
+        local_target_mb: 50,
+    });
+    db.initialize().await.unwrap();
+
+    let seed = uuid::Uuid::now_v7().as_bytes().to_vec();
+    db.insert_event(&seed, 1, "twitch", &[], "seed", "", "{}").await.unwrap();
+
+    let mut handles = Vec::new();
+    for _ in 0..16u32 {
+        let db = db.clone();
+        let seed = seed.clone();
+        handles.push(tokio::spawn(async move {
+            for _ in 0..25u32 {
+                // The exact operations the engine runs from SEPARATE tasks: the
+                // stats read path, a timeline read, a write, and the WAL
+                // checkpoint — all on the one shared connection.
+                db.execute_query("SELECT COUNT(*) AS n FROM timeline_events").await.unwrap();
+                db.get_event_as_json(&seed).await.unwrap();
+                let u = uuid::Uuid::now_v7().as_bytes().to_vec();
+                db.insert_event(&u, 1, "twitch", &[], "hi", "", "{}").await.unwrap();
+                db.checkpoint_wal().await;
+            }
+        }));
+    }
+    for h in handles {
+        h.await.expect("a concurrent DB read panicked the WAL");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

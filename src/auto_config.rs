@@ -296,6 +296,46 @@ mod tests {
     }
 
     #[test]
+    fn register_module_adds_a_new_entry_and_preserves_an_existing_one() {
+        let dir = std::env::temp_dir().join(format!("ckt-acfg-reg-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let content = r#"{"timeline_database_location":"./t.db","timeline_database_backup_location":"./b.db","port":9734}"#;
+        std::fs::write(&path, content).unwrap();
+        let config: crate::config::Config = serde_json::from_str(content).unwrap();
+        let state = Arc::new(Mutex::new(ConfigState {
+            path,
+            last_size: content.len() as u32,
+            config,
+            pin: 0,
+            jwt_secret: String::new(),
+        }));
+
+        // A brand-new module is registered as not-auto-authorized (its first
+        // connect still prompts).
+        assert!(
+            register_module(&state, "newmod", "input").is_some(),
+            "a new module must be registered"
+        );
+        let modules_path = config::modules_path(&state);
+        let modules: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&modules_path).unwrap()).unwrap();
+        let entry = modules.iter().find(|e| e["name"] == "newmod").unwrap();
+        assert_eq!(entry["auto_auth"], false);
+
+        // A second run leaves the pre-existing entry untouched.
+        assert!(
+            register_module(&state, "newmod", "input").is_none(),
+            "an existing entry must return early"
+        );
+        let after: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&modules_path).unwrap()).unwrap();
+        assert_eq!(after.len(), 1, "no duplicate entry");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn write_connection_config_creates_missing_file() {
         let dir = std::env::temp_dir().join(format!("ckt-acfg-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();

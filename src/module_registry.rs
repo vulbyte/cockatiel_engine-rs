@@ -119,4 +119,35 @@ mod tests {
         assert!(entries[0].instance_uuid7.is_empty());
         assert_eq!(entries[0].priority, 0);
     }
+
+    #[test]
+    fn registered_module_round_trips_through_save_and_load() {
+        let dir = std::env::temp_dir().join(format!("ckt-reg-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("modules.json");
+
+        let persistence = ModuleRegistryPersistence {
+            path: path.clone(),
+            modules: Arc::new(Mutex::new(vec![RegisteredModule {
+                name: "x".to_string(),
+                instance_uuid7: "u".to_string(),
+                position: "inprocess".to_string(),
+                priority: 7,
+                auto_auth: true,
+                auth_token: "tok".to_string(),
+            }])),
+        };
+        persistence.save().expect("save succeeds");
+
+        let reloaded: Vec<RegisteredModule> =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].name, "x");
+        assert_eq!(reloaded[0].position, "inprocess");
+        assert_eq!(reloaded[0].priority, 7);
+        assert!(reloaded[0].auto_auth);
+        assert_eq!(reloaded[0].auth_token, "tok");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

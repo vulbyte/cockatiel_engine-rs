@@ -45,6 +45,38 @@ pub struct DatabaseConfig {
     pub local_target_mb: u32,
 }
 
+/// Check the configured timeline DB path is usable WITHOUT opening the DB.
+///
+/// Returns a human-readable reason when it is not: an empty path, a path that is
+/// itself a directory, or a parent directory that cannot be created. A missing
+/// parent is created best-effort so a fresh install just works. Pure apart from
+/// that one `create_dir_all`, so the startup block decision is unit-testable.
+pub fn timeline_db_path_problem(location: &str) -> Option<String> {
+    let trimmed = location.trim();
+    if trimmed.is_empty() {
+        return Some("timeline database location is empty".to_string());
+    }
+    let path = std::path::Path::new(trimmed);
+    if path.is_dir() {
+        return Some(format!(
+            "timeline database path {} is a directory",
+            path.display()
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Some(format!(
+                    "cannot create timeline database directory {}: {}",
+                    parent.display(),
+                    e
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// The content of a queued (never-started) timeline row, enough to rebuild a
 /// pipeline message after a crash. NOTE: `channel_id`, `user_data` and the
 /// parsed `Command` are NOT persisted on the timeline row — a recovered message
@@ -196,6 +228,23 @@ impl DatabaseManager {
             .unwrap_or(false)
     }
 
+    /// Ensure the backup file's parent directory exists (0o700 on unix). Best
+    /// effort — a failure surfaces via the copy/rename that follows. The default
+    /// backup lives in the home directory, whose parent may not exist yet.
+    fn ensure_backup_parent(backup_path: &str) {
+        let path = std::path::Path::new(backup_path);
+        let Some(parent) = path.parent() else { return };
+        if parent.as_os_str().is_empty() {
+            return;
+        }
+        let _ = std::fs::create_dir_all(parent);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
     /// Size of the local timeline DB main file in bytes (the warning logic
     /// compares this against the configured target).
     pub fn db_size_bytes(&self) -> u64 {
@@ -209,7 +258,15 @@ impl DatabaseManager {
         self.config.local_target_mb
     }
 
-    pub async fn initialize(&self) -> Result<(), Box<dyn std::error::Error>> {
+    /// Whether the local timeline connection has been opened yet. `false` while
+    /// the engine is BLOCKED on a missing timeline DB: `db_status` still works
+    /// (it reads config, not the connection), but every query that touches the
+    /// DB returns "Local database not initialized".
+    pub async fn is_initialized(&self) -> bool {
+        self.local.lock().await.is_some()
+    }
+
+    pub async fn initialize(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Open the local DB (the write buffer / queue). If it is corrupt or
         // otherwise can't be opened and a backup exists, restore from the
         // backup before giving up.
@@ -253,6 +310,11 @@ impl DatabaseManager {
         println!("[Database] Initialized at {:?}", self.config.local_path);
 
         if self.backup_configured() {
+            // The default backup lives in the home directory; make sure its
+            // parent exists before the first snapshot lands.
+            if let Some(bp) = self.config.remote_url.as_deref() {
+                Self::ensure_backup_parent(bp);
+            }
             println!(
                 "[Database] Backup enabled at {} (periodic snapshot)",
                 self.config.remote_url.as_deref().unwrap_or("")
@@ -264,7 +326,7 @@ impl DatabaseManager {
         Ok(())
     }
 
-    async fn open_local(path: &std::path::Path) -> Result<turso::Connection, Box<dyn std::error::Error>> {
+    async fn open_local(path: &std::path::Path) -> Result<turso::Connection, Box<dyn std::error::Error + Send + Sync>> {
         let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
             .build()
             .await?;
@@ -278,7 +340,7 @@ impl DatabaseManager {
     /// Replace the local connection with a fresh one. Used after a query
     /// panics: a turso/Limbo "not yet implemented" panic poisons the shared
     /// connection (even clones), so we discard it and reopen the DB file.
-    pub async fn reopen_local(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn reopen_local(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let fresh = Self::open_local(&self.config.local_path).await?;
         let mut local = self.locked().await;
         *local = Some(fresh);
@@ -943,15 +1005,20 @@ impl DatabaseManager {
     ) -> Result<String, String> {
         // Return a `String` error (Send) so callers can run this in a contained
         // task that catches turso/Limbo panics on unsupported SQL.
+        //
+        // Hold the shared DB lock for the WHOLE query. turso 0.1.5's WAL panics
+        // with "cannot start a new read tx without ending an existing one" when
+        // two read transactions overlap, and the engine issues reads from
+        // several tasks at once (the TUI's `stats` poll, timeline reads, the
+        // message hot path, the periodic WAL checkpoint). Cloning the connection
+        // and dropping the guard — as this used to — let those reads collide and
+        // the leaked read transaction then made EVERY later read panic, which is
+        // what took the engine down and drove the TUI into a reconnect loop. A
+        // tokio Mutex is NOT poisoned by a panic, so holding the guard across a
+        // panicking query cannot brick the DB: the guard is released on unwind.
         let run = async {
-        // Clone the connection and drop the guard BEFORE running the query:
-        // a turso/Limbo "not yet implemented" panic on the SQL would otherwise
-        // poison the shared mutex and brick the timeline DB. The clone is a
-        // cheap shared handle (turso::Connection is Clone).
-        let conn = {
-            let guard = self.locked().await;
-            guard.as_ref().ok_or("Local database not initialized")?.clone()
-        };
+        let guard = self.locked().await;
+        let conn = guard.as_ref().ok_or("Local database not initialized")?;
         let mut stmt = conn.prepare(sql).await?;
         let columns: Vec<String> = stmt.columns().iter().map(|c| c.name().to_string()).collect();
         let mut rows = stmt.query(()).await?;
@@ -1278,10 +1345,17 @@ impl DatabaseManager {
         }
 
         // Copy while the lock is held → no concurrent writes → consistent.
+        Self::ensure_backup_parent(bp);
         let tmp = format!("{}.tmp", bp);
         let _ = std::fs::remove_file(&tmp);
         std::fs::copy(&self.config.local_path, &tmp)
             .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
+        // The timeline holds chat data; keep the snapshot owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
         // Drop the borrowed connection reference (the MutexGuard itself was
         // already released when `conn` was shadowed) before the atomic rename.
         let _ = conn;
@@ -1295,11 +1369,15 @@ impl DatabaseManager {
     /// Force the local SQLite write-ahead log to merge into the main file and
     /// truncate. Called periodically and when the WAL exceeds ~5 MB.
     pub async fn checkpoint_wal(&self) {
-        if let Some(conn) = self.locked().await.as_ref().map(|c| c.clone()) {
-            if let Ok(mut stmt) = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await {
-                while let Ok(Some(_)) = stmt.next().await {}
-            }
-        }
+        // Hold the lock for the checkpoint too: it opens a read transaction, and
+        // running it on a cloned connection while another read is in flight is
+        // the same turso WAL collision that `execute_query` documents.
+        let guard = self.locked().await;
+        let Some(conn) = guard.as_ref() else { return };
+        let Ok(mut stmt) = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await else {
+            return;
+        };
+        while let Ok(Some(_)) = stmt.next().await {}
     }
 
     /// Approximate size of the local DB's write-ahead log in bytes.
@@ -1307,5 +1385,40 @@ impl DatabaseManager {
         let mut path = self.config.local_path.as_os_str().to_owned();
         path.push("-wal");
         std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod timeline_path_tests {
+    use super::timeline_db_path_problem;
+
+    #[test]
+    fn empty_location_is_a_problem() {
+        assert!(timeline_db_path_problem("").is_some());
+        assert!(timeline_db_path_problem("   ").is_some());
+    }
+
+    #[test]
+    fn a_directory_is_not_a_valid_db_path() {
+        let dir = std::env::temp_dir().join(format!("ckt-tl-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let problem = timeline_db_path_problem(&dir.to_string_lossy());
+        assert!(problem.as_deref().unwrap_or("").contains("is a directory"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_parent_is_created_not_reported() {
+        let root = std::env::temp_dir().join(format!("ckt-tl-{}", uuid::Uuid::now_v7()));
+        let nested = root.join("a").join("b").join("timeline.db");
+        // Parent does not exist yet: the check creates it and reports no problem.
+        assert!(timeline_db_path_problem(&nested.to_string_lossy()).is_none());
+        assert!(root.join("a").join("b").is_dir(), "parent was created");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_plain_filename_in_the_cwd_is_fine() {
+        assert!(timeline_db_path_problem("./cockatiel_data.db").is_none());
     }
 }
