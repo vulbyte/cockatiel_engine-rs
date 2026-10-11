@@ -2,21 +2,24 @@
 //! parser fuzzing — adversarial inputs must never panic and must classify
 //! consistently.
 
-use crate::command_registry::{CommandRegistry, parse_command};
 use crate::cockatiel_protobuf::{Command, Commands};
-use crate::{classify_command, CommandAction};
+use crate::command_registry::{CommandRegistry, parse_command};
+use crate::{CommandAction, classify_command};
 
 fn reg_with_commands() -> CommandRegistry {
     let mut r = CommandRegistry::default();
-    r.register("reprimand", Commands {
-        commands: vec![Command {
-            command_name: "reprimand".into(),
-            command_flag: "!".into(),
-            command_description: "reprimand".into(),
-            command_flags: vec![],
-        }],
-        alert_on_unknown_command: false,
-    });
+    r.register(
+        "reprimand",
+        Commands {
+            commands: vec![Command {
+                command_name: "reprimand".into(),
+                command_flag: "!".into(),
+                command_description: "reprimand".into(),
+                command_flags: vec![],
+            }],
+            alert_on_unknown_command: false,
+        },
+    );
     // An alerting module also owns `!`.
     let flag = |name: &str| crate::cockatiel_protobuf::Flag {
         flag_name: name.to_string(),
@@ -27,23 +30,32 @@ fn reg_with_commands() -> CommandRegistry {
         options: vec![],
         value: String::new(),
     };
-    r.register("tts-service", Commands {
-        commands: vec![Command {
-            command_name: "tts".into(),
-            command_flag: "!".into(),
-            command_description: "tts".into(),
-            command_flags: vec![flag("p"), flag("r")],
-        }],
-        alert_on_unknown_command: true,
-    });
+    r.register(
+        "tts-service",
+        Commands {
+            commands: vec![Command {
+                command_name: "tts".into(),
+                command_flag: "!".into(),
+                command_description: "tts".into(),
+                command_flags: vec![flag("p"), flag("r")],
+            }],
+            alert_on_unknown_command: true,
+        },
+    );
     r
 }
 
 #[test]
 fn help_classifies_to_help() {
     let r = reg_with_commands();
-    assert!(matches!(classify_command("!help", &r), CommandAction::Help(None)));
-    assert!(matches!(classify_command("!help what can I do", &r), CommandAction::Help(Some(_))));
+    assert!(matches!(
+        classify_command("!help", &r),
+        CommandAction::Help(None)
+    ));
+    assert!(matches!(
+        classify_command("!help what can I do", &r),
+        CommandAction::Help(Some(_))
+    ));
     // The module argument is captured for the detail view.
     match classify_command("!help tts", &r) {
         CommandAction::Help(Some(m)) => assert_eq!(m, "tts"),
@@ -66,13 +78,19 @@ fn known_command_attaches() {
 #[test]
 fn unknown_on_alerting_flag_alerts() {
     let r = reg_with_commands();
-    assert!(matches!(classify_command("!bogus whatever", &r), CommandAction::Alert));
+    assert!(matches!(
+        classify_command("!bogus whatever", &r),
+        CommandAction::Alert
+    ));
 }
 
 #[test]
 fn plain_message_is_none() {
     let r = reg_with_commands();
-    assert!(matches!(classify_command("just chatting", &r), CommandAction::None));
+    assert!(matches!(
+        classify_command("just chatting", &r),
+        CommandAction::None
+    ));
 }
 
 /// A4 — parser fuzzing: adversarial inputs never panic.
@@ -115,6 +133,17 @@ fn parser_flag_values_round_trip() {
     let r = reg_with_commands();
     let p = parse_command("!tts -p 2 -r:1.4 hey", &r).unwrap();
     assert_eq!(p.args, "hey");
-    let vals: Vec<(String, String)> = p.command.command_flags.iter().map(|f| (f.flag_name.clone(), f.value.clone())).collect();
-    assert_eq!(vals, vec![("p".to_string(), "2".to_string()), ("r".to_string(), "1.4".to_string())]);
+    let vals: Vec<(String, String)> = p
+        .command
+        .command_flags
+        .iter()
+        .map(|f| (f.flag_name.clone(), f.value.clone()))
+        .collect();
+    assert_eq!(
+        vals,
+        vec![
+            ("p".to_string(), "2".to_string()),
+            ("r".to_string(), "1.4".to_string())
+        ]
+    );
 }

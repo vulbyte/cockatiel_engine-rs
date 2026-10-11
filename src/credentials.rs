@@ -95,7 +95,9 @@ pub fn credential_values_map(module: &DiscoveredModule) -> HashMap<String, Strin
 }
 
 /// Read the `module_specific` object of a module's config.json (empty if none).
-fn load_config_module_specific(module: &DiscoveredModule) -> serde_json::Map<String, serde_json::Value> {
+fn load_config_module_specific(
+    module: &DiscoveredModule,
+) -> serde_json::Map<String, serde_json::Value> {
     let path = module_config_path(module);
     let Ok(data) = std::fs::read_to_string(&path) else {
         return serde_json::Map::new();
@@ -131,7 +133,9 @@ fn load_legacy_credentials(
     out: &mut HashMap<String, String>,
 ) {
     let path = module_config_path(module);
-    let Ok(data) = std::fs::read_to_string(&path) else { return };
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return;
+    };
     let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&data) else {
         return;
     };
@@ -162,19 +166,13 @@ fn load_legacy_credentials(
 /// Whether every REQUIRED credential in the schema has a non-empty value in
 /// the given map. Optional fields (e.g. oauth_token, which adapters acquire
 /// automatically) do not block completion.
-pub fn is_config_complete(
-    fields: &[CredentialField],
-    values: &HashMap<String, String>,
-) -> bool {
-    fields
-        .iter()
-        .filter(|f| !f.optional)
-        .all(|f| {
-            values
-                .get(&f.key)
-                .map(|v| !v.trim().is_empty())
-                .unwrap_or(false)
-        })
+pub fn is_config_complete(fields: &[CredentialField], values: &HashMap<String, String>) -> bool {
+    fields.iter().filter(|f| !f.optional).all(|f| {
+        values
+            .get(&f.key)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    })
 }
 
 /// Validate the submitted fields against the module's credential schema.
@@ -204,7 +202,9 @@ pub fn save_module_credentials(
     let mut env_entries: Vec<(String, String)> = Vec::new();
     let mut spec = serde_json::Map::new();
     for field in fields {
-        let Some(value) = values.get(&field.key) else { continue };
+        let Some(value) = values.get(&field.key) else {
+            continue;
+        };
         if field.sensitive {
             let encoded = if field.list {
                 let items: Vec<String> = value
@@ -225,10 +225,15 @@ pub fn save_module_credentials(
                 .collect();
             spec.insert(
                 field.key.clone(),
-                serde_json::Value::Array(items.into_iter().map(serde_json::Value::String).collect()),
+                serde_json::Value::Array(
+                    items.into_iter().map(serde_json::Value::String).collect(),
+                ),
             );
         } else {
-            spec.insert(field.key.clone(), serde_json::Value::String(value.trim().to_string()));
+            spec.insert(
+                field.key.clone(),
+                serde_json::Value::String(value.trim().to_string()),
+            );
         }
     }
 
@@ -355,10 +360,9 @@ mod tests {
         )
         .unwrap();
 
-        let values = HashMap::from([
-            ("servers".to_string(), "111=chan-a\n222".to_string()),
-        ]);
-        save_module_credentials(&module, &secret_and_list_fields(), &values).expect("save succeeds");
+        let values = HashMap::from([("servers".to_string(), "111=chan-a\n222".to_string())]);
+        save_module_credentials(&module, &secret_and_list_fields(), &values)
+            .expect("save succeeds");
 
         let ms = scratch.config();
         let spec = ms.get("module_specific").expect("module_specific present");
@@ -396,14 +400,14 @@ mod tests {
         )
         .unwrap();
 
-        let values = HashMap::from([(
-            "servers".to_string(),
-            "999=chan-z".to_string(),
-        )]);
-        save_module_credentials(&module, &secret_and_list_fields(), &values).expect("save succeeds");
+        let values = HashMap::from([("servers".to_string(), "999=chan-z".to_string())]);
+        save_module_credentials(&module, &secret_and_list_fields(), &values)
+            .expect("save succeeds");
 
         let spec = scratch.config();
-        let ms = spec.get("module_specific").expect("module_specific present");
+        let ms = spec
+            .get("module_specific")
+            .expect("module_specific present");
         assert_eq!(ms.get("servers"), Some(&serde_json::json!(["999=chan-z"])));
         assert_eq!(ms.get("http_timeout_secs"), Some(&serde_json::json!(42)));
     }
@@ -416,10 +420,15 @@ mod tests {
             ("bot_token".to_string(), "super-secret".to_string()),
             ("servers".to_string(), "111".to_string()),
         ]);
-        save_module_credentials(&module, &secret_and_list_fields(), &values).expect("save succeeds");
+        save_module_credentials(&module, &secret_and_list_fields(), &values)
+            .expect("save succeeds");
 
         let env = std::fs::read_to_string(module.directory.join(".env")).expect(".env written");
-        assert!(env.contains("DISCORD_BOT_TOKEN=super-secret"), "got {:?}", env);
+        assert!(
+            env.contains("DISCORD_BOT_TOKEN=super-secret"),
+            "got {:?}",
+            env
+        );
         let config = std::fs::read_to_string(module.directory.join("config.json")).unwrap();
         assert!(
             !config.contains("super-secret"),
@@ -433,9 +442,13 @@ mod tests {
         let scratch = Scratch::new("fresh");
         let module = scratch.module();
         let values = HashMap::from([("servers".to_string(), "111".to_string())]);
-        save_module_credentials(&module, &secret_and_list_fields(), &values).expect("save succeeds");
+        save_module_credentials(&module, &secret_and_list_fields(), &values)
+            .expect("save succeeds");
         assert_eq!(
-            scratch.config().get("module_specific").and_then(|m| m.get("servers")),
+            scratch
+                .config()
+                .get("module_specific")
+                .and_then(|m| m.get("servers")),
             Some(&serde_json::json!(["111"]))
         );
 
@@ -444,9 +457,13 @@ mod tests {
         let module = scratch.module();
         std::fs::write(module.directory.join("config.json"), "{ not json").unwrap();
         let values = HashMap::from([("servers".to_string(), "222".to_string())]);
-        save_module_credentials(&module, &secret_and_list_fields(), &values).expect("save succeeds");
+        save_module_credentials(&module, &secret_and_list_fields(), &values)
+            .expect("save succeeds");
         assert_eq!(
-            scratch.config().get("module_specific").and_then(|m| m.get("servers")),
+            scratch
+                .config()
+                .get("module_specific")
+                .and_then(|m| m.get("servers")),
             Some(&serde_json::json!(["222"]))
         );
     }

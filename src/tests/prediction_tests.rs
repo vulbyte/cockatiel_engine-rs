@@ -31,16 +31,37 @@ fn the_prediction_update_arm_exists_and_mirrors_the_prompt_forward() {
 
     // The forward is a fresh ContainerForModule with the same header fields as
     // the Prompt arm, carrying the cloned PredictionUpdate.
-    assert!(arm.contains("let forward = ContainerForModule {"), "the arm must build a fresh container");
-    assert!(arm.contains("version: 2,"), "the forward must carry the protocol version");
-    assert!(arm.contains("auth_token: container.auth_token.clone()"), "the forward must carry the auth token");
-    assert!(arm.contains("module_instance_uuid7: container.module_instance_uuid7.clone()"), "the forward must carry the instance uuid");
-    assert!(arm.contains("payload: Some(ModulePayload::PredictionUpdate(update)),"), "the forward must carry the cloned prediction update");
+    assert!(
+        arm.contains("let forward = ContainerForModule {"),
+        "the arm must build a fresh container"
+    );
+    assert!(
+        arm.contains("version: 2,"),
+        "the forward must carry the protocol version"
+    );
+    assert!(
+        arm.contains("auth_token: container.auth_token.clone()"),
+        "the forward must carry the auth token"
+    );
+    assert!(
+        arm.contains("module_instance_uuid7: container.module_instance_uuid7.clone()"),
+        "the forward must carry the instance uuid"
+    );
+    assert!(
+        arm.contains("payload: Some(ModulePayload::PredictionUpdate(update)),"),
+        "the forward must carry the cloned prediction update"
+    );
 
     // The broadcast shape matches Prompt: every module except the sender, via
     // non-blocking try_send.
-    assert!(arm.contains("filter(|(n, _)| n.as_str() != module_name.as_str())"), "the forward must exclude the origin module");
-    assert!(arm.contains("sender.try_send(forward.clone())"), "the forward must be a non-blocking try_send");
+    assert!(
+        arm.contains("filter(|(n, _)| n.as_str() != module_name.as_str())"),
+        "the forward must exclude the origin module"
+    );
+    assert!(
+        arm.contains("sender.try_send(forward.clone())"),
+        "the forward must be a non-blocking try_send"
+    );
 }
 
 /// Only the events module (the brain) or the TUI control surface may
@@ -87,11 +108,26 @@ fn the_poll_update_arm_exists_and_mirrors_the_prediction_forward() {
     let src = include_str!("../main.rs");
     let arm = poll_arm(src);
 
-    assert!(arm.contains("let forward = ContainerForModule {"), "the arm must build a fresh container");
-    assert!(arm.contains("version: 2,"), "the forward must carry the protocol version");
-    assert!(arm.contains("payload: Some(ModulePayload::PollUpdate(update)),"), "the forward must carry the cloned poll update");
-    assert!(arm.contains("filter(|(n, _)| n.as_str() != module_name.as_str())"), "the forward must exclude the origin module");
-    assert!(arm.contains("sender.try_send(forward.clone())"), "the forward must be a non-blocking try_send");
+    assert!(
+        arm.contains("let forward = ContainerForModule {"),
+        "the arm must build a fresh container"
+    );
+    assert!(
+        arm.contains("version: 2,"),
+        "the forward must carry the protocol version"
+    );
+    assert!(
+        arm.contains("payload: Some(ModulePayload::PollUpdate(update)),"),
+        "the forward must carry the cloned poll update"
+    );
+    assert!(
+        arm.contains("filter(|(n, _)| n.as_str() != module_name.as_str())"),
+        "the forward must exclude the origin module"
+    );
+    assert!(
+        arm.contains("sender.try_send(forward.clone())"),
+        "the forward must be a non-blocking try_send"
+    );
 }
 
 #[test]

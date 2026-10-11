@@ -3,9 +3,8 @@
 
 use crate::auth::{AuthStore, generate_auth_token};
 use crate::{
-    compose_rejection_broadcast, compose_rejection_record, is_always_trusted,
-    is_control_surface, is_loopback_addr, is_test_runner, may_read_other_credentials,
-    userdb_actor_perm,
+    compose_rejection_broadcast, compose_rejection_record, is_always_trusted, is_control_surface,
+    is_loopback_addr, is_test_runner, may_read_other_credentials, userdb_actor_perm,
 };
 
 #[test]
@@ -23,10 +22,18 @@ fn loopback_grants_owner_perm() {
 
 #[test]
 fn loopback_addr_detection() {
-    assert!(is_loopback_addr(&"127.0.0.1:1111".parse::<std::net::SocketAddr>().unwrap()));
-    assert!(is_loopback_addr(&"[::1]:1111".parse::<std::net::SocketAddr>().unwrap()));
-    assert!(!is_loopback_addr(&"192.168.1.10:1111".parse::<std::net::SocketAddr>().unwrap()));
-    assert!(!is_loopback_addr(&"10.0.0.5:1111".parse::<std::net::SocketAddr>().unwrap()));
+    assert!(is_loopback_addr(
+        &"127.0.0.1:1111".parse::<std::net::SocketAddr>().unwrap()
+    ));
+    assert!(is_loopback_addr(
+        &"[::1]:1111".parse::<std::net::SocketAddr>().unwrap()
+    ));
+    assert!(!is_loopback_addr(
+        &"192.168.1.10:1111".parse::<std::net::SocketAddr>().unwrap()
+    ));
+    assert!(!is_loopback_addr(
+        &"10.0.0.5:1111".parse::<std::net::SocketAddr>().unwrap()
+    ));
 }
 
 /// A2 — identity gates: only the TUI / test-runner / audit-viewer reach the
@@ -86,9 +93,26 @@ fn jwt_name_trust_binding() {
 /// the reason, the original raw message, and what it became (no obscurity).
 #[test]
 fn rejection_record_contains_reason_raw_and_processed() {
-    let b = compose_rejection_broadcast("banned-words", "uuid-9", "banned word 'x' via leet", "b4dx", "b*d*");
-    assert_eq!(b, "[banned-words] rejected uuid-9: banned word 'x' via leet (\"b4dx\" -> \"b*d*\")");
+    let b = compose_rejection_broadcast(
+        "banned-words",
+        "uuid-9",
+        "banned word 'x' via leet",
+        "b4dx",
+        "b*d*",
+    );
+    assert_eq!(
+        b,
+        "[banned-words] rejected uuid-9: banned word 'x' via leet (\"b4dx\" -> \"b*d*\")"
+    );
 
-    let r = compose_rejection_record("banned-words", "LLM risk 0.92 >= 0.5", "toxic stuff", "t**** **ff");
-    assert_eq!(r, "[rejected by banned-words] LLM risk 0.92 >= 0.5 : \"toxic stuff\" -> \"t**** **ff\"");
+    let r = compose_rejection_record(
+        "banned-words",
+        "LLM risk 0.92 >= 0.5",
+        "toxic stuff",
+        "t**** **ff",
+    );
+    assert_eq!(
+        r,
+        "[rejected by banned-words] LLM risk 0.92 >= 0.5 : \"toxic stuff\" -> \"t**** **ff\""
+    );
 }

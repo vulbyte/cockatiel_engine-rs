@@ -39,8 +39,10 @@ impl CommandRegistry {
             alert_on_unknown: commands.alert_on_unknown_command,
         };
         for cmd in &reg.commands {
-            self.index
-                .insert((cmd.command_flag.clone(), cmd.command_name.clone()), module.to_string());
+            self.index.insert(
+                (cmd.command_flag.clone(), cmd.command_name.clone()),
+                module.to_string(),
+            );
         }
         self.modules.insert(module.to_string(), reg);
     }
@@ -62,13 +64,11 @@ impl CommandRegistry {
         self.index
             .get(&(flag.to_string(), name.to_string()))
             .and_then(|owner| {
-                self.modules
-                    .get(owner)
-                    .and_then(|reg| {
-                        reg.commands
-                            .iter()
-                            .find(|c| c.command_flag == flag && c.command_name == name)
-                    })
+                self.modules.get(owner).and_then(|reg| {
+                    reg.commands
+                        .iter()
+                        .find(|c| c.command_flag == flag && c.command_name == name)
+                })
             })
             .map(|c| c.command_flags.clone())
             .unwrap_or_default()
@@ -261,7 +261,9 @@ pub fn parse_command(raw: &str, registry: &CommandRegistry) -> Option<ParsedComm
         command: Command {
             command_name: name.to_string(),
             command_flag: flag.clone(),
-            command_description: registry.command_description(&flag, name).unwrap_or_default(),
+            command_description: registry
+                .command_description(&flag, name)
+                .unwrap_or_default(),
             command_flags: parsed_flags,
         },
         args: args.join(" "),
@@ -280,8 +282,24 @@ mod tests {
                 command_flag: "!".into(),
                 command_description: "read chat out loud".into(),
                 command_flags: vec![
-                    Flag { flag_name: "p".into(), flag_description: "priority".into(), limiting_type: 0, min_val: 0.0, max_val: 0.0, options: vec![], value: String::new() },
-                    Flag { flag_name: "v".into(), flag_description: "voice".into(), limiting_type: 0, min_val: 0.0, max_val: 0.0, options: vec![], value: String::new() },
+                    Flag {
+                        flag_name: "p".into(),
+                        flag_description: "priority".into(),
+                        limiting_type: 0,
+                        min_val: 0.0,
+                        max_val: 0.0,
+                        options: vec![],
+                        value: String::new(),
+                    },
+                    Flag {
+                        flag_name: "v".into(),
+                        flag_description: "voice".into(),
+                        limiting_type: 0,
+                        min_val: 0.0,
+                        max_val: 0.0,
+                        options: vec![],
+                        value: String::new(),
+                    },
                 ],
             }],
             alert_on_unknown_command: true,
@@ -307,8 +325,20 @@ mod tests {
         let p = parse_command("!tts -p 2 -r:1.4 -v 88 hey! how are you today?", &r).unwrap();
         assert_eq!(p.command.command_name, "tts");
         assert_eq!(p.command.command_flag, "!");
-        let vals: Vec<(String, String)> = p.command.command_flags.iter().map(|f| (f.flag_name.clone(), f.value.clone())).collect();
-        assert_eq!(vals, vec![("p".to_string(), "2".to_string()), ("r".to_string(), "1.4".to_string()), ("v".to_string(), "88".to_string())]);
+        let vals: Vec<(String, String)> = p
+            .command
+            .command_flags
+            .iter()
+            .map(|f| (f.flag_name.clone(), f.value.clone()))
+            .collect();
+        assert_eq!(
+            vals,
+            vec![
+                ("p".to_string(), "2".to_string()),
+                ("r".to_string(), "1.4".to_string()),
+                ("v".to_string(), "88".to_string())
+            ]
+        );
         // The `-` is stripped; positional args = the trailing message.
         assert_eq!(p.args, "hey! how are you today?");
     }
@@ -353,7 +383,13 @@ mod tests {
     #[test]
     fn catch_all_and_owner() {
         let mut r = sample_registry();
-        r.register("catch-all-mod", Commands { commands: vec![], alert_on_unknown_command: false });
+        r.register(
+            "catch-all-mod",
+            Commands {
+                commands: vec![],
+                alert_on_unknown_command: false,
+            },
+        );
         assert_eq!(r.catch_alls(), vec!["catch-all-mod".to_string()]);
         assert_eq!(r.owner("!", "tts").unwrap(), "tts-service");
         assert_eq!(r.owner("!", "reprimand").unwrap(), "reprimand");
@@ -363,15 +399,18 @@ mod tests {
     #[test]
     fn re_registration_on_reconnect_replaces_the_old_set() {
         let mut r = CommandRegistry::default();
-        r.register("mod", Commands {
-            commands: vec![Command {
-                command_name: "old".into(),
-                command_flag: "!".into(),
-                command_description: String::new(),
-                command_flags: vec![],
-            }],
-            alert_on_unknown_command: false,
-        });
+        r.register(
+            "mod",
+            Commands {
+                commands: vec![Command {
+                    command_name: "old".into(),
+                    command_flag: "!".into(),
+                    command_description: String::new(),
+                    command_flags: vec![],
+                }],
+                alert_on_unknown_command: false,
+            },
+        );
         assert!(r.has_registration("mod"));
         assert_eq!(r.owner("!", "old").unwrap(), "mod");
         assert!(r.owner("!", "new").is_none());
@@ -380,16 +419,22 @@ mod tests {
         // set, never accumulate — a stale command from a previous connection
         // must not keep routing after the module reconnected with different
         // commands.
-        r.register("mod", Commands {
-            commands: vec![Command {
-                command_name: "new".into(),
-                command_flag: "!".into(),
-                command_description: String::new(),
-                command_flags: vec![],
-            }],
-            alert_on_unknown_command: true,
-        });
-        assert!(r.owner("!", "old").is_none(), "old command must be gone after re-registration");
+        r.register(
+            "mod",
+            Commands {
+                commands: vec![Command {
+                    command_name: "new".into(),
+                    command_flag: "!".into(),
+                    command_description: String::new(),
+                    command_flags: vec![],
+                }],
+                alert_on_unknown_command: true,
+            },
+        );
+        assert!(
+            r.owner("!", "old").is_none(),
+            "old command must be gone after re-registration"
+        );
         assert_eq!(r.owner("!", "new").unwrap(), "mod");
         assert_eq!(r.alert_owner_for("!"), Some("mod".to_string()));
         // Exactly one registration remains (no duplicate owner rows).
@@ -401,17 +446,30 @@ mod tests {
     fn command_recipients_scopes_by_command_and_catch_all() {
         use crate::pipeline::command_recipients;
         let mut r = CommandRegistry::default();
-        r.register("tts-service", Commands {
-            commands: vec![Command {
-                command_name: "tts".into(),
-                command_flag: "!".into(),
-                command_description: String::new(),
-                command_flags: vec![],
-            }],
-            alert_on_unknown_command: false,
-        });
-        r.register("display", Commands { commands: vec![], alert_on_unknown_command: false });
-        let stage = vec!["tts-service".to_string(), "display".to_string(), "other".to_string()];
+        r.register(
+            "tts-service",
+            Commands {
+                commands: vec![Command {
+                    command_name: "tts".into(),
+                    command_flag: "!".into(),
+                    command_description: String::new(),
+                    command_flags: vec![],
+                }],
+                alert_on_unknown_command: false,
+            },
+        );
+        r.register(
+            "display",
+            Commands {
+                commands: vec![],
+                alert_on_unknown_command: false,
+            },
+        );
+        let stage = vec![
+            "tts-service".to_string(),
+            "display".to_string(),
+            "other".to_string(),
+        ];
 
         let cmd = Command {
             command_name: "tts".into(),
@@ -423,7 +481,10 @@ mod tests {
         let targets = command_recipients(Some(&cmd), &r, &stage).unwrap();
         assert!(targets.contains(&"tts-service".to_string()));
         assert!(targets.contains(&"display".to_string()));
-        assert!(!targets.contains(&"other".to_string()), "a module outside the stage is excluded");
+        assert!(
+            !targets.contains(&"other".to_string()),
+            "a module outside the stage is excluded"
+        );
 
         // A plain message (no command) -> every stage module EXCEPT the
         // command-scoped one. Catch-alls and never-registered modules get it;

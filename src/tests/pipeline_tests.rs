@@ -200,8 +200,15 @@ pub(super) fn nothing_left(rx: &mut ModuleRx) -> bool {
     rx.try_recv().is_err()
 }
 
-pub(super) async fn row(db: &DatabaseManager, uuid7: &str) -> serde_json::Map<String, serde_json::Value> {
-    let json = db.get_event_as_json(uuid7.as_bytes()).await.unwrap().unwrap();
+pub(super) async fn row(
+    db: &DatabaseManager,
+    uuid7: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let json = db
+        .get_event_as_json(uuid7.as_bytes())
+        .await
+        .unwrap()
+        .unwrap();
     serde_json::from_str::<serde_json::Value>(&json)
         .unwrap()
         .as_object()
@@ -211,8 +218,9 @@ pub(super) async fn row(db: &DatabaseManager, uuid7: &str) -> serde_json::Map<St
 
 #[tokio::test]
 async fn send_outcome_not_connected_when_module_has_no_sender() {
-    let senders: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<ContainerForModule>>>> =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let senders: Arc<
+        tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<ContainerForModule>>>,
+    > = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let outcome = send_to_module(&senders, "ghost", dummy_container(), "test").await;
     assert_eq!(outcome, SendOutcome::NotConnected);
 }
@@ -221,7 +229,10 @@ async fn send_outcome_not_connected_when_module_has_no_sender() {
 async fn send_outcome_not_connected_when_channel_is_closed() {
     let (tx, rx) = tokio::sync::mpsc::channel::<ContainerForModule>(1);
     drop(rx); // the module's socket is gone; its sender slot still lingers.
-    let senders = Arc::new(tokio::sync::Mutex::new(HashMap::from([("mod".to_string(), tx)])));
+    let senders = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+        "mod".to_string(),
+        tx,
+    )])));
     let outcome = send_to_module(&senders, "mod", dummy_container(), "test").await;
     assert_eq!(outcome, SendOutcome::NotConnected);
 }
@@ -231,7 +242,10 @@ async fn send_outcome_dropped_when_channel_is_full() {
     // Bounded capacity-1 channel, receiver kept alive and NEVER drained.
     let (tx, _rx) = tokio::sync::mpsc::channel::<ContainerForModule>(1);
     tx.try_send(dummy_container()).unwrap(); // fill it — the next send can't land
-    let senders = Arc::new(tokio::sync::Mutex::new(HashMap::from([("mod".to_string(), tx)])));
+    let senders = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+        "mod".to_string(),
+        tx,
+    )])));
     let outcome = send_to_module(&senders, "mod", dummy_container(), "test").await;
     assert_eq!(outcome, SendOutcome::Dropped);
 }
@@ -274,7 +288,9 @@ async fn recover_one_skips_missing_or_non_queued_rows() {
     // 'processing' status an engine build before the consolidation used to set
     // when it claimed a message. (An in-flight message is 'queued' now; that
     // case is covered by the in-memory claim check below.)
-    db.set_pipeline_status(&uuid_bytes, "processing").await.unwrap();
+    db.set_pipeline_status(&uuid_bytes, "processing")
+        .await
+        .unwrap();
 
     let orchestrator = PipelineOrchestrator::new(
         db.clone(),
@@ -332,7 +348,11 @@ async fn a_message_through_the_whole_chain_costs_three_database_calls() {
         .await
         .unwrap();
 
-    assert_eq!(db.take_round_trips(), ROUND_TRIPS, "a message must cost one write, not one per stage");
+    assert_eq!(
+        db.take_round_trips(),
+        ROUND_TRIPS,
+        "a message must cost one write, not one per stage"
+    );
 
     // ...and the row it leaves behind is complete, in every column the old
     // per-stage writes used to fill between them.
@@ -342,11 +362,20 @@ async fn a_message_through_the_whole_chain_costs_three_database_calls() {
     assert_eq!(r["user_uuid7"], "user-1");
     assert_eq!(r["processed_message"], "final text");
     assert!(r["error_message"].is_null());
-    let pre = r["pre_process_completed_at"].as_i64().expect("pre_process_completed_at");
-    let inp = r["in_process_completed_at"].as_i64().expect("in_process_completed_at");
-    let post = r["post_process_completed_at"].as_i64().expect("post_process_completed_at");
+    let pre = r["pre_process_completed_at"]
+        .as_i64()
+        .expect("pre_process_completed_at");
+    let inp = r["in_process_completed_at"]
+        .as_i64()
+        .expect("in_process_completed_at");
+    let post = r["post_process_completed_at"]
+        .as_i64()
+        .expect("post_process_completed_at");
     let persisted = r["persisted_at"].as_i64().expect("persisted_at");
-    assert!(pre <= inp && inp <= post && post <= persisted, "stage timestamps out of order: {pre} {inp} {post} {persisted}");
+    assert!(
+        pre <= inp && inp <= post && post <= persisted,
+        "stage timestamps out of order: {pre} {inp} {post} {persisted}"
+    );
 
     // The in-memory record is released once the message is terminal, so nothing
     // can rewrite the row afterwards.
@@ -369,18 +398,26 @@ async fn an_audit_held_message_is_neither_advanced_nor_completed() {
 
     // A module flags it: the hold must land before that module's ack is
     // processed, which is what main.rs guarantees.
-    db.mark_audit(uuid7.as_bytes(), "wrong language").await.unwrap();
+    db.mark_audit(uuid7.as_bytes(), "wrong language")
+        .await
+        .unwrap();
     orchestrator
         .handle_message_from_module(&pre_reply("pre", &uuid7, "translated"))
         .await
         .unwrap();
 
-    assert!(nothing_left(rx.get_mut("mid").unwrap()), "a held message must not be advanced to in-process");
+    assert!(
+        nothing_left(rx.get_mut("mid").unwrap()),
+        "a held message must not be advanced to in-process"
+    );
     assert!(nothing_left(rx.get_mut("post").unwrap()));
     let r = row(&db, &uuid7).await;
     assert_eq!(r["pipeline_status"], "audit");
     assert_eq!(r["flags"], "wrong language", "the hold reason must survive");
-    assert!(r["persisted_at"].is_null(), "a held message is not persisted");
+    assert!(
+        r["persisted_at"].is_null(),
+        "a held message is not persisted"
+    );
     assert_eq!(db.list_audit(10, 0).await.unwrap().len(), 1);
 }
 
@@ -409,14 +446,19 @@ async fn a_message_held_mid_post_process_keeps_its_hold_and_still_lands_the_resu
     assert_eq!(take_broadcast(rx.get_mut("post").unwrap()), uuid7);
 
     // Held now, while post-process is in flight.
-    db.mark_audit(uuid7.as_bytes(), "needs a moderator").await.unwrap();
+    db.mark_audit(uuid7.as_bytes(), "needs a moderator")
+        .await
+        .unwrap();
     orchestrator
         .handle_message_from_module(&post_reply("post", &uuid7, "final text"))
         .await
         .unwrap();
 
     let r = row(&db, &uuid7).await;
-    assert_eq!(r["pipeline_status"], "audit", "finishing the chain must not complete a held message");
+    assert_eq!(
+        r["pipeline_status"], "audit",
+        "finishing the chain must not complete a held message"
+    );
     assert_eq!(r["flags"], "needs a moderator");
     assert!(r["post_process_completed_at"].is_null() && r["persisted_at"].is_null());
     // What the run produced still lands — that is the data the per-stage writes
@@ -448,14 +490,22 @@ async fn an_abandoned_message_lands_a_dropped_outcome() {
         .await
         .unwrap();
 
-    assert!(nothing_left(rx.get_mut("post").unwrap()), "an abandoned message must not reach post-process");
+    assert!(
+        nothing_left(rx.get_mut("post").unwrap()),
+        "an abandoned message must not reach post-process"
+    );
     let r = row(&db, &uuid7).await;
     assert_eq!(r["pipeline_status"], "dropped");
     assert_eq!(r["error_message"], "abandoned by module 'mid'");
     assert_eq!(r["processed_message"], "no thanks");
-    assert!(r["pre_process_completed_at"].is_number(), "the stages it did run are still recorded");
     assert!(
-        r["in_process_completed_at"].is_null() && r["post_process_completed_at"].is_null() && r["persisted_at"].is_null(),
+        r["pre_process_completed_at"].is_number(),
+        "the stages it did run are still recorded"
+    );
+    assert!(
+        r["in_process_completed_at"].is_null()
+            && r["post_process_completed_at"].is_null()
+            && r["persisted_at"].is_null(),
         "an abandoned message never completed"
     );
     assert!(orchestrator.pipeline_states.lock().await.is_empty());
@@ -504,14 +554,18 @@ async fn a_critical_module_timeout_lands_a_failed_outcome_with_its_error() {
     let r = row(&db, &uuid7).await;
     assert_eq!(r["pipeline_status"], "failed");
     assert_eq!(
-        r["error_message"],
-        "Critical module 'mid' timed out at stage 'in_process'",
+        r["error_message"], "Critical module 'mid' timed out at stage 'in_process'",
         "the failure reason must be recorded verbatim"
     );
-    assert_eq!(r["processed_message"], "pre text", "what the run produced lands with the failure");
+    assert_eq!(
+        r["processed_message"], "pre text",
+        "what the run produced lands with the failure"
+    );
     assert!(r["pre_process_completed_at"].is_number());
     assert!(
-        r["in_process_completed_at"].is_null() && r["post_process_completed_at"].is_null() && r["persisted_at"].is_null(),
+        r["in_process_completed_at"].is_null()
+            && r["post_process_completed_at"].is_null()
+            && r["persisted_at"].is_null(),
         "a failed message must not claim it was persisted"
     );
 }
@@ -549,7 +603,11 @@ async fn a_receipt_less_module_is_resent_not_advanced() {
 
     // The message is still in flight, and the module got a fresh broadcast
     // (the resend). Nothing has been marked failed/complete.
-    assert_eq!(take_broadcast(rx.get_mut("pre").unwrap()), uuid7, "the stage must be resent");
+    assert_eq!(
+        take_broadcast(rx.get_mut("pre").unwrap()),
+        uuid7,
+        "the stage must be resent"
+    );
     assert!(
         orchestrator.ack_tracker.lock().await.has_pending(&uuid7),
         "the message stays pending across the resend"
@@ -616,12 +674,27 @@ async fn recover_one_leaves_a_message_that_is_already_in_flight_alone() {
 
     orchestrator.recover_one(&uuid7).await.unwrap();
 
-    assert!(nothing_left(rx.get_mut("pre").unwrap()), "an in-flight message must not be re-broadcast to pre-process");
-    assert!(nothing_left(rx.get_mut("mid").unwrap()), "its in-process stage must not be restarted either");
-    assert_eq!(row(&db, &uuid7).await["pipeline_status"], "queued", "the drain must not write to the row");
+    assert!(
+        nothing_left(rx.get_mut("pre").unwrap()),
+        "an in-flight message must not be re-broadcast to pre-process"
+    );
+    assert!(
+        nothing_left(rx.get_mut("mid").unwrap()),
+        "its in-process stage must not be restarted either"
+    );
+    assert_eq!(
+        row(&db, &uuid7).await["pipeline_status"],
+        "queued",
+        "the drain must not write to the row"
+    );
     let states = orchestrator.pipeline_states.lock().await;
-    let state = states.get(&uuid7).expect("the live state must survive the drain");
-    assert_eq!(state.processed_message, "pre text", "the drain must not reset the live state");
+    let state = states
+        .get(&uuid7)
+        .expect("the live state must survive the drain");
+    assert_eq!(
+        state.processed_message, "pre text",
+        "the drain must not reset the live state"
+    );
     assert!(matches!(state.stage, PipelineStage::InProcessing));
 }
 
@@ -667,11 +740,14 @@ async fn permit_module_gate_semantics() {
     // (0, 0, 0) gate → free + unrestricted → allowed.
     {
         let mut gates = std::collections::HashMap::new();
-        gates.insert("free".to_string(), crate::pipeline::ModuleGate {
-            authority: crate::pipeline::AUTHORITY_USER,
-            min_rank: 0.0,
-            price: 0,
-        });
+        gates.insert(
+            "free".to_string(),
+            crate::pipeline::ModuleGate {
+                authority: crate::pipeline::AUTHORITY_USER,
+                min_rank: 0.0,
+                price: 0,
+            },
+        );
         orchestrator.set_module_gates(gates);
     }
     assert!(orchestrator.permit_module("user-1", "free").await);
@@ -681,11 +757,14 @@ async fn permit_module_gate_semantics() {
     // unavailable). The real enforcement happens when user_db is set.
     {
         let mut gates = std::collections::HashMap::new();
-        gates.insert("paid".to_string(), crate::pipeline::ModuleGate {
-            authority: crate::pipeline::AUTHORITY_MOD,
-            min_rank: 0.3,
-            price: 5,
-        });
+        gates.insert(
+            "paid".to_string(),
+            crate::pipeline::ModuleGate {
+                authority: crate::pipeline::AUTHORITY_MOD,
+                min_rank: 0.3,
+                price: 5,
+            },
+        );
         orchestrator.set_module_gates(gates);
     }
     assert!(orchestrator.permit_module("user-1", "paid").await);
@@ -698,7 +777,9 @@ async fn permit_module_gate_semantics() {
 /// owner admits owner — never a lower tier. Mirrors the `User` role flags.
 #[tokio::test]
 async fn module_authority_cascades_up_and_never_down() {
-    use crate::pipeline::{AUTHORITY_ADMIN, AUTHORITY_MOD, AUTHORITY_OWNER, AUTHORITY_USER, ModuleGate};
+    use crate::pipeline::{
+        AUTHORITY_ADMIN, AUTHORITY_MOD, AUTHORITY_OWNER, AUTHORITY_USER, ModuleGate,
+    };
 
     // A helper that reports the authority tier a role set passes for a gate.
     // This is a pure projection of the same logic permit_module uses, kept here
@@ -738,9 +819,17 @@ async fn module_authority_cascades_up_and_never_down() {
     assert!(satisfied(AUTHORITY_MOD, t_owner));
 
     // And the gate struct's open-check: (0,0,0) is open, anything else isn't.
-    let open = ModuleGate { authority: AUTHORITY_USER, min_rank: 0.0, price: 0 };
+    let open = ModuleGate {
+        authority: AUTHORITY_USER,
+        min_rank: 0.0,
+        price: 0,
+    };
     assert!(open.is_open());
-    let closed = ModuleGate { authority: AUTHORITY_MOD, min_rank: 0.0, price: 0 };
+    let closed = ModuleGate {
+        authority: AUTHORITY_MOD,
+        min_rank: 0.0,
+        price: 0,
+    };
     assert!(!closed.is_open());
 }
 
@@ -1011,7 +1100,9 @@ async fn a_critical_timeout_does_not_clobber_an_audit_hold() {
     assert_eq!(take_broadcast(rx.get_mut("mid").unwrap()), uuid7);
 
     // Held while 'mid' is in flight, then 'mid' times out critically.
-    db.mark_audit(uuid7.as_bytes(), "needs a moderator").await.unwrap();
+    db.mark_audit(uuid7.as_bytes(), "needs a moderator")
+        .await
+        .unwrap();
     orchestrator.ack_tracker.lock().await.inject(
         uuid7.clone(),
         vec![PendingAck {
@@ -1027,9 +1118,15 @@ async fn a_critical_timeout_does_not_clobber_an_audit_hold() {
     orchestrator.handle_timeout().await.unwrap();
 
     let r = row(&db, &uuid7).await;
-    assert_eq!(r["pipeline_status"], "audit", "a hold must survive a critical timeout");
+    assert_eq!(
+        r["pipeline_status"], "audit",
+        "a hold must survive a critical timeout"
+    );
     assert_eq!(r["flags"], "needs a moderator");
-    assert!(r["error_message"].is_null(), "the hold must not record the timeout as an error");
+    assert!(
+        r["error_message"].is_null(),
+        "the hold must not record the timeout as an error"
+    );
 }
 
 /// The bug this pins: `refresh_user_data` re-reads the message owner's CURRENT
@@ -1139,7 +1236,141 @@ async fn an_abandon_does_not_clobber_an_audit_hold() {
         .unwrap();
 
     let r = row(&db, &uuid7).await;
-    assert_eq!(r["pipeline_status"], "audit", "a hold must survive an abandon");
+    assert_eq!(
+        r["pipeline_status"], "audit",
+        "a hold must survive an abandon"
+    );
     assert_eq!(r["flags"], "hold me");
     assert!(r["error_message"].is_null());
+}
+
+/// Only a live incumbent from a DIFFERENT instance causes a shadow. A
+/// same-instance reconnect must take the slot (its new socket is the target),
+/// and a dead incumbent never blocks the slot.
+#[test]
+fn shadow_only_when_a_live_different_instance_holds_the_slot() {
+    use crate::pipeline::should_shadow;
+    assert!(!should_shadow(false, false), "no incumbent -> take the slot");
+    assert!(!should_shadow(false, true), "dead incumbent -> take the slot");
+    assert!(
+        !should_shadow(true, true),
+        "same-instance reconnect must take the slot (old socket may still be closing)"
+    );
+    assert!(
+        should_shadow(true, false),
+        "a live DIFFERENT instance keeps the slot; the newcomer shadows"
+    );
+}
+
+/// The name-keyed routing slot is owned by exactly one instance. A duplicate
+/// same-name connection (a "shadow") must not evict a live incumbent, a
+/// non-owner's disconnect must not remove the slot, and only the owner's
+/// disconnect releases it.
+#[tokio::test]
+async fn duplicate_connection_shadow_cannot_evict_live_slot() {
+    let orchestrator = PipelineOrchestrator::new(
+        test_db().await,
+        PipelineConfig {
+            pre_process_modules: vec![],
+            in_process_modules: vec![],
+            post_process_modules: vec![],
+            ack_timeout_ms: 3000,
+            critical_modules: vec![],
+        },
+        Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        Arc::new(std::sync::Mutex::new(CommandRegistry::default())),
+    );
+
+    // The incumbent claims the slot.
+    let (incumbent_tx, incumbent_rx) = tokio::sync::mpsc::channel(8);
+    {
+        let mut senders = orchestrator.module_senders.lock().await;
+        let mut owners = orchestrator.slot_owner.lock().await;
+        senders.insert("scorer".to_string(), incumbent_tx.clone());
+        owners.insert("scorer".to_string(), "instance-a".to_string());
+    }
+
+    // A duplicate arrives while the incumbent's sender is live: it is accepted
+    // as a shadow and must NOT overwrite the slot or its owner.
+    let (shadow_tx, _shadow_rx) = tokio::sync::mpsc::channel(8);
+    {
+        let mut senders = orchestrator.module_senders.lock().await;
+        let mut owners = orchestrator.slot_owner.lock().await;
+        let live_incumbent = senders
+            .get("scorer")
+            .map(|s| !s.is_closed())
+            .unwrap_or(false);
+        assert!(live_incumbent);
+        if !live_incumbent {
+            senders.insert("scorer".to_string(), shadow_tx.clone());
+            owners.insert("scorer".to_string(), "instance-b".to_string());
+        }
+    }
+    {
+        let senders = orchestrator.module_senders.lock().await;
+        let owners = orchestrator.slot_owner.lock().await;
+        assert!(
+            senders
+                .get("scorer")
+                .map(|s| s.same_channel(&incumbent_tx))
+                .unwrap_or(false),
+            "the live incumbent's sender must be retained"
+        );
+        assert_eq!(owners.get("scorer").map(String::as_str), Some("instance-a"));
+    }
+
+    // The shadow (which never owned the slot) disconnects. Its auth session is
+    // still its own (`still_owned == true`), but it does not own the slot, so
+    // cleanup must leave the live module's slot untouched.
+    {
+        let mut senders = orchestrator.module_senders.lock().await;
+        let mut owners = orchestrator.slot_owner.lock().await;
+        let still_owned = true;
+        if still_owned && owners.get("scorer").map(String::as_str) == Some("instance-b") {
+            senders.remove("scorer");
+            owners.remove("scorer");
+        }
+    }
+    {
+        let senders = orchestrator.module_senders.lock().await;
+        let owners = orchestrator.slot_owner.lock().await;
+        assert!(senders.contains_key("scorer"));
+        assert_eq!(owners.get("scorer").map(String::as_str), Some("instance-a"));
+    }
+
+    // The incumbent dies (its receiver, owned by the socket, is dropped). The
+    // slot's sender is now closed, so a newcomer is no longer a shadow.
+    drop(incumbent_rx);
+    let (newcomer_tx, _newcomer_rx) = tokio::sync::mpsc::channel(8);
+    {
+        let mut senders = orchestrator.module_senders.lock().await;
+        let mut owners = orchestrator.slot_owner.lock().await;
+        let live_incumbent = senders
+            .get("scorer")
+            .map(|s| !s.is_closed())
+            .unwrap_or(false);
+        assert!(
+            !live_incumbent,
+            "the dead incumbent must not block the slot"
+        );
+        senders.insert("scorer".to_string(), newcomer_tx.clone());
+        owners.insert("scorer".to_string(), "instance-b".to_string());
+    }
+
+    // The owner disconnects: cleanup releases the slot.
+    {
+        let mut senders = orchestrator.module_senders.lock().await;
+        let mut owners = orchestrator.slot_owner.lock().await;
+        let still_owned = true;
+        if still_owned && owners.get("scorer").map(String::as_str) == Some("instance-b") {
+            senders.remove("scorer");
+            owners.remove("scorer");
+        }
+    }
+    {
+        let senders = orchestrator.module_senders.lock().await;
+        let owners = orchestrator.slot_owner.lock().await;
+        assert!(!senders.contains_key("scorer"));
+        assert!(!owners.contains_key("scorer"));
+    }
 }

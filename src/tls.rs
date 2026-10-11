@@ -10,9 +10,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio_rustls::TlsAcceptor;
 
 /// Directory (relative to the engine's cwd) holding the generated cert/key.
 pub fn tls_dir() -> PathBuf {
@@ -56,14 +56,17 @@ fn ensure_cert() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), St
     // Generate a self-signed cert valid for the loopback names/IPs every
     // client uses. IP SANs are required — rustls verifies the hostname against
     // the cert, and an IP SAN is distinct from a DNS SAN.
-    let mut params = rcgen::CertificateParams::new(vec![])
-        .map_err(|e| format!("cert params: {}", e))?;
+    let mut params =
+        rcgen::CertificateParams::new(vec![]).map_err(|e| format!("cert params: {}", e))?;
     params.subject_alt_names = vec![
-        rcgen::SanType::DnsName(rcgen::Ia5String::try_from("localhost").map_err(|e| format!("san: {}", e))?),
+        rcgen::SanType::DnsName(
+            rcgen::Ia5String::try_from("localhost").map_err(|e| format!("san: {}", e))?,
+        ),
         rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         rcgen::SanType::IpAddress(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
     ];
-    let key_pair = rcgen::KeyPair::generate().map_err(|e| format!("key generation failed: {}", e))?;
+    let key_pair =
+        rcgen::KeyPair::generate().map_err(|e| format!("key generation failed: {}", e))?;
     let certified = params
         .self_signed(&key_pair)
         .map_err(|e| format!("cert generation failed: {}", e))?;

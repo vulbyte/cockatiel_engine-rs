@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use turso::Value;
@@ -174,10 +175,50 @@ fn push_set(sets: &mut Vec<String>, args: &mut Vec<Value>, clause: &str, value: 
     args.push(value);
 }
 
+/// The lock guarding `DatabaseManager::local` is SERIALIZATION ONLY. It
+/// guarantees the single turso connection is never driven by two operations at
+/// once (turso 0.1.5's WAL panics if two read transactions overlap), but it does
+/// NOT repair connection state: a turso panic leaves the connection internally
+/// inconsistent, and a tokio Mutex is not poisoned by a panic, so the same
+/// broken connection would be handed to every later operation. Repairing that
+/// requires discarding the connection and opening a fresh one — see
+/// [`DatabaseManager::locked`] and [`DatabaseManager::reopen_local`].
+struct LocalGuard<'a> {
+    inner: tokio::sync::MutexGuard<'a, Option<turso::Connection>>,
+    needs_reopen: &'a AtomicBool,
+}
+
+impl std::ops::Deref for LocalGuard<'_> {
+    type Target = Option<turso::Connection>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for LocalGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Drop for LocalGuard<'_> {
+    fn drop(&mut self) {
+        // A turso call panics while this guard is alive; the unwind runs this
+        // Drop. Mark the connection as poisoned so the next `locked()` throws
+        // it away and opens a fresh one instead of reusing a wedged connection.
+        if std::thread::panicking() {
+            self.needs_reopen.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DatabaseManager {
     config: DatabaseConfig,
     local: Arc<Mutex<Option<turso::Connection>>>,
+    /// Set (during unwinding) when an operation panicked while holding `local`.
+    /// The next [`Self::locked`] replaces the connection before handing it out.
+    needs_reopen: Arc<AtomicBool>,
     /// Counts the calls this manager makes into the database layer. Test-only:
     /// the whole point of the consolidated write is how much a message costs, and
     /// the turso driver exposes no statement hook to count them from the outside
@@ -193,6 +234,7 @@ impl DatabaseManager {
         Self {
             config,
             local: Arc::new(Mutex::new(None)),
+            needs_reopen: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             round_trips: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -200,23 +242,83 @@ impl DatabaseManager {
 
     /// The one door every call into the database goes through, so the tests can
     /// count them.
+    ///
+    /// If a previous operation panicked while holding the connection, the
+    /// connection is discarded and a fresh one opened before the guard is
+    /// handed out. This is what stops a single turso panic from wedging the DB
+    /// permanently: the Mutex serializes access but cannot repair the
+    /// connection, so the repair has to happen here.
     #[cfg(test)]
-    async fn locked(&self) -> tokio::sync::MutexGuard<'_, Option<turso::Connection>> {
+    async fn locked(&self) -> LocalGuard<'_> {
         self.round_trips
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.local.lock().await
+        self.repair_after_panic().await;
+        LocalGuard {
+            inner: self.local.lock().await,
+            needs_reopen: &self.needs_reopen,
+        }
     }
 
     #[cfg(not(test))]
-    async fn locked(&self) -> tokio::sync::MutexGuard<'_, Option<turso::Connection>> {
-        self.local.lock().await
+    async fn locked(&self) -> LocalGuard<'_> {
+        self.repair_after_panic().await;
+        LocalGuard {
+            inner: self.local.lock().await,
+            needs_reopen: &self.needs_reopen,
+        }
+    }
+
+    /// If a prior operation panicked, replace the poisoned connection with a
+    /// freshly opened one before it can be used again. Best effort: if the
+    /// reopen fails the flag stays set and the next call retries.
+    async fn repair_after_panic(&self) {
+        if self.needs_reopen.load(Ordering::SeqCst) {
+            let _ = self.reopen_local().await;
+        }
+    }
+
+    /// Run a database operation in a panic-containing wrapper. A turso panic
+    /// (e.g. the WAL's "cannot start a new read tx without ending an existing
+    /// one", or a `todo!()` on unsupported SQL) unwinds through the operation;
+    /// it is caught here, the connection is marked so the next `locked()`
+    /// replaces it, and the caller gets an error instead of the process/task
+    /// dying with a wedged DB.
+    async fn contained<T, E, F>(&self, work: F) -> Result<T, E>
+    where
+        E: From<String>,
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        use futures_util::FutureExt;
+        match std::panic::AssertUnwindSafe(work).catch_unwind().await {
+            Ok(result) => result,
+            Err(_) => {
+                // The guard's Drop already marked the connection for reopen
+                // during the unwind; marking again is harmless and also covers
+                // a panic that happened outside the guard. The next `locked()`
+                // replaces the connection before it is used again.
+                self.needs_reopen.store(true, Ordering::SeqCst);
+                Err(E::from(
+                    "database operation panicked; connection will be reopened".to_string(),
+                ))
+            }
+        }
     }
 
     /// Test-only: read the call count and reset it to zero, so a test can measure
     /// exactly what happened between two points.
     #[cfg(test)]
     pub fn take_round_trips(&self) -> usize {
-        self.round_trips.swap(0, std::sync::atomic::Ordering::SeqCst)
+        self.round_trips
+            .swap(0, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Test-only: panic while holding the DB lock, simulating a turso panic
+    /// mid-query. Proves the poisoned connection is replaced (reopened) on the
+    /// next operation instead of being reused forever.
+    #[cfg(test)]
+    pub async fn force_panic_while_locked(&self) {
+        let _guard = self.locked().await;
+        panic!("simulated turso panic while holding the DB lock");
     }
 
     /// True when a backup DB path is configured (and thus a backup is usable).
@@ -326,7 +428,9 @@ impl DatabaseManager {
         Ok(())
     }
 
-    async fn open_local(path: &std::path::Path) -> Result<turso::Connection, Box<dyn std::error::Error + Send + Sync>> {
+    async fn open_local(
+        path: &std::path::Path,
+    ) -> Result<turso::Connection, Box<dyn std::error::Error + Send + Sync>> {
         let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
             .build()
             .await?;
@@ -338,12 +442,25 @@ impl DatabaseManager {
     }
 
     /// Replace the local connection with a fresh one. Used after a query
-    /// panics: a turso/Limbo "not yet implemented" panic poisons the shared
-    /// connection (even clones), so we discard it and reopen the DB file.
+    /// panics: a turso/Limbo panic poisons the shared connection (even clones),
+    /// so we discard it and reopen the DB file. Called automatically by
+    /// [`Self::locked`] whenever the previous operation panicked, and directly
+    /// by the containment wrapper [`Self::contained`].
+    ///
+    /// The poisoned connection is dropped before the replacement is opened so
+    /// its file/WAL handles are released first. Locks `local` directly (never
+    /// through `locked`) to avoid recursing back into the repair path.
     pub async fn reopen_local(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        {
+            let mut local = self.local.lock().await;
+            *local = None;
+        }
         let fresh = Self::open_local(&self.config.local_path).await?;
-        let mut local = self.locked().await;
-        *local = Some(fresh);
+        {
+            let mut local = self.local.lock().await;
+            *local = Some(fresh);
+        }
+        self.needs_reopen.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -431,7 +548,12 @@ impl DatabaseManager {
             );
         }
         if let Some(error) = outcome.error() {
-            push_set(&mut sets, &mut args, "error_message", Value::Text(error.to_string()));
+            push_set(
+                &mut sets,
+                &mut args,
+                "error_message",
+                Value::Text(error.to_string()),
+            );
         }
 
         // What the run produced. `None` means "the run never got here".
@@ -444,13 +566,28 @@ impl DatabaseManager {
             );
         }
         if let Some(ts) = result.pre_process_completed_at {
-            push_set(&mut sets, &mut args, "pre_process_completed_at", Value::Integer(ts));
+            push_set(
+                &mut sets,
+                &mut args,
+                "pre_process_completed_at",
+                Value::Integer(ts),
+            );
         }
         if let Some(ts) = result.in_process_completed_at {
-            push_set(&mut sets, &mut args, "in_process_completed_at", Value::Integer(ts));
+            push_set(
+                &mut sets,
+                &mut args,
+                "in_process_completed_at",
+                Value::Integer(ts),
+            );
         }
         if matches!(outcome, PipelineOutcome::Complete) {
-            push_set(&mut sets, &mut args, "post_process_completed_at", Value::Integer(now));
+            push_set(
+                &mut sets,
+                &mut args,
+                "post_process_completed_at",
+                Value::Integer(now),
+            );
             push_set(&mut sets, &mut args, "persisted_at", Value::Integer(now));
         }
 
@@ -466,7 +603,12 @@ impl DatabaseManager {
             .filter(|(_, bytes)| !bytes.is_empty() && !result.audio_type_markers.is_empty());
         match audio {
             Some((_, bytes)) => {
-                push_set(&mut sets, &mut args, "data_blob", Value::Blob(bytes.clone()));
+                push_set(
+                    &mut sets,
+                    &mut args,
+                    "data_blob",
+                    Value::Blob(bytes.clone()),
+                );
                 let joined = args.len() + 1;
                 sets.push(format!(
                     "flags = CASE WHEN flags IS NULL OR flags = '' THEN ?{joined} ELSE flags || ',' || ?{joined} END"
@@ -577,7 +719,8 @@ impl DatabaseManager {
         conn.execute(
             "UPDATE timeline_events SET pipeline_status = ?1 WHERE uuid7 = ?2",
             turso::params![status, uuid7],
-        ).await?;
+        )
+        .await?;
 
         Ok(())
     }
@@ -609,7 +752,8 @@ impl DatabaseManager {
         conn.execute(
             "UPDATE timeline_events SET processed_message = ?1 WHERE uuid7 = ?2",
             turso::params![processed, uuid7],
-        ).await?;
+        )
+        .await?;
 
         Ok(())
     }
@@ -625,7 +769,8 @@ impl DatabaseManager {
         conn.execute(
             "UPDATE timeline_events SET user_uuid7 = ?1 WHERE uuid7 = ?2 AND user_uuid7 IS NULL",
             turso::params![user_uuid, uuid7],
-        ).await?;
+        )
+        .await?;
 
         Ok(())
     }
@@ -641,7 +786,8 @@ impl DatabaseManager {
         conn.execute(
             "UPDATE timeline_events SET data_blob = ?1 WHERE uuid7 = ?2",
             turso::params![data, uuid7],
-        ).await?;
+        )
+        .await?;
 
         Ok(())
     }
@@ -657,49 +803,58 @@ impl DatabaseManager {
         conn.execute(
             "UPDATE timeline_events SET flags = ?1 WHERE uuid7 = ?2",
             turso::params![flags, uuid7],
-        ).await?;
+        )
+        .await?;
 
         Ok(())
     }
 
     /// Store rendered audio on a message: the bytes go in `data_blob` and the
-/// content type rides in the `flags` column as `audio_type=<mime>`, so the
-/// web UI / displays can retrieve it later.
+    /// content type rides in the `flags` column as `audio_type=<mime>`, so the
+    /// web UI / displays can retrieve it later.
     pub async fn set_audio(
         &self,
         uuid7: &[u8],
         audio_type: &str,
         audio: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let conn = self.locked().await;
-        let conn = conn.as_ref().ok_or("Local database not initialized")?;
+        self.contained(async {
+            let conn = self.locked().await;
+            let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
-        // Append the content type to any existing flags.
-        let mut existing_flags = conn.query(
-            "SELECT flags FROM timeline_events WHERE uuid7 = ?1",
-            turso::params![uuid7],
-        ).await?;
-        let mut flags = String::new();
-        if let Some(row) = existing_flags.next().await? {
-            if let Ok(f) = row.get::<String>(0) {
-                flags = f;
+            // Append the content type to any existing flags.
+            let mut existing_flags = conn
+                .query(
+                    "SELECT flags FROM timeline_events WHERE uuid7 = ?1",
+                    turso::params![uuid7],
+                )
+                .await?;
+            let mut flags = String::new();
+            // Drain to `Done`: a `Rows` abandoned mid-step leaks turso's single
+            // WAL read transaction and the next read panics.
+            while let Some(row) = existing_flags.next().await? {
+                if let Ok(f) = row.get::<String>(0) {
+                    flags = f;
+                }
             }
-        }
-        drop(existing_flags);
-        let audio_marker = format!("audio_type={}", audio_type);
-        if !flags.split(',').any(|p| p == audio_marker) {
-            if !flags.is_empty() {
-                flags.push(',');
+            drop(existing_flags);
+            let audio_marker = format!("audio_type={}", audio_type);
+            if !flags.split(',').any(|p| p == audio_marker) {
+                if !flags.is_empty() {
+                    flags.push(',');
+                }
+                flags.push_str(&audio_marker);
             }
-            flags.push_str(&audio_marker);
-        }
 
-        conn.execute(
-            "UPDATE timeline_events SET data_blob = ?1, flags = ?2 WHERE uuid7 = ?3",
-            turso::params![audio, flags, uuid7],
-        ).await?;
+            conn.execute(
+                "UPDATE timeline_events SET data_blob = ?1, flags = ?2 WHERE uuid7 = ?3",
+                turso::params![audio, flags, uuid7],
+            )
+            .await?;
 
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     /// Fetch a message's rendered audio (content type, bytes) if it has any.
@@ -707,29 +862,37 @@ impl DatabaseManager {
         &self,
         uuid7: &[u8],
     ) -> Result<Option<(String, Vec<u8>)>, Box<dyn std::error::Error>> {
-        let conn = self.locked().await;
-        let conn = conn.as_ref().ok_or("Local database not initialized")?;
+        self.contained(async {
+            let conn = self.locked().await;
+            let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
-        let mut rows = conn.query(
-            "SELECT data_blob, flags FROM timeline_events WHERE uuid7 = ?1",
-            turso::params![uuid7],
-        ).await?;
-        if let Some(row) = rows.next().await? {
-            let blob: Option<Vec<u8>> = row.get(0).unwrap_or(None);
-            let flags: String = row.get(1).unwrap_or_default();
-            if let Some(bytes) = blob {
-                if bytes.is_empty() {
-                    return Ok(None);
+            let mut rows = conn
+                .query(
+                    "SELECT data_blob, flags FROM timeline_events WHERE uuid7 = ?1",
+                    turso::params![uuid7],
+                )
+                .await?;
+            let mut out = None;
+            if let Some(row) = rows.next().await? {
+                let blob: Option<Vec<u8>> = row.get(0).unwrap_or(None);
+                let flags: String = row.get(1).unwrap_or_default();
+                if let Some(bytes) = blob
+                    && !bytes.is_empty()
+                {
+                    let audio_type = flags
+                        .split(',')
+                        .find_map(|p| p.strip_prefix("audio_type="))
+                        .unwrap_or("audio/mpeg")
+                        .to_string();
+                    out = Some((audio_type, bytes));
                 }
-                let audio_type = flags
-                    .split(',')
-                    .find_map(|p| p.strip_prefix("audio_type="))
-                    .unwrap_or("audio/mpeg")
-                    .to_string();
-                return Ok(Some((audio_type, bytes)));
             }
-        }
-        Ok(None)
+            // Drain any remaining rows so the read transaction is ended before
+            // the guard (and the connection) is returned.
+            while rows.next().await?.is_some() {}
+            Ok(out)
+        })
+        .await
     }
 
     pub async fn set_command(
@@ -743,7 +906,8 @@ impl DatabaseManager {
         conn.execute(
             "UPDATE timeline_events SET command = ?1 WHERE uuid7 = ?2",
             turso::params![command, uuid7],
-        ).await?;
+        )
+        .await?;
 
         Ok(())
     }
@@ -760,7 +924,8 @@ impl DatabaseManager {
             conn.execute(
                 "UPDATE timeline_events SET synced_at = ?1 WHERE uuid7 = ?2",
                 turso::params![now, uuid.as_slice()],
-            ).await?;
+            )
+            .await?;
         }
 
         Ok(())
@@ -769,20 +934,26 @@ impl DatabaseManager {
     pub async fn get_next_queued(
         &self,
     ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-        let conn = self.locked().await;
-        let conn = conn.as_ref().ok_or("Local database not initialized")?;
+        self.contained(async {
+            let conn = self.locked().await;
+            let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
-        let mut rows = conn.query(
-            "SELECT uuid7 FROM timeline_events WHERE pipeline_status = 'queued' ORDER BY uuid7 ASC LIMIT 1",
-            (),
-        ).await?;
+            let mut rows = conn.query(
+                "SELECT uuid7 FROM timeline_events WHERE pipeline_status = 'queued' ORDER BY uuid7 ASC LIMIT 1",
+                (),
+            ).await?;
 
-        if let Some(row) = rows.next().await? {
-            let uuid7: Vec<u8> = row.get(0)?;
-            Ok(Some(uuid7))
-        } else {
-            Ok(None)
-        }
+            let out = if let Some(row) = rows.next().await? {
+                let uuid7: Vec<u8> = row.get(0)?;
+                Some(uuid7)
+            } else {
+                None
+            };
+            // Drain to `Done` so the read transaction is not left open.
+            while rows.next().await?.is_some() {}
+            Ok(out)
+        })
+        .await
     }
 
     pub async fn get_incomplete(
@@ -808,73 +979,84 @@ impl DatabaseManager {
     pub async fn get_unsynced_count(
         &self,
     ) -> Result<i32, Box<dyn std::error::Error>> {
-        let conn = self.locked().await;
-        let conn = conn.as_ref().ok_or("Local database not initialized")?;
+        self.contained(async {
+            let conn = self.locked().await;
+            let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
-        let mut rows = conn.query(
-            "SELECT COUNT(*) FROM timeline_events WHERE synced_at IS NULL AND pipeline_status = 'complete'",
-            (),
-        ).await?;
+            let mut rows = conn.query(
+                "SELECT COUNT(*) FROM timeline_events WHERE synced_at IS NULL AND pipeline_status = 'complete'",
+                (),
+            ).await?;
 
-        if let Some(row) = rows.next().await? {
-            let count: i64 = row.get(0)?;
-            Ok(count as i32)
-        } else {
-            Ok(0)
-        }
+            let out = if let Some(row) = rows.next().await? {
+                let count: i64 = row.get(0)?;
+                count as i32
+            } else {
+                0
+            };
+            // Drain to `Done` so the read transaction is not left open.
+            while rows.next().await?.is_some() {}
+            Ok(out)
+        })
+        .await
     }
 
     pub async fn get_event_as_json(
         &self,
         uuid7: &[u8],
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-        let conn = self.locked().await;
-        let conn = conn.as_ref().ok_or("Local database not initialized")?;
+        self.contained(async {
+            let conn = self.locked().await;
+            let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
-        let mut rows = conn.query(
-            "SELECT schema_version, event_type, platform, raw_message, command, flags, user_uuid7, processed_message, error_message, pre_process_completed_at, in_process_completed_at, post_process_completed_at, persisted_at, pipeline_status, synced_at FROM timeline_events WHERE uuid7 = ?1",
-            turso::params![uuid7],
-        ).await?;
+            let mut rows = conn.query(
+                "SELECT schema_version, event_type, platform, raw_message, command, flags, user_uuid7, processed_message, error_message, pre_process_completed_at, in_process_completed_at, post_process_completed_at, persisted_at, pipeline_status, synced_at FROM timeline_events WHERE uuid7 = ?1",
+                turso::params![uuid7],
+            ).await?;
 
-        if let Some(row) = rows.next().await? {
-            let schema_version: i32 = row.get(0)?;
-            let event_type: i32 = row.get(1)?;
-            let platform: Option<String> = row.get(2)?;
-            let raw_message: String = row.get(3)?;
-            let command: Option<String> = row.get(4)?;
-            let flags: Option<String> = row.get(5)?;
-            let user_uuid7: Option<String> = row.get(6)?;
-            let processed_message: Option<String> = row.get(7)?;
-            let error_message: Option<String> = row.get(8)?;
-            let pre: Option<i64> = row.get(9)?;
-            let in_p: Option<i64> = row.get(10)?;
-            let post: Option<i64> = row.get(11)?;
-            let persisted: Option<i64> = row.get(12)?;
-            let status: String = row.get(13)?;
-            let synced: Option<i64> = row.get(14)?;
+            let mut out = None;
+            if let Some(row) = rows.next().await? {
+                let schema_version: i32 = row.get(0)?;
+                let event_type: i32 = row.get(1)?;
+                let platform: Option<String> = row.get(2)?;
+                let raw_message: String = row.get(3)?;
+                let command: Option<String> = row.get(4)?;
+                let flags: Option<String> = row.get(5)?;
+                let user_uuid7: Option<String> = row.get(6)?;
+                let processed_message: Option<String> = row.get(7)?;
+                let error_message: Option<String> = row.get(8)?;
+                let pre: Option<i64> = row.get(9)?;
+                let in_p: Option<i64> = row.get(10)?;
+                let post: Option<i64> = row.get(11)?;
+                let persisted: Option<i64> = row.get(12)?;
+                let status: String = row.get(13)?;
+                let synced: Option<i64> = row.get(14)?;
 
-            let json = serde_json::json!({
-                "schema_version": schema_version,
-                "event_type": event_type,
-                "platform": platform,
-                "raw_message": raw_message,
-                "command": command,
-                "flags": flags,
-                "user_uuid7": user_uuid7,
-                "processed_message": processed_message,
-                "error_message": error_message,
-                "pre_process_completed_at": pre,
-                "in_process_completed_at": in_p,
-                "post_process_completed_at": post,
-                "persisted_at": persisted,
-                "pipeline_status": status,
-                "synced_at": synced,
-            });
+                let json = serde_json::json!({
+                    "schema_version": schema_version,
+                    "event_type": event_type,
+                    "platform": platform,
+                    "raw_message": raw_message,
+                    "command": command,
+                    "flags": flags,
+                    "user_uuid7": user_uuid7,
+                    "processed_message": processed_message,
+                    "error_message": error_message,
+                    "pre_process_completed_at": pre,
+                    "in_process_completed_at": in_p,
+                    "post_process_completed_at": post,
+                    "persisted_at": persisted,
+                    "pipeline_status": status,
+                    "synced_at": synced,
+                });
 
-            Ok(Some(serde_json::to_string(&json)?))
-        } else {
-            Ok(None)
-        }
+                out = Some(serde_json::to_string(&json)?);
+            }
+            // Drain to `Done` so the read transaction is not left open.
+            while rows.next().await?.is_some() {}
+            Ok(out)
+        })
+        .await
     }
 
     /// Query timeline events by filter. `None`/empty filters mean "any". Only
@@ -959,7 +1141,11 @@ impl DatabaseManager {
             .map_err(|e| format!("timeline query failed: {}", e))?;
 
         let mut out = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| format!("row read failed: {}", e))? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("row read failed: {}", e))?
+        {
             let uuid7: Option<Vec<u8>> = row.get(0).ok();
             let event_type: i32 = row.get(1).unwrap_or(0);
             let platform: Option<String> = row.get(2).ok();
@@ -999,10 +1185,7 @@ impl DatabaseManager {
 
     /// Execute an arbitrary read-only SQL query and return results as JSON.
     /// Returns an array of objects where keys are column names and values are the cell values.
-    pub async fn execute_query(
-        &self,
-        sql: &str,
-    ) -> Result<String, String> {
+    pub async fn execute_query(&self, sql: &str) -> Result<String, String> {
         // Return a `String` error (Send) so callers can run this in a contained
         // task that catches turso/Limbo panics on unsupported SQL.
         //
@@ -1010,50 +1193,66 @@ impl DatabaseManager {
         // with "cannot start a new read tx without ending an existing one" when
         // two read transactions overlap, and the engine issues reads from
         // several tasks at once (the TUI's `stats` poll, timeline reads, the
-        // message hot path, the periodic WAL checkpoint). Cloning the connection
-        // and dropping the guard — as this used to — let those reads collide and
-        // the leaked read transaction then made EVERY later read panic, which is
-        // what took the engine down and drove the TUI into a reconnect loop. A
-        // tokio Mutex is NOT poisoned by a panic, so holding the guard across a
-        // panicking query cannot brick the DB: the guard is released on unwind.
+        // message hot path, the periodic WAL checkpoint). The Mutex is
+        // SERIALIZATION ONLY: it is not poisoned by a panic and it does not
+        // repair the connection, so a panic leaves the shared connection wedged
+        // and every later read panics. The `contained` wrapper below catches
+        // that panic and reopens a fresh connection, so one bad query cannot
+        // take the timeline DB down.
         let run = async {
-        let guard = self.locked().await;
-        let conn = guard.as_ref().ok_or("Local database not initialized")?;
-        let mut stmt = conn.prepare(sql).await?;
-        let columns: Vec<String> = stmt.columns().iter().map(|c| c.name().to_string()).collect();
-        let mut rows = stmt.query(()).await?;
-        let mut results = Vec::new();
+            let guard = self.locked().await;
+            let conn = guard.as_ref().ok_or("Local database not initialized")?;
+            let mut stmt = conn.prepare(sql).await?;
+            let columns: Vec<String> = stmt
+                .columns()
+                .iter()
+                .map(|c| c.name().to_string())
+                .collect();
+            let mut rows = stmt.query(()).await?;
+            let mut results = Vec::new();
 
-        while let Some(row) = rows.next().await? {
-            let mut map = serde_json::Map::new();
-            let col_count = row.column_count();
-            for i in 0..col_count {
-                let name = columns.get(i).cloned().unwrap_or_else(|| format!("col_{}", i));
-                let val = row.get_value(i)?;
-                match val {
-                    Value::Integer(n) => { map.insert(name, serde_json::Value::Number(n.into())); }
-                    Value::Real(f) => {
-                        if let Some(num) = serde_json::Number::from_f64(f) {
-                            map.insert(name, serde_json::Value::Number(num));
-                        } else {
+            while let Some(row) = rows.next().await? {
+                let mut map = serde_json::Map::new();
+                let col_count = row.column_count();
+                for i in 0..col_count {
+                    let name = columns
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("col_{}", i));
+                    let val = row.get_value(i)?;
+                    match val {
+                        Value::Integer(n) => {
+                            map.insert(name, serde_json::Value::Number(n.into()));
+                        }
+                        Value::Real(f) => {
+                            if let Some(num) = serde_json::Number::from_f64(f) {
+                                map.insert(name, serde_json::Value::Number(num));
+                            } else {
+                                map.insert(name, serde_json::Value::Null);
+                            }
+                        }
+                        Value::Text(s) => {
+                            map.insert(name, serde_json::Value::String(s));
+                        }
+                        Value::Blob(b) => {
+                            map.insert(
+                                name,
+                                serde_json::Value::String(String::from_utf8_lossy(&b).to_string()),
+                            );
+                        }
+                        Value::Null => {
                             map.insert(name, serde_json::Value::Null);
                         }
                     }
-                    Value::Text(s) => { map.insert(name, serde_json::Value::String(s)); }
-                    Value::Blob(b) => {
-                        map.insert(name, serde_json::Value::String(
-                            String::from_utf8_lossy(&b).to_string(),
-                        ));
-                    }
-                    Value::Null => { map.insert(name, serde_json::Value::Null); }
                 }
+                results.push(serde_json::Value::Object(map));
             }
-            results.push(serde_json::Value::Object(map));
-        }
 
-        Ok(serde_json::to_string(&results)?)
+            Ok(serde_json::to_string(&results)?)
         };
-        run.await.map_err(|e: Box<dyn std::error::Error>| e.to_string())
+        self.contained(run)
+            .await
+            .map_err(|e: Box<dyn std::error::Error>| e.to_string())
     }
 
     /// Mark every 'processing' row as failed with the given reason. Returns the
@@ -1074,7 +1273,10 @@ impl DatabaseManager {
     /// It is NOT the crash-recovery path any more. A message that was mid-flight
     /// when the engine died is still 'queued' and is replayed to completion by
     /// `get_queued_uuids` + `recover_one`, which now claims rows in memory.
-    pub async fn mark_all_processing_as_failed(&self, reason: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    pub async fn mark_all_processing_as_failed(
+        &self,
+        reason: &str,
+    ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
@@ -1094,33 +1296,41 @@ impl DatabaseManager {
     /// writes no intermediate status), so this is no longer the "is a live
     /// pipeline running this?" check it used to be — callers must pair it with
     /// the in-memory claim (`recover_one` does, via `pipeline_states`).
-    pub async fn load_queued_message(&self, uuid7: &[u8]) -> Result<Option<QueuedMessage>, Box<dyn std::error::Error>> {
-        let conn = self.locked().await;
-        let conn = conn.as_ref().ok_or("Local database not initialized")?;
+    pub async fn load_queued_message(
+        &self,
+        uuid7: &[u8],
+    ) -> Result<Option<QueuedMessage>, Box<dyn std::error::Error>> {
+        self.contained(async {
+            let conn = self.locked().await;
+            let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
-        let mut rows = conn.query(
-            "SELECT event_type, platform, raw_message, command, flags, user_uuid7 FROM timeline_events WHERE uuid7 = ?1 AND pipeline_status = 'queued'",
-            turso::params![uuid7],
-        ).await?;
+            let mut rows = conn.query(
+                "SELECT event_type, platform, raw_message, command, flags, user_uuid7 FROM timeline_events WHERE uuid7 = ?1 AND pipeline_status = 'queued'",
+                turso::params![uuid7],
+            ).await?;
 
-        if let Some(row) = rows.next().await? {
-            let event_type: i32 = row.get(0)?;
-            let platform: Option<String> = row.get(1)?;
-            let raw_message: String = row.get(2)?;
-            let command: Option<String> = row.get(3)?;
-            let flags: Option<String> = row.get(4)?;
-            let user_uuid7: Option<String> = row.get(5)?;
-            Ok(Some(QueuedMessage {
-                event_type,
-                platform: platform.unwrap_or_default(),
-                raw_message,
-                command: command.unwrap_or_default(),
-                flags: flags.unwrap_or_default(),
-                user_uuid7: user_uuid7.unwrap_or_default(),
-            }))
-        } else {
-            Ok(None)
-        }
+            let mut out = None;
+            if let Some(row) = rows.next().await? {
+                let event_type: i32 = row.get(0)?;
+                let platform: Option<String> = row.get(1)?;
+                let raw_message: String = row.get(2)?;
+                let command: Option<String> = row.get(3)?;
+                let flags: Option<String> = row.get(4)?;
+                let user_uuid7: Option<String> = row.get(5)?;
+                out = Some(QueuedMessage {
+                    event_type,
+                    platform: platform.unwrap_or_default(),
+                    raw_message,
+                    command: command.unwrap_or_default(),
+                    flags: flags.unwrap_or_default(),
+                    user_uuid7: user_uuid7.unwrap_or_default(),
+                });
+            }
+            // Drain to `Done` so the read transaction is not left open.
+            while rows.next().await?.is_some() {}
+            Ok(out)
+        })
+        .await
     }
 
     /// Every uuid7 currently `pipeline_status = 'queued'`, in ascending uuid7
@@ -1129,7 +1339,9 @@ impl DatabaseManager {
     /// stored as BLOB or TEXT depending on how the row was inserted (turso's
     /// `FromValue for Vec<u8>` only accepts BLOB and `String` only TEXT, so
     /// neither alone is safe) — use `get_value` and decode both.
-    pub async fn get_queued_uuids(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    pub async fn get_queued_uuids(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
@@ -1158,14 +1370,18 @@ impl DatabaseManager {
     /// and SQLite's type rules mean a BLOB param never equals a TEXT column.
     /// Re-write those rows as BLOB so all byte-keyed queries (status updates,
     /// stage completion, recovery) work on them. Returns rows normalized.
-    pub async fn normalize_uuid_storage(&self) -> Result<u32, Box<dyn std::error::Error>> {
+    pub async fn normalize_uuid_storage(
+        &self,
+    ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
-        let mut rows = conn.query(
-            "SELECT uuid7 FROM timeline_events WHERE typeof(uuid7) = 'text'",
-            (),
-        ).await?;
+        let mut rows = conn
+            .query(
+                "SELECT uuid7 FROM timeline_events WHERE typeof(uuid7) = 'text'",
+                (),
+            )
+            .await?;
         let mut text_uuids: Vec<String> = Vec::new();
         while let Some(row) = rows.next().await? {
             let v: turso::Value = row.get_value(0)?;
@@ -1180,7 +1396,8 @@ impl DatabaseManager {
             conn.execute(
                 "UPDATE timeline_events SET uuid7 = ?1 WHERE uuid7 = ?2 AND typeof(uuid7) = 'text'",
                 turso::params![u.as_bytes(), u.as_str()],
-            ).await?;
+            )
+            .await?;
             normalized += 1;
         }
         Ok(normalized)
@@ -1210,16 +1427,27 @@ impl DatabaseManager {
     }
 
     /// Whether a message is currently held for audit.
-    pub async fn is_audited(&self, uuid7: &[u8]) -> Result<bool, Box<dyn std::error::Error>> {
-        let conn = self.locked().await;
-        let conn = conn.as_ref().ok_or("Local database not initialized")?;
-        let mut rows = conn
-            .query(
-                "SELECT 1 FROM timeline_events WHERE uuid7 = ?1 AND pipeline_status = 'audit'",
-                turso::params![uuid7],
-            )
-            .await?;
-        Ok(rows.next().await?.is_some())
+    pub async fn is_audited(
+        &self,
+        uuid7: &[u8],
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        self.contained(async {
+            let conn = self.locked().await;
+            let conn = conn.as_ref().ok_or("Local database not initialized")?;
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM timeline_events WHERE uuid7 = ?1 AND pipeline_status = 'audit'",
+                    turso::params![uuid7],
+                )
+                .await?;
+            let found = rows.next().await?.is_some();
+            // Drain to `Done` so the read transaction is not left open. This is
+            // the hot path (called from the pipeline and the message loop), so a
+            // leaked transaction here is what wedged the WAL.
+            while rows.next().await?.is_some() {}
+            Ok(found)
+        })
+        .await
     }
 
     /// Fetch the content of a held message for the audit prompt.
@@ -1227,28 +1455,33 @@ impl DatabaseManager {
         &self,
         uuid7: &[u8],
     ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
-        let conn = self.locked().await;
-        let conn = conn.as_ref().ok_or("Local database not initialized")?;
-        let mut rows = conn
-            .query(
-                "SELECT platform, raw_message, user_uuid7, flags FROM timeline_events WHERE uuid7 = ?1",
-                turso::params![uuid7],
-            )
-            .await?;
-        if let Some(row) = rows.next().await? {
-            let platform: Option<String> = row.get(0)?;
-            let raw_message: String = row.get(1)?;
-            let user_uuid7: Option<String> = row.get(2)?;
-            let flags: Option<String> = row.get(3)?;
-            Ok(Some(serde_json::json!({
-                "platform": platform,
-                "raw_message": raw_message,
-                "user_uuid7": user_uuid7,
-                "reason": flags,
-            })))
-        } else {
-            Ok(None)
-        }
+        self.contained(async {
+            let conn = self.locked().await;
+            let conn = conn.as_ref().ok_or("Local database not initialized")?;
+            let mut rows = conn
+                .query(
+                    "SELECT platform, raw_message, user_uuid7, flags FROM timeline_events WHERE uuid7 = ?1",
+                    turso::params![uuid7],
+                )
+                .await?;
+            let mut out = None;
+            if let Some(row) = rows.next().await? {
+                let platform: Option<String> = row.get(0)?;
+                let raw_message: String = row.get(1)?;
+                let user_uuid7: Option<String> = row.get(2)?;
+                let flags: Option<String> = row.get(3)?;
+                out = Some(serde_json::json!({
+                    "platform": platform,
+                    "raw_message": raw_message,
+                    "user_uuid7": user_uuid7,
+                    "reason": flags,
+                }));
+            }
+            // Drain to `Done` so the read transaction is not left open.
+            while rows.next().await?.is_some() {}
+            Ok(out)
+        })
+        .await
     }
 
     /// List held-for-audit messages as JSON rows (uuid, platform, message,
@@ -1323,47 +1556,63 @@ impl DatabaseManager {
     /// backup file stays portable/inspectable. Returns 1 on success, 0 when no
     /// backup is configured.
     pub async fn sync_to_remote(&self) -> Result<u32, Box<dyn std::error::Error>> {
-        let Some(bp) = self.config.remote_url.as_deref() else {
-            return Ok(0);
-        };
-        if bp.trim().is_empty() {
-            return Ok(0);
-        }
+        self.contained(async {
+            let Some(bp) = self.config.remote_url.as_deref() else {
+                return Ok(0);
+            };
+            if bp.trim().is_empty() {
+                return Ok(0);
+            }
 
-        let conn = self.locked().await;
-        let conn = conn.as_ref().ok_or("Local database not initialized")?;
-        // Merge the WAL so the copy is authoritative — but only when a -wal
-        // file actually exists for the local DB (checkpointing a missing WAL
-        // should not fail the backup). Best-effort either way: a failed
-        // checkpoint must never fail the backup.
-        // (PRAGMA returns a result row — drain it so the driver doesn't error.)
-        let wal_path = format!("{}-wal", self.config.local_path.to_string_lossy());
-        if std::path::Path::new(&wal_path).exists()
-            && let Ok(mut stmt) = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await
-        {
-            while let Ok(Some(_)) = stmt.next().await {}
-        }
+            let conn = self.locked().await;
+            let conn = conn.as_ref().ok_or("Local database not initialized")?;
+            // Merge the WAL so the copy is authoritative — but only when a -wal
+            // file actually exists for the local DB (checkpointing a missing WAL
+            // should not fail the backup). Best-effort either way: a failed
+            // checkpoint must never fail the backup.
+            // (PRAGMA returns a result row — drain it to `Done` so the read
+            // transaction is ended; an error mid-drain may leave the tx open, so
+            // force a reopen before the connection is used again.)
+            let wal_path = format!("{}-wal", self.config.local_path.to_string_lossy());
+            if std::path::Path::new(&wal_path).exists()
+                && let Ok(mut stmt) = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await
+            {
+                loop {
+                    match stmt.next().await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(_) => {
+                            self.needs_reopen.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                }
+            }
 
-        // Copy while the lock is held → no concurrent writes → consistent.
-        Self::ensure_backup_parent(bp);
-        let tmp = format!("{}.tmp", bp);
-        let _ = std::fs::remove_file(&tmp);
-        std::fs::copy(&self.config.local_path, &tmp)
-            .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
-        // The timeline holds chat data; keep the snapshot owner-only.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
-        // Drop the borrowed connection reference (the MutexGuard itself was
-        // already released when `conn` was shadowed) before the atomic rename.
-        let _ = conn;
+            // Copy while the lock is held → no concurrent writes → consistent.
+            Self::ensure_backup_parent(bp);
+            let tmp = format!("{}.tmp", bp);
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::copy(&self.config.local_path, &tmp)
+                .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
+            // The timeline holds chat data; keep the snapshot owner-only.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+            }
+            // `conn` borrows the lock guard; this only ends the borrow. The
+            // guard itself is still held for the rename below, so the copy and
+            // the rename happen with no concurrent writes.
+            let _ = conn;
 
-        // POSIX rename() atomically replaces an existing target — never delete
-        // the last good backup before the new snapshot lands.
-        std::fs::rename(&tmp, bp).map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
-        Ok(1)
+            // POSIX rename() atomically replaces an existing target — never delete
+            // the last good backup before the new snapshot lands.
+            std::fs::rename(&tmp, bp)
+                .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
+            Ok(1)
+        })
+        .await
     }
 
     /// Force the local SQLite write-ahead log to merge into the main file and
@@ -1372,12 +1621,31 @@ impl DatabaseManager {
         // Hold the lock for the checkpoint too: it opens a read transaction, and
         // running it on a cloned connection while another read is in flight is
         // the same turso WAL collision that `execute_query` documents.
-        let guard = self.locked().await;
-        let Some(conn) = guard.as_ref() else { return };
-        let Ok(mut stmt) = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await else {
-            return;
-        };
-        while let Ok(Some(_)) = stmt.next().await {}
+        let _ = self
+            .contained(async {
+                let guard = self.locked().await;
+                let Some(conn) = guard.as_ref() else {
+                    return Ok(());
+                };
+                let Ok(mut stmt) = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await else {
+                    return Ok(());
+                };
+                // Drain to `Done`: a statement abandoned mid-step leaks the read
+                // transaction. An error mid-drain may leave it open too, so mark
+                // the connection for reopen before it is used again.
+                loop {
+                    match stmt.next().await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(_) => {
+                            self.needs_reopen.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                }
+                Ok::<(), String>(())
+            })
+            .await;
     }
 
     /// Approximate size of the local DB's write-ahead log in bytes.

@@ -18,9 +18,7 @@ use crate::cockatiel_protobuf::{
 use crate::command_registry::CommandRegistry;
 use crate::database::{DatabaseConfig, DatabaseManager};
 use crate::pipeline::{PipelineConfig, PipelineOrchestrator};
-use crate::{
-    EngineState, IngestCommandOutcome, handle_command_on_ingest, should_fetch_user_data,
-};
+use crate::{EngineState, IngestCommandOutcome, handle_command_on_ingest, should_fetch_user_data};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -40,22 +38,31 @@ fn flag(name: &str) -> crate::cockatiel_protobuf::Flag {
 /// A registry with one alerting command module (`!tts`) and no catch-all.
 fn registry_with_commands() -> CommandRegistry {
     let mut r = CommandRegistry::default();
-    r.register("tts-service", Commands {
-        commands: vec![Command {
-            command_name: "tts".into(),
-            command_flag: "!".into(),
-            command_description: "read chat out loud".into(),
-            command_flags: vec![flag("p")],
-        }],
-        alert_on_unknown_command: true,
-    });
+    r.register(
+        "tts-service",
+        Commands {
+            commands: vec![Command {
+                command_name: "tts".into(),
+                command_flag: "!".into(),
+                command_description: "read chat out loud".into(),
+                command_flags: vec![flag("p")],
+            }],
+            alert_on_unknown_command: true,
+        },
+    );
     r
 }
 
 /// The same registry plus a catch-all module (registered an EMPTY command list).
 fn registry_with_catch_all() -> CommandRegistry {
     let mut r = registry_with_commands();
-    r.register("catch-all-mod", Commands { commands: vec![], alert_on_unknown_command: false });
+    r.register(
+        "catch-all-mod",
+        Commands {
+            commands: vec![],
+            alert_on_unknown_command: false,
+        },
+    );
     r
 }
 
@@ -65,7 +72,10 @@ fn names(list: &[&str]) -> Vec<String> {
 
 /// A pipeline config with the given post-process (output display) modules.
 fn cfg_with_post_process(post: &[&str]) -> PipelineConfig {
-    PipelineConfig { post_process_modules: names(post), ..PipelineConfig::default() }
+    PipelineConfig {
+        post_process_modules: names(post),
+        ..PipelineConfig::default()
+    }
 }
 
 fn chat(raw: &str) -> ChatMessage {
@@ -182,15 +192,15 @@ fn each_condition_is_individually_necessary_and_sufficient() {
 
     // Necessary: all three absent -> no fetch. This is the common plain-chat
     // case and the only reason this whole change exists.
-    assert!(!should_fetch_user_data(false, &none, &no_display, &connected));
-
-    // Sufficient, one at a time.
-    assert!(should_fetch_user_data(
-        true,
+    assert!(!should_fetch_user_data(
+        false,
         &none,
         &no_display,
         &connected
     ));
+
+    // Sufficient, one at a time.
+    assert!(should_fetch_user_data(true, &none, &no_display, &connected));
     assert!(should_fetch_user_data(
         false,
         &registry_with_catch_all(),
@@ -339,7 +349,8 @@ async fn help_and_apology_are_engine_handled_not_attached() {
 
     // `!help` is handled by the engine.
     let mut help = chat("!help");
-    let help_outcome = handle_command_on_ingest(&mut help, &registry, &orchestrator, &ui_state).await;
+    let help_outcome =
+        handle_command_on_ingest(&mut help, &registry, &orchestrator, &ui_state).await;
     assert_eq!(help_outcome, IngestCommandOutcome::EngineHandled);
     assert!(!help_outcome.command_attached());
     assert!(help.command.is_none());
@@ -352,7 +363,8 @@ async fn help_and_apology_are_engine_handled_not_attached() {
 
     // An unregistered command under the alerting `!` flag gets the apology.
     let mut bogus = chat("!bogus whatever");
-    let bogus_outcome = handle_command_on_ingest(&mut bogus, &registry, &orchestrator, &ui_state).await;
+    let bogus_outcome =
+        handle_command_on_ingest(&mut bogus, &registry, &orchestrator, &ui_state).await;
     assert_eq!(bogus_outcome, IngestCommandOutcome::EngineHandled);
     assert!(!bogus_outcome.command_attached());
     assert!(bogus.command.is_none());
@@ -432,13 +444,19 @@ fn adapter_container(chat: ChatMessage) -> ContainerForEngine {
 #[tokio::test]
 async fn plain_message_reaches_a_catch_all_and_completes() {
     let db = test_db().await;
-    let cfg = PipelineConfig { pre_process_modules: names(&["watcher"]), ..PipelineConfig::default() };
+    let cfg = PipelineConfig {
+        pre_process_modules: names(&["watcher"]),
+        ..PipelineConfig::default()
+    };
     let registry = Arc::new(Mutex::new(registry_with_commands()));
     // "watcher" is a catch-all (empty Commands), so a plain message routes to it.
-    registry
-        .lock()
-        .unwrap()
-        .register("watcher", Commands { commands: vec![], alert_on_unknown_command: false });
+    registry.lock().unwrap().register(
+        "watcher",
+        Commands {
+            commands: vec![],
+            alert_on_unknown_command: false,
+        },
+    );
     let orchestrator = test_orchestrator(db.clone(), cfg.clone(), &registry).await;
     let ui_state = Arc::new(Mutex::new(EngineState::new()));
     let mut rx = connect_pre_process(&orchestrator, "watcher").await;
@@ -453,14 +471,22 @@ async fn plain_message_reaches_a_catch_all_and_completes() {
         &names(&["watcher"])
     ));
 
-    assert!(orchestrator.handle_message_from_module(&adapter_container(c)).await.unwrap());
+    assert!(
+        orchestrator
+            .handle_message_from_module(&adapter_container(c))
+            .await
+            .unwrap()
+    );
 
     // The downstream module really did receive it.
     let broadcast = recv_broadcast(&mut rx).await;
     let Some(ModulePayload::MessagePreProcess(bcast)) = broadcast.payload else {
         panic!("expected a pre-process broadcast");
     };
-    let seen = bcast.raw_message.clone().expect("broadcast carried no chat message");
+    let seen = bcast
+        .raw_message
+        .clone()
+        .expect("broadcast carried no chat message");
     assert_eq!(seen.raw_message, "hello everyone");
     assert!(!bcast.message_uuid7.is_empty());
     // The identifier is still exactly what the adapter sent.
@@ -482,7 +508,11 @@ async fn plain_message_reaches_a_catch_all_and_completes() {
     };
     assert!(orchestrator.handle_message_from_module(&ack).await.unwrap());
 
-    let json = db.get_event_as_json(uuid.as_bytes()).await.unwrap().unwrap();
+    let json = db
+        .get_event_as_json(uuid.as_bytes())
+        .await
+        .unwrap()
+        .unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v["pipeline_status"], "complete");
     assert_eq!(v["processed_message"], "hello everyone");
@@ -494,7 +524,10 @@ async fn plain_message_reaches_a_catch_all_and_completes() {
 #[tokio::test]
 async fn attached_command_still_routes_with_the_command_attached() {
     let db = test_db().await;
-    let cfg = PipelineConfig { pre_process_modules: names(&["tts-service"]), ..PipelineConfig::default() };
+    let cfg = PipelineConfig {
+        pre_process_modules: names(&["tts-service"]),
+        ..PipelineConfig::default()
+    };
     let registry = Arc::new(Mutex::new(registry_with_commands()));
     let orchestrator = test_orchestrator(db.clone(), cfg, &registry).await;
     let ui_state = Arc::new(Mutex::new(EngineState::new()));
@@ -505,14 +538,24 @@ async fn attached_command_still_routes_with_the_command_attached() {
         handle_command_on_ingest(&mut c, &registry, &orchestrator, &ui_state).await,
         IngestCommandOutcome::Attached
     );
-    assert!(orchestrator.handle_message_from_module(&adapter_container(c)).await.unwrap());
+    assert!(
+        orchestrator
+            .handle_message_from_module(&adapter_container(c))
+            .await
+            .unwrap()
+    );
 
     let broadcast = recv_broadcast(&mut rx).await;
     let Some(ModulePayload::MessagePreProcess(bcast)) = broadcast.payload else {
         panic!("expected a pre-process broadcast");
     };
-    let seen = bcast.raw_message.clone().expect("broadcast carried no chat message");
-    let cmd = seen.command.expect("the parsed command did not survive routing");
+    let seen = bcast
+        .raw_message
+        .clone()
+        .expect("broadcast carried no chat message");
+    let cmd = seen
+        .command
+        .expect("the parsed command did not survive routing");
     assert_eq!(cmd.command_name, "tts");
     assert_eq!(cmd.command_flag, "!");
     assert_eq!(cmd.command_flags[0].value, "2");
@@ -533,7 +576,11 @@ async fn attached_command_still_routes_with_the_command_attached() {
     };
     assert!(orchestrator.handle_message_from_module(&ack).await.unwrap());
 
-    let json = db.get_event_as_json(uuid.as_bytes()).await.unwrap().unwrap();
+    let json = db
+        .get_event_as_json(uuid.as_bytes())
+        .await
+        .unwrap()
+        .unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v["pipeline_status"], "complete");
 }

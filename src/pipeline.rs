@@ -1,13 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::cockatiel_protobuf;
 use crate::cockatiel_protobuf::{
-    container_for_engine::Payload as EnginePayload,
-    container_for_module::Payload as ModulePayload,
     ChatMessage, Command, ContainerForEngine, ContainerForModule,
+    container_for_engine::Payload as EnginePayload, container_for_module::Payload as ModulePayload,
 };
 use crate::command_registry::CommandRegistry;
 use crate::database::{DatabaseManager, PipelineOutcome, PipelineResult};
@@ -56,6 +55,15 @@ pub(crate) fn command_recipients(
     // Keep only targets actually in this stage's configured list.
     targets.retain(|name| stage_modules.iter().any(|m| m == name));
     Some(targets)
+}
+
+/// Whether a same-name connection should be accepted as a silent "shadow"
+/// (keeping the incumbent's routing slot) rather than taking the slot itself.
+/// Only a LIVE incumbent from a DIFFERENT instance warrants a shadow: a
+/// reconnect of the SAME instance must take the slot so its new socket becomes
+/// the routing target, even if the old socket is still closing.
+pub(crate) fn should_shadow(live_incumbent: bool, same_instance: bool) -> bool {
+    live_incumbent && !same_instance
 }
 
 /// How often the ack-timeout sweep runs. This bounds how long a stage waits once
@@ -113,7 +121,10 @@ pub(crate) async fn send_to_module(
     if sender.try_send(container.clone()).is_ok() {
         return SendOutcome::Sent;
     }
-    if tokio::time::timeout(Duration::from_millis(1000), sender.send(container)).await.is_ok() {
+    if tokio::time::timeout(Duration::from_millis(1000), sender.send(container))
+        .await
+        .is_ok()
+    {
         return SendOutcome::Sent;
     }
     eprintln!(
@@ -346,13 +357,7 @@ impl AckTracker {
         }
     }
 
-    pub fn track(
-        &mut self,
-        uuid7: String,
-        stage: String,
-        module_name: String,
-        timeout_ms: u32,
-    ) {
+    pub fn track(&mut self, uuid7: String, stage: String, module_name: String, timeout_ms: u32) {
         let entry = PendingAck {
             uuid7: uuid7.clone(),
             stage,
@@ -391,7 +396,10 @@ impl AckTracker {
             receipt_received: false,
             resend_count: entry.resend_count + 1,
         };
-        self.pending.entry(entry.uuid7.clone()).or_default().push(fresh);
+        self.pending
+            .entry(entry.uuid7.clone())
+            .or_default()
+            .push(fresh);
     }
 
     pub fn ack(&mut self, uuid7: &str) -> Vec<PendingAck> {
@@ -639,6 +647,11 @@ pub struct PipelineOrchestrator {
     pub pipeline_states: Arc<Mutex<HashMap<String, PipelineState>>>,
     pub config: Arc<Mutex<PipelineConfig>>,
     pub module_senders: Arc<Mutex<HashMap<String, mpsc::Sender<ContainerForModule>>>>,
+    /// Records which instance owns the name-keyed routing slot (`module_senders`)
+    /// so a duplicate/shadow disconnect can't evict the live module's sender.
+    /// Invariant: an entry is present only while `module_senders` holds a slot
+    /// for the same name, and its value is the instance that installed it.
+    pub slot_owner: Arc<Mutex<HashMap<String, String>>>,
     pub command_registry: Arc<std::sync::Mutex<CommandRegistry>>,
     /// The operator pause and the messages it is holding.
     ///
@@ -673,6 +686,7 @@ impl PipelineOrchestrator {
             pipeline_states: Arc::new(Mutex::new(HashMap::new())),
             config: Arc::new(Mutex::new(config)),
             module_senders,
+            slot_owner: Arc::new(Mutex::new(HashMap::new())),
             command_registry,
             pause_state: Arc::new(Mutex::new(PauseState::default())),
             module_timings: Arc::new(Mutex::new(ModuleTimings::default())),
@@ -970,15 +984,17 @@ impl PipelineOrchestrator {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let uuid7_bytes = uuid7_string_to_bytes(&msg.uuid7);
 
-        self.db.insert_event(
-            &uuid7_bytes,
-            msg.event_type,
-            &msg.platform,
-            &[],
-            &msg.raw_message,
-            msg.command.as_deref().unwrap_or(""),
-            msg.flags.as_deref().unwrap_or("{}"),
-        ).await?;
+        self.db
+            .insert_event(
+                &uuid7_bytes,
+                msg.event_type,
+                &msg.platform,
+                &[],
+                &msg.raw_message,
+                msg.command.as_deref().unwrap_or(""),
+                msg.flags.as_deref().unwrap_or("{}"),
+            )
+            .await?;
 
         if let Some(ref cmd) = msg.command {
             self.db.set_command(&uuid7_bytes, cmd).await?;
@@ -1041,7 +1057,10 @@ impl PipelineOrchestrator {
     /// While the pipeline is paused this claims the row and then holds at the
     /// entry gate: recovery is not skipped, it is deferred to the resume like
     /// any other dispatch.
-    pub async fn recover_one(&self, uuid7: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    pub async fn recover_one(
+        &self,
+        uuid7: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         // The claim check the database used to do. A row in flight is 'queued'
         // now (the pipeline writes no intermediate status), so `load_queued_message`
         // can no longer tell a live message from a stranded one — the state map
@@ -1070,8 +1089,16 @@ impl PipelineOrchestrator {
             processed_message: msg.raw_message.clone(),
             platform: msg.platform.clone(),
             event_type: msg.event_type,
-            command: if msg.command.is_empty() { None } else { Some(msg.command.clone()) },
-            flags: if msg.flags.is_empty() { None } else { Some(msg.flags.clone()) },
+            command: if msg.command.is_empty() {
+                None
+            } else {
+                Some(msg.command.clone())
+            },
+            flags: if msg.flags.is_empty() {
+                None
+            } else {
+                Some(msg.flags.clone())
+            },
             parsed_command: None,
             channel_id: String::new(),
             user_uuid7: msg.user_uuid7.clone(),
@@ -1114,7 +1141,9 @@ impl PipelineOrchestrator {
     /// row inserted after the snapshot is a message the live pipeline owns and
     /// drives itself), and a row this pass could not drive is handed back to
     /// the caller to log rather than retried in a tight loop.
-    pub async fn drain_queued_once(&self) -> Result<RecoveryDrain, Box<dyn std::error::Error>> {
+    pub async fn drain_queued_once(
+        &self,
+    ) -> Result<RecoveryDrain, Box<dyn std::error::Error>> {
         let uuids = self.db.get_queued_uuids().await?;
         let mut drain = RecoveryDrain {
             considered: uuids.len(),
@@ -1184,7 +1213,11 @@ impl PipelineOrchestrator {
         let cfg = self.config_snapshot().await;
         let targets = {
             let registry = self.command_registry.lock().unwrap();
-            command_recipients(state.parsed_command.as_ref(), &registry, &cfg.pre_process_modules)
+            command_recipients(
+                state.parsed_command.as_ref(),
+                &registry,
+                &cfg.pre_process_modules,
+            )
         };
 
         let recipients: Vec<String> = match &targets {
@@ -1205,7 +1238,14 @@ impl PipelineOrchestrator {
                 );
                 continue;
             }
-            match send_to_module(&self.module_senders, module_name, container.clone(), "pre_process").await {
+            match send_to_module(
+                &self.module_senders,
+                module_name,
+                container.clone(),
+                "pre_process",
+            )
+            .await
+            {
                 SendOutcome::Sent => {
                     sent_any = true;
                     // The tracker lock is taken ONLY for this mutation — never
@@ -1306,8 +1346,11 @@ impl PipelineOrchestrator {
         // recipient, skip it without sending.
         let is_recipient = {
             let registry = self.command_registry.lock().unwrap();
-            let targets =
-                command_recipients(state.parsed_command.as_ref(), &registry, &cfg.in_process_modules);
+            let targets = command_recipients(
+                state.parsed_command.as_ref(),
+                &registry,
+                &cfg.in_process_modules,
+            );
             targets
                 .as_ref()
                 .map(|t| t.iter().any(|m| m == module_name))
@@ -1476,7 +1519,14 @@ impl PipelineOrchestrator {
                 );
                 continue;
             }
-            match send_to_module(&self.module_senders, module_name, container.clone(), "post_process").await {
+            match send_to_module(
+                &self.module_senders,
+                module_name,
+                container.clone(),
+                "post_process",
+            )
+            .await
+            {
                 SendOutcome::Sent => {
                     self.ack_tracker.lock().await.track(
                         uuid7.to_string(),
@@ -1637,7 +1687,11 @@ impl PipelineOrchestrator {
         // the failure was recorded.
         let result = self.take_result(uuid7).await.unwrap_or_default();
         self.db
-            .write_terminal_outcome(&uuid7_bytes, &PipelineOutcome::Failed(error.to_string()), &result)
+            .write_terminal_outcome(
+                &uuid7_bytes,
+                &PipelineOutcome::Failed(error.to_string()),
+                &result,
+            )
             .await?;
 
         let mut ack_guard = self.ack_tracker.lock().await;
@@ -1672,7 +1726,11 @@ impl PipelineOrchestrator {
         let uuid7_bytes = uuid7_string_to_bytes(uuid7);
 
         self.db
-            .write_terminal_outcome(&uuid7_bytes, &PipelineOutcome::Dropped(reason.to_string()), &result)
+            .write_terminal_outcome(
+                &uuid7_bytes,
+                &PipelineOutcome::Dropped(reason.to_string()),
+                &result,
+            )
             .await?;
 
         let mut ack_guard = self.ack_tracker.lock().await;
@@ -1687,7 +1745,9 @@ impl PipelineOrchestrator {
     /// the downstream stages — and displays like term-chat — would show a score
     /// one message behind. Best-effort: a failure leaves the ingest value.
     async fn refresh_user_data(&self, uuid7: &str) {
-        let Some(client) = self.user_db.as_ref() else { return };
+        let Some(client) = self.user_db.as_ref() else {
+            return;
+        };
         let (platform, user_uuid7) = {
             let states = self.pipeline_states.lock().await;
             match states.get(uuid7) {
@@ -1733,7 +1793,10 @@ impl PipelineOrchestrator {
         // shows as each module's current ms. Only count real completed
         // messages (an ack is the module saying "done"), so the average is
         // purely how long a module takes on the messages it actually handled.
-        self.module_timings.lock().await.record(module_name, elapsed_ms);
+        self.module_timings
+            .lock()
+            .await
+            .record(module_name, elapsed_ms);
 
         match stage.as_str() {
             "pre_process" => {
@@ -1773,10 +1836,13 @@ impl PipelineOrchestrator {
         Ok(())
     }
 
-/// Resend a stage message whose receipt ping never arrived. Returns:
+    /// Resend a stage message whose receipt ping never arrived. Returns:
     /// `Ok(true)` = resent + clock restarted, `Ok(false)` = the module isn't
     /// connected (nothing to resend to), `Err` = rebuild/send failure.
-    async fn resend_stage(&self, entry: &PendingAck) -> Result<bool, Box<dyn std::error::Error>> {
+    async fn resend_stage(
+        &self,
+        entry: &PendingAck,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         let state = {
             let states = self.pipeline_states.lock().await;
             states.get(&entry.uuid7).cloned()
@@ -1865,19 +1931,14 @@ impl PipelineOrchestrator {
         .await;
         match outcome {
             SendOutcome::Sent => {
-                self.ack_tracker
-                    .lock()
-                    .await
-                    .re_track(entry);
+                self.ack_tracker.lock().await.re_track(entry);
                 Ok(true)
             }
             _ => Ok(false),
         }
     }
 
-    pub async fn handle_timeout(
-        &self,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn handle_timeout(&self) -> Result<(), Box<dyn std::error::Error>> {
         // PAUSE GATE (the sweep) — and the one that decides whether pausing can
         // ever LOSE a message. `sent_at` is wall-clock: a sweep that ran while
         // the engine was paused would find every in-flight stage long expired
@@ -1959,8 +2020,12 @@ impl PipelineOrchestrator {
                 if failed.insert(entry.uuid7.clone()) {
                     self.mark_failed(
                         &entry.uuid7,
-                        &format!("Critical module '{}' timed out at stage '{}'", entry.module_name, entry.stage),
-                    ).await?;
+                        &format!(
+                            "Critical module '{}' timed out at stage '{}'",
+                            entry.module_name, entry.stage
+                        ),
+                    )
+                    .await?;
                 }
             } else if !still_pending
                 && !resent.contains(&entry.uuid7)
@@ -2020,7 +2085,11 @@ impl PipelineOrchestrator {
         if audio.is_empty() {
             return Ok(());
         }
-        let mime = if audio_type.is_empty() { "audio/mpeg" } else { audio_type };
+        let mime = if audio_type.is_empty() {
+            "audio/mpeg"
+        } else {
+            audio_type
+        };
         let mut states = self.pipeline_states.lock().await;
         if let Some(state) = states.get_mut(uuid7) {
             state.audio = audio.to_vec();
@@ -2080,11 +2149,16 @@ impl PipelineOrchestrator {
                 // authenticated module could overwrite another message's
                 // processed text/audio before `handle_ack` noticed it had no
                 // entry to clear.
-                if !self.owns_pending_stage(&msg.message_uuid7, &container.module_name, "pre_process").await {
+                if !self
+                    .owns_pending_stage(&msg.message_uuid7, &container.module_name, "pre_process")
+                    .await
+                {
                     return Ok(true);
                 }
 
-                let processed = msg.raw_message.as_ref()
+                let processed = msg
+                    .raw_message
+                    .as_ref()
                     .map(|cm| cm.raw_message.clone())
                     .unwrap_or_default();
 
@@ -2095,8 +2169,10 @@ impl PipelineOrchestrator {
                     }
                 }
 
-                self.store_audio(&msg.message_uuid7, "pre", &msg.audio_type, &msg.audio).await?;
-                self.handle_ack(&msg.message_uuid7, &container.module_name).await?;
+                self.store_audio(&msg.message_uuid7, "pre", &msg.audio_type, &msg.audio)
+                    .await?;
+                self.handle_ack(&msg.message_uuid7, &container.module_name)
+                    .await?;
                 Ok(true)
             }
             Some(EnginePayload::MessageInProcess(msg)) => {
@@ -2104,7 +2180,10 @@ impl PipelineOrchestrator {
                     return Ok(true);
                 }
 
-                if !self.owns_pending_stage(&msg.message_uuid7, &container.module_name, "in_process").await {
+                if !self
+                    .owns_pending_stage(&msg.message_uuid7, &container.module_name, "in_process")
+                    .await
+                {
                     return Ok(true);
                 }
 
@@ -2115,7 +2194,8 @@ impl PipelineOrchestrator {
                     }
                 }
 
-                self.store_audio(&msg.message_uuid7, "in", &msg.audio_type, &msg.audio).await?;
+                self.store_audio(&msg.message_uuid7, "in", &msg.audio_type, &msg.audio)
+                    .await?;
 
                 // The module handed the message back marked for abandonment: the
                 // chain ends here instead of continuing to the next stage.
@@ -2123,11 +2203,13 @@ impl PipelineOrchestrator {
                     self.mark_dropped(
                         &msg.message_uuid7,
                         &format!("abandoned by module '{}'", container.module_name),
-                    ).await?;
+                    )
+                    .await?;
                     return Ok(true);
                 }
 
-                self.handle_ack(&msg.message_uuid7, &container.module_name).await?;
+                self.handle_ack(&msg.message_uuid7, &container.module_name)
+                    .await?;
                 Ok(true)
             }
             Some(EnginePayload::MessagePostProcess(msg)) => {
@@ -2135,7 +2217,10 @@ impl PipelineOrchestrator {
                     return Ok(true);
                 }
 
-                if !self.owns_pending_stage(&msg.message_uuid7, &container.module_name, "post_process").await {
+                if !self
+                    .owns_pending_stage(&msg.message_uuid7, &container.module_name, "post_process")
+                    .await
+                {
                     return Ok(true);
                 }
 
@@ -2146,8 +2231,10 @@ impl PipelineOrchestrator {
                     }
                 }
 
-                self.store_audio(&msg.message_uuid7, "post", &msg.audio_type, &msg.audio).await?;
-                self.handle_ack(&msg.message_uuid7, &container.module_name).await?;
+                self.store_audio(&msg.message_uuid7, "post", &msg.audio_type, &msg.audio)
+                    .await?;
+                self.handle_ack(&msg.message_uuid7, &container.module_name)
+                    .await?;
                 Ok(true)
             }
             Some(EnginePayload::MessageAck(ack)) => {
@@ -2235,7 +2322,10 @@ mod timeout_sweep_tests {
         );
 
         // Once the survivor acks, the message is free to advance.
-        assert_eq!(tracker.ack_module("uuid-1", "live").map(|(s, _, _)| s), Some("pre_process".into()));
+        assert_eq!(
+            tracker.ack_module("uuid-1", "live").map(|(s, _, _)| s),
+            Some("pre_process".into())
+        );
         assert!(!tracker.has_pending("uuid-1"));
     }
 
@@ -2293,16 +2383,14 @@ mod timeout_sweep_tests {
             rebased.check_timeouts().is_empty(),
             "the paused interval must not count against the message"
         );
-        assert!(rebased.has_pending("uuid-3"), "the stage is still waiting, not reaped");
+        assert!(
+            rebased.has_pending("uuid-3"),
+            "the stage is still waiting, not reaped"
+        );
 
         // ...and a budget that really does expire from the rebase point still
         // does, so the rebase is a hand-back of credit, not an amnesty.
-        rebased.track(
-            "uuid-3".to_string(),
-            "post_process".into(),
-            "tts".into(),
-            0,
-        );
+        rebased.track("uuid-3".to_string(), "post_process".into(), "tts".into(), 0);
         let timed_out = rebased.check_timeouts();
         assert_eq!(timed_out.len(), 1);
         assert_eq!(timed_out[0].0.stage, "post_process");
@@ -2323,9 +2411,11 @@ mod timeout_wiring_tests {
             "the sweep task must use the tight interval, not a literal"
         );
         // And the 15s DB-sync loop must NOT be doing the sweeping any more.
-        let sync_start = src.find("let mut interval = tokio::time::interval(sync_interval);")
+        let sync_start = src
+            .find("let mut interval = tokio::time::interval(sync_interval);")
             .expect("sync loop not found");
-        let sweep_start = src.find("crate::pipeline::TIMEOUT_SWEEP_INTERVAL")
+        let sweep_start = src
+            .find("crate::pipeline::TIMEOUT_SWEEP_INTERVAL")
             .expect("sweep task not found");
         assert!(
             sweep_start < sync_start,
@@ -2342,10 +2432,13 @@ mod timeout_wiring_tests {
     #[test]
     fn a_timeout_is_logged_with_its_module_and_stage() {
         let src = include_str!("pipeline.rs");
-        let start = src.find("pub async fn handle_timeout(")
+        let start = src
+            .find("pub async fn handle_timeout(")
             .expect("handle_timeout not found");
-        let end = start + src[start..].find("\n    pub async fn ")
-            .unwrap_or(src[start..].len());
+        let end = start
+            + src[start..]
+                .find("\n    pub async fn ")
+                .unwrap_or(src[start..].len());
         let body = &src[start..end];
         assert!(
             body.contains("entry.module_name") && body.contains("entry.stage"),

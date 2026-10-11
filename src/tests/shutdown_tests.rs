@@ -62,10 +62,11 @@ fn the_engine_exits_cleanly_and_only_after_the_answer_is_confirmed() {
     let wait = src
         .find("shutdown.wait_answered()")
         .expect("the exit waits for the answer");
-    let exit = src
-        .find("std::process::exit(0)")
-        .expect("a clean exit");
-    assert!(wait < exit, "the process must not exit before the answer is confirmed");
+    let exit = src.find("std::process::exit(0)").expect("a clean exit");
+    assert!(
+        wait < exit,
+        "the process must not exit before the answer is confirmed"
+    );
     assert_eq!(
         src.matches("std::process::exit(").count(),
         1,

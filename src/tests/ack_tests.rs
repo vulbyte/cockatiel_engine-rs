@@ -9,8 +9,18 @@ use std::time::{Duration, Instant};
 fn stage_advances_only_when_all_recipients_ack() {
     let mut tracker = AckTracker::new();
     let uuid = "test-msg-uuid".to_string();
-    tracker.track(uuid.clone(), "preprocess".to_string(), "module-a".to_string(), 3000);
-    tracker.track(uuid.clone(), "preprocess".to_string(), "module-b".to_string(), 3000);
+    tracker.track(
+        uuid.clone(),
+        "preprocess".to_string(),
+        "module-a".to_string(),
+        3000,
+    );
+    tracker.track(
+        uuid.clone(),
+        "preprocess".to_string(),
+        "module-b".to_string(),
+        3000,
+    );
 
     assert!(tracker.has_pending(&uuid));
 
@@ -31,13 +41,21 @@ fn stage_advances_only_when_all_recipients_ack() {
 #[test]
 fn ack_module_ignores_unknown_recipients_and_is_idempotent() {
     let mut tracker = AckTracker::new();
-    tracker.track("u2".to_string(), "preprocess".to_string(), "module-a".to_string(), 3000);
+    tracker.track(
+        "u2".to_string(),
+        "preprocess".to_string(),
+        "module-a".to_string(),
+        3000,
+    );
 
     // A module that was never tracked for this message does not clear it.
     assert_eq!(tracker.ack_module("u2", "module-other"), None);
     assert!(tracker.has_pending("u2"));
 
-    assert_eq!(tracker.ack_module("u2", "module-a").map(|(s, _, _)| s), Some("preprocess".to_string()));
+    assert_eq!(
+        tracker.ack_module("u2", "module-a").map(|(s, _, _)| s),
+        Some("preprocess".to_string())
+    );
     assert!(!tracker.has_pending("u2"));
 
     // Acking again after removal is a no-op.
@@ -94,8 +112,18 @@ fn check_timeouts_yields_only_elapsed_entries() {
 #[test]
 fn ack_module_reports_the_stage_clear_only_once() {
     let mut tracker = AckTracker::new();
-    tracker.track("u-atomic".to_string(), "preprocess".to_string(), "a".to_string(), 3000);
-    tracker.track("u-atomic".to_string(), "preprocess".to_string(), "b".to_string(), 3000);
+    tracker.track(
+        "u-atomic".to_string(),
+        "preprocess".to_string(),
+        "a".to_string(),
+        3000,
+    );
+    tracker.track(
+        "u-atomic".to_string(),
+        "preprocess".to_string(),
+        "b".to_string(),
+        3000,
+    );
 
     let (_, _, still_a) = tracker.ack_module("u-atomic", "a").unwrap();
     assert!(still_a, "b is still pending — the stage is not clear");
@@ -142,7 +170,12 @@ fn check_timeouts_reports_the_post_drain_pending_state() {
 #[test]
 fn a_receipt_confirms_delivery_without_advancing() {
     let mut tracker = AckTracker::new();
-    tracker.track("u-rcpt".to_string(), "preprocess".to_string(), "module-a".to_string(), 3000);
+    tracker.track(
+        "u-rcpt".to_string(),
+        "preprocess".to_string(),
+        "module-a".to_string(),
+        3000,
+    );
     assert!(tracker.has_pending("u-rcpt"));
 
     // Receipt arrives: the entry stays pending (result not yet in).
@@ -157,7 +190,10 @@ fn a_receipt_confirms_delivery_without_advancing() {
     assert!(tracker.has_pending("u-rcpt"));
 
     // Only the result (stage-echo) clears it.
-    assert_eq!(tracker.ack_module("u-rcpt", "module-a").map(|(s, _, _)| s), Some("preprocess".to_string()));
+    assert_eq!(
+        tracker.ack_module("u-rcpt", "module-a").map(|(s, _, _)| s),
+        Some("preprocess".to_string())
+    );
     assert!(!tracker.has_pending("u-rcpt"));
 }
 
@@ -166,10 +202,18 @@ fn a_receipt_confirms_delivery_without_advancing() {
 #[test]
 fn a_receipt_for_an_untracked_module_is_a_no_op() {
     let mut tracker = AckTracker::new();
-    tracker.track("u-x".to_string(), "preprocess".to_string(), "module-a".to_string(), 3000);
+    tracker.track(
+        "u-x".to_string(),
+        "preprocess".to_string(),
+        "module-a".to_string(),
+        3000,
+    );
     tracker.mark_receipt("u-x", "ghost");
     assert!(tracker.has_pending("u-x"));
-    assert_eq!(tracker.ack_module("u-x", "module-a").map(|(s, _, _)| s), Some("preprocess".to_string()));
+    assert_eq!(
+        tracker.ack_module("u-x", "module-a").map(|(s, _, _)| s),
+        Some("preprocess".to_string())
+    );
 }
 
 /// `re_track` re-adds a resent stage message with the incremented resend count
@@ -181,11 +225,19 @@ fn a_resend_restarts_the_clock_and_counts() {
 
     // A tracked entry (no receipt) that times out is drained by check_timeouts;
     // the timeout handler re-tracks it on resend.
-    tracker.track("u-r".to_string(), "preprocess".to_string(), "module-c".to_string(), 0);
+    tracker.track(
+        "u-r".to_string(),
+        "preprocess".to_string(),
+        "module-c".to_string(),
+        0,
+    );
     let timed_out = tracker.check_timeouts();
     assert_eq!(timed_out.len(), 1);
     assert_eq!(timed_out[0].0.resend_count, 0);
-    assert!(!tracker.has_pending("u-r"), "check_timeouts drains the expired entry");
+    assert!(
+        !tracker.has_pending("u-r"),
+        "check_timeouts drains the expired entry"
+    );
 
     // Re-track after the resend: count bumps, the entry is pending again.
     tracker.re_track(&timed_out[0].0);

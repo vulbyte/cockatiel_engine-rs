@@ -196,7 +196,9 @@ pub fn env_path(dir: &PathBuf) -> PathBuf {
 /// Load a KEY=VALUE `.env` file into the process environment. Real environment
 /// variables win — this only fills in what wasn't already set.
 pub fn load_env_file(dir: &PathBuf) {
-    let Ok(content) = fs::read_to_string(env_path(dir)) else { return };
+    let Ok(content) = fs::read_to_string(env_path(dir)) else {
+        return;
+    };
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -358,14 +360,35 @@ pub fn backfill_config_defaults(state: &Arc<Mutex<ConfigState>>) {
 
     let mut changed = false;
     let defaults: [(&str, serde_json::Value); 8] = [
-        ("max_message_bytes", serde_json::json!(default_max_message_bytes())),
-        ("max_connections", serde_json::json!(default_max_connections())),
-        ("handshake_timeout_secs", serde_json::json!(default_handshake_timeout_secs())),
-        ("send_timeout_secs", serde_json::json!(default_send_timeout_secs())),
-        ("recovery_grace_secs", serde_json::json!(default_recovery_grace_secs())),
+        (
+            "max_message_bytes",
+            serde_json::json!(default_max_message_bytes()),
+        ),
+        (
+            "max_connections",
+            serde_json::json!(default_max_connections()),
+        ),
+        (
+            "handshake_timeout_secs",
+            serde_json::json!(default_handshake_timeout_secs()),
+        ),
+        (
+            "send_timeout_secs",
+            serde_json::json!(default_send_timeout_secs()),
+        ),
+        (
+            "recovery_grace_secs",
+            serde_json::json!(default_recovery_grace_secs()),
+        ),
         ("start_paused", serde_json::json!(default_start_paused())),
-        ("shutdown_on_request", serde_json::json!(default_shutdown_on_request())),
-        ("prediction_creator_role", serde_json::json!(default_creator_role())),
+        (
+            "shutdown_on_request",
+            serde_json::json!(default_shutdown_on_request()),
+        ),
+        (
+            "prediction_creator_role",
+            serde_json::json!(default_creator_role()),
+        ),
     ];
     for (key, value) in defaults {
         if obj.get(key).is_none() {
@@ -379,9 +402,10 @@ pub fn backfill_config_defaults(state: &Arc<Mutex<ConfigState>>) {
     // fill an empty value. A deleted or moved working folder must not take the
     // only backup with it. Idempotent: once the value is the home path (or any
     // other explicit path) this leaves it alone.
-    if let Some(home) =
-        migrated_backup_path(obj.get("timeline_database_backup_location").and_then(|v| v.as_str()))
-    {
+    if let Some(home) = migrated_backup_path(
+        obj.get("timeline_database_backup_location")
+            .and_then(|v| v.as_str()),
+    ) {
         obj.insert(
             "timeline_database_backup_location".to_string(),
             serde_json::json!(home),
@@ -532,7 +556,11 @@ pub fn chmod_owner_only(path: &Path) -> std::io::Result<()> {
 
 pub fn modules_path(config_state: &Arc<Mutex<ConfigState>>) -> PathBuf {
     let state = config_state.lock().unwrap();
-    state.path.parent().unwrap_or(&PathBuf::from(".")).join("modules.json")
+    state
+        .path
+        .parent()
+        .unwrap_or(&PathBuf::from("."))
+        .join("modules.json")
 }
 
 pub fn get_config(state: &Arc<Mutex<ConfigState>>) -> Config {
@@ -567,7 +595,8 @@ pub fn refresh_config(state: &Arc<Mutex<ConfigState>>) {
     state.last_size = u32::MAX;
 }
 
-pub async fn verify_config() -> Result<(String, PathBuf), Box<dyn std::error::Error>> {
+pub async fn verify_config() -> Result<(String, PathBuf), Box<dyn std::error::Error>>
+{
     for path in ["../config.json"] {
         if let Ok(content) = get_file(path) {
             return Ok((content, PathBuf::from(path)));
@@ -632,16 +661,18 @@ pub fn add_module_to_config(
         // the operator just made (the classic "moves snap back" bug). So a
         // module already sitting in SOME ordering list keeps its operator-set
         // placement — only its priority is refreshed.
-        let already_placed = ["input", "preprocess", "inprocess", "postprocess"].iter().any(|label| {
-            let list = match *label {
-                "input" => &config.inputs,
-                "preprocess" => &config.preprocess_modules,
-                "inprocess" => &config.inprocess_modules,
-                "postprocess" => &config.postprocess_modules,
-                _ => unreachable!(),
-            };
-            list.iter().any(|entry| entry.name == name)
-        });
+        let already_placed = ["input", "preprocess", "inprocess", "postprocess"]
+            .iter()
+            .any(|label| {
+                let list = match *label {
+                    "input" => &config.inputs,
+                    "preprocess" => &config.preprocess_modules,
+                    "inprocess" => &config.inprocess_modules,
+                    "postprocess" => &config.postprocess_modules,
+                    _ => unreachable!(),
+                };
+                list.iter().any(|entry| entry.name == name)
+            });
 
         if already_placed {
             // Refresh the entry's priority wherever the operator placed it; do
@@ -705,7 +736,10 @@ mod backup_path_tests {
         assert_eq!(migrated_backup_path(None), Some(home.clone()));
         assert_eq!(migrated_backup_path(Some("")), Some(home.clone()));
         assert_eq!(migrated_backup_path(Some("   ")), Some(home.clone()));
-        assert_eq!(migrated_backup_path(Some("./cockatiel_backup.db")), Some(home));
+        assert_eq!(
+            migrated_backup_path(Some("./cockatiel_backup.db")),
+            Some(home)
+        );
         // An explicit path (the home default itself, or anything else) is kept.
         assert_eq!(migrated_backup_path(Some("/mnt/backups/tl.db")), None);
         assert_eq!(
@@ -717,9 +751,15 @@ mod backup_path_tests {
     #[test]
     fn effective_location_migrates_legacy_but_keeps_explicit() {
         let home = default_timeline_backup_path().to_string_lossy().to_string();
-        assert_eq!(effective_timeline_backup_location("./cockatiel_backup.db"), home);
+        assert_eq!(
+            effective_timeline_backup_location("./cockatiel_backup.db"),
+            home
+        );
         assert_eq!(effective_timeline_backup_location(""), home);
-        assert_eq!(effective_timeline_backup_location("/mnt/backups/tl.db"), "/mnt/backups/tl.db");
+        assert_eq!(
+            effective_timeline_backup_location("/mnt/backups/tl.db"),
+            "/mnt/backups/tl.db"
+        );
     }
 
     #[test]

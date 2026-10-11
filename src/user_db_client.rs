@@ -9,10 +9,10 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessa
 pub use cockatiel_proto::proto;
 
 use proto::{
-    user_db_request, AddChannelRequest, AddUserRequest, ChannelRef, DeleteUserRequest,
-    GetUserRequest, ListUsersRequest, RatingRequest, RemoveChannelRequest, ScoreRequest,
-    SetRolesRequest, UpdateFlagsRequest, UserDbRequest, UserDbResponse, UserValueDeleteRequest,
-    UserValueListRequest, UserValueRequest,
+    AddChannelRequest, AddUserRequest, ChannelRef, DeleteUserRequest, GetUserRequest,
+    ListUsersRequest, RatingRequest, RemoveChannelRequest, ScoreRequest, SetRolesRequest,
+    UpdateFlagsRequest, UserDbRequest, UserDbResponse, UserValueDeleteRequest,
+    UserValueListRequest, UserValueRequest, user_db_request,
 };
 
 /// Convenience result for a module-price deduction: the user's updated record,
@@ -27,9 +27,13 @@ pub struct UserDbClient {
     pub url: String,
     pub token: String,
     // None = not connected yet (lazy connect per request).
-    conn: Mutex<Option<tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >>>,
+    conn: Mutex<
+        Option<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        >,
+    >,
 }
 
 impl UserDbClient {
@@ -96,58 +100,89 @@ impl UserDbClient {
         result
     }
 
-    pub async fn add_user(&self, username: &str, channel: Option<&ChannelRef>) -> Result<UserDbResponse, String> {
+    pub async fn add_user(
+        &self,
+        username: &str,
+        channel: Option<&ChannelRef>,
+    ) -> Result<UserDbResponse, String> {
         self.request(user_db_request::Op::AddUser(AddUserRequest {
             username: username.to_string(),
             channel: channel.cloned(),
-        })).await
+        }))
+        .await
     }
 
-    pub async fn delete_user(&self, uuid7: &str, actor_uuid7: &str, actor_role: &str) -> Result<UserDbResponse, String> {
+    pub async fn delete_user(
+        &self,
+        uuid7: &str,
+        actor_uuid7: &str,
+        actor_role: &str,
+    ) -> Result<UserDbResponse, String> {
         self.request(user_db_request::Op::DeleteUser(DeleteUserRequest {
             uuid7: uuid7.to_string(),
             actor_uuid7: actor_uuid7.to_string(),
             actor_role: actor_role.to_string(),
-        })).await
+        }))
+        .await
     }
 
-    pub async fn add_score(&self, uuid7: &str, delta: i32, reason: &str) -> Result<UserDbResponse, String> {
+    pub async fn add_score(
+        &self,
+        uuid7: &str,
+        delta: i32,
+        reason: &str,
+    ) -> Result<UserDbResponse, String> {
         self.request(user_db_request::Op::AddScore(ScoreRequest {
             uuid7: uuid7.to_string(),
             delta,
             reason: reason.to_string(),
-        })).await
+        }))
+        .await
     }
 
-    pub async fn remove_score(&self, uuid7: &str, delta: i32, reason: &str) -> Result<UserDbResponse, String> {
+    pub async fn remove_score(
+        &self,
+        uuid7: &str,
+        delta: i32,
+        reason: &str,
+    ) -> Result<UserDbResponse, String> {
         self.request(user_db_request::Op::RemoveScore(ScoreRequest {
             uuid7: uuid7.to_string(),
             delta,
             reason: reason.to_string(),
-        })).await
+        }))
+        .await
     }
 
     /// Score-only adjustment: changes `score` by `delta` WITHOUT incrementing
     /// the commendations/reprimands counters and WITHOUT the rating cooldown.
     /// Used by the automated scorer so real configured deltas apply without
     /// corrupting the human-rating counters.
-    pub async fn adjust_score_only(&self, uuid7: &str, delta: i32, reason: &str) -> Result<UserDbResponse, String> {
+    pub async fn adjust_score_only(
+        &self,
+        uuid7: &str,
+        delta: i32,
+        reason: &str,
+    ) -> Result<UserDbResponse, String> {
         self.request(user_db_request::Op::AdjustScoreOnly(ScoreRequest {
             uuid7: uuid7.to_string(),
             delta,
             reason: reason.to_string(),
-        })).await
+        }))
+        .await
     }
 
     /// Deduct a module price from the user's CURRENT score (guarded: refused
     /// when the user lacks the funds). The lifetime `total_score` is untouched.
     pub async fn deduct_score(&self, uuid7: &str, amount: i32) -> Result<DeductOutcome, String> {
         let resp = self
-            .request(user_db_request::Op::DeductScore(crate::user_db_client::proto::DeductScoreRequest {
-                uuid7: uuid7.to_string(),
-                amount,
-                reason: String::new(),
-            }))
+            .request(user_db_request::Op::DeductScore(
+                crate::user_db_client::proto::DeductScoreRequest {
+                    uuid7: uuid7.to_string(),
+                    amount,
+                    reason: String::new(),
+                },
+            ))
             .await?;
         Ok(DeductOutcome {
             applied: resp.success,
@@ -207,46 +242,72 @@ impl UserDbClient {
             platform: platform.to_string(),
             handle: handle.to_string(),
             reason: reason.to_string(),
-        })).await
+        }))
+        .await
     }
 
-    pub async fn add_channel(&self, uuid7: &str, channel: Option<&ChannelRef>) -> Result<UserDbResponse, String> {
+    pub async fn add_channel(
+        &self,
+        uuid7: &str,
+        channel: Option<&ChannelRef>,
+    ) -> Result<UserDbResponse, String> {
         self.request(user_db_request::Op::AddChannel(AddChannelRequest {
             uuid7: uuid7.to_string(),
             channel: channel.cloned(),
-        })).await
+        }))
+        .await
     }
 
-    pub async fn remove_channel(&self, uuid7: &str, platform: &str, channel_id: &str) -> Result<UserDbResponse, String> {
+    pub async fn remove_channel(
+        &self,
+        uuid7: &str,
+        platform: &str,
+        channel_id: &str,
+    ) -> Result<UserDbResponse, String> {
         self.request(user_db_request::Op::RemoveChannel(RemoveChannelRequest {
             uuid7: uuid7.to_string(),
             platform: platform.to_string(),
             channel_id: channel_id.to_string(),
-        })).await
+        }))
+        .await
     }
 
-    pub async fn get_user(&self, uuid7: &str, platform: &str, channel_id: &str, handle: &str) -> Result<UserDbResponse, String> {
+    pub async fn get_user(
+        &self,
+        uuid7: &str,
+        platform: &str,
+        channel_id: &str,
+        handle: &str,
+    ) -> Result<UserDbResponse, String> {
         self.request(user_db_request::Op::GetUser(GetUserRequest {
             uuid7: uuid7.to_string(),
             platform: platform.to_string(),
             channel_id: channel_id.to_string(),
             handle: handle.to_string(),
-        })).await
+        }))
+        .await
     }
 
-    pub async fn list_users(&self, platform: &str, limit: i32, offset: i32) -> Result<UserDbResponse, String> {
+    pub async fn list_users(
+        &self,
+        platform: &str,
+        limit: i32,
+        offset: i32,
+    ) -> Result<UserDbResponse, String> {
         self.request(user_db_request::Op::ListUsers(ListUsersRequest {
             platform: platform.to_string(),
             limit,
             offset,
-        })).await
+        }))
+        .await
     }
 
     pub async fn update_flags(&self, uuid7: &str, flags: &str) -> Result<UserDbResponse, String> {
         self.request(user_db_request::Op::UpdateFlags(UpdateFlagsRequest {
             uuid7: uuid7.to_string(),
             flags: flags.to_string(),
-        })).await
+        }))
+        .await
     }
 
     pub async fn set_roles(
@@ -267,7 +328,8 @@ impl UserDbClient {
             is_moderator,
             is_admin,
             is_owner,
-        })).await
+        }))
+        .await
     }
 
     pub async fn read_user_value(&self, uuid7: &str, key: &str) -> Result<UserDbResponse, String> {
@@ -275,28 +337,43 @@ impl UserDbClient {
             uuid7: uuid7.to_string(),
             key: key.to_string(),
             value: String::new(),
-        })).await
+        }))
+        .await
     }
 
-    pub async fn write_user_value(&self, uuid7: &str, key: &str, value: &str) -> Result<UserDbResponse, String> {
+    pub async fn write_user_value(
+        &self,
+        uuid7: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<UserDbResponse, String> {
         self.request(user_db_request::Op::WriteUserValue(UserValueRequest {
             uuid7: uuid7.to_string(),
             key: key.to_string(),
             value: value.to_string(),
-        })).await
+        }))
+        .await
     }
 
-    pub async fn delete_user_value(&self, uuid7: &str, key: &str) -> Result<UserDbResponse, String> {
-        self.request(user_db_request::Op::DeleteUserValue(UserValueDeleteRequest {
-            uuid7: uuid7.to_string(),
-            key: key.to_string(),
-        })).await
+    pub async fn delete_user_value(
+        &self,
+        uuid7: &str,
+        key: &str,
+    ) -> Result<UserDbResponse, String> {
+        self.request(user_db_request::Op::DeleteUserValue(
+            UserValueDeleteRequest {
+                uuid7: uuid7.to_string(),
+                key: key.to_string(),
+            },
+        ))
+        .await
     }
 
     pub async fn list_user_values(&self, uuid7: &str) -> Result<UserDbResponse, String> {
         self.request(user_db_request::Op::ListUserValues(UserValueListRequest {
             uuid7: uuid7.to_string(),
-        })).await
+        }))
+        .await
     }
 }
 
@@ -376,7 +453,8 @@ pub fn userdb_response_to_json(resp: &UserDbResponse) -> String {
             "reason": e.reason,
             "created_at": e.created_at,
         })).collect::<Vec<_>>(),
-    }).to_string()
+    })
+    .to_string()
 }
 
 pub type SharedUserDbClient = Arc<UserDbClient>;

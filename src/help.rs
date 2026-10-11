@@ -35,7 +35,13 @@ pub fn format_overview(registry: &CommandRegistry) -> String {
     for (module, commands) in by_module {
         lines.push(format!("{module}  commands"));
         for (i, c) in commands.iter().enumerate() {
-            lines.push(format!("{} {}{} — {}", i + 1, c.command_flag, c.command_name, c.command_description));
+            lines.push(format!(
+                "{} {}{} — {}",
+                i + 1,
+                c.command_flag,
+                c.command_name,
+                c.command_description
+            ));
         }
     }
     lines.join("\n")

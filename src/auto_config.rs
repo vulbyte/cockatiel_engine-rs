@@ -130,7 +130,10 @@ fn register_module(
     match serde_json::to_string_pretty(&registry) {
         Ok(pretty) => {
             let _ = config::write_atomic(&path, &pretty);
-            Some("registered in modules.json (auto_auth: false — first connect will prompt)".to_string())
+            Some(
+                "registered in modules.json (auto_auth: false — first connect will prompt)"
+                    .to_string(),
+            )
         }
         Err(e) => Some(format!("failed to register in modules.json: {}", e)),
     }
@@ -156,20 +159,23 @@ fn add_to_ordering(
     let already_placed = ORDERING_KEYS.iter().any(|key| {
         root.get(*key)
             .and_then(|v| v.as_array())
-            .map(|list| list.iter().any(|e| e.get("name").and_then(|v| v.as_str()) == Some(name)))
+            .map(|list| {
+                list.iter()
+                    .any(|e| e.get("name").and_then(|v| v.as_str()) == Some(name))
+            })
             .unwrap_or(false)
     });
 
     if already_placed {
         // Refresh priority where the operator placed it; never move it back.
         for key in ORDERING_KEYS {
-            if let Some(existing) = root
-                .get_mut(key)
-                .and_then(|v| v.as_array_mut())
-                .and_then(|list| {
-                    list.iter_mut()
-                        .find(|e| e.get("name").and_then(|v| v.as_str()) == Some(name))
-                })
+            if let Some(existing) =
+                root.get_mut(key)
+                    .and_then(|v| v.as_array_mut())
+                    .and_then(|list| {
+                        list.iter_mut()
+                            .find(|e| e.get("name").and_then(|v| v.as_str()) == Some(name))
+                    })
             {
                 existing["priority"] = serde_json::json!(100);
             }
@@ -274,10 +280,14 @@ mod tests {
         .unwrap();
 
         let msg = write_connection_config(&dir, "m", "input", 9734, 987400);
-        assert!(msg.is_some(), "missing pin/position/priority should be filled");
+        assert!(
+            msg.is_some(),
+            "missing pin/position/priority should be filled"
+        );
 
         let root: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
         // Existing values are preserved.
         assert_eq!(root["ip"], "10.0.0.5");
         assert_eq!(root["port"], 9999);
@@ -344,7 +354,8 @@ mod tests {
         assert!(msg.is_some(), "a missing config.json should be created");
 
         let root: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
         assert_eq!(root["ip"], DEFAULT_BIND_IP);
         assert_eq!(root["port"], 9734);
         assert_eq!(root["pin"], 1234);

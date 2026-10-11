@@ -39,7 +39,10 @@ async fn orchestrator_with(
     cfg.ack_timeout_ms = ack_timeout_ms;
     orchestrator.set_config(cfg).await;
     if paused {
-        assert!(orchestrator.pause().await, "the orchestrator must be held here");
+        assert!(
+            orchestrator.pause().await,
+            "the orchestrator must be held here"
+        );
         assert!(orchestrator.is_paused().await);
     } else {
         assert!(!orchestrator.is_paused().await);
@@ -64,25 +67,21 @@ fn no_module_saw_anything(rx: &mut HashMap<String, ModuleRx>) {
 /// so the tests that drain a backlog wait for it rather than assuming it has
 /// already run. The work is in-memory and bounded, so this cannot flake: it
 /// either arrives within the deadline or the test fails.
-async fn wait_for_broadcasts(
-    rx: &mut ModuleRx,
-    count: usize,
-    what: &str,
-) -> Vec<String> {
+async fn wait_for_broadcasts(rx: &mut ModuleRx, count: usize, what: &str) -> Vec<String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut seen = Vec::new();
     while seen.len() < count {
         if let Ok(container) = rx.try_recv() {
             let uuid7 = match &container.payload {
-                Some(crate::cockatiel_protobuf::container_for_module::Payload::MessagePreProcess(m)) => {
-                    m.message_uuid7.clone()
-                }
-                Some(crate::cockatiel_protobuf::container_for_module::Payload::MessageInProcess(m)) => {
-                    m.message_uuid7.clone()
-                }
-                Some(crate::cockatiel_protobuf::container_for_module::Payload::MessagePostProcess(m)) => {
-                    m.message_uuid7.clone()
-                }
+                Some(
+                    crate::cockatiel_protobuf::container_for_module::Payload::MessagePreProcess(m),
+                ) => m.message_uuid7.clone(),
+                Some(
+                    crate::cockatiel_protobuf::container_for_module::Payload::MessageInProcess(m),
+                ) => m.message_uuid7.clone(),
+                Some(
+                    crate::cockatiel_protobuf::container_for_module::Payload::MessagePostProcess(m),
+                ) => m.message_uuid7.clone(),
                 other => panic!("expected a stage message, got {other:?}"),
             };
             seen.push(uuid7);
@@ -127,14 +126,20 @@ async fn a_message_ingested_while_paused_is_persisted_and_dispatched_to_nobody()
     let r = row(&orchestrator.db, &uuid7).await;
     assert_eq!(r["raw_message"], "held at the door");
     assert_eq!(r["pipeline_status"], "queued");
-    assert_eq!(orchestrator.db.get_queued_uuids().await.unwrap(), vec![uuid7.clone()]);
+    assert_eq!(
+        orchestrator.db.get_queued_uuids().await.unwrap(),
+        vec![uuid7.clone()]
+    );
 
     // It is held, not lost, and not even pending an ack from anyone.
     assert_eq!(orchestrator.held_count().await, 1);
     assert!(!orchestrator.ack_tracker.lock().await.has_pending(&uuid7));
     // The ack sweep is gated too — nothing to reap, but it must not run.
     orchestrator.handle_timeout().await.unwrap();
-    assert_eq!(row(&orchestrator.db, &uuid7).await["pipeline_status"], "queued");
+    assert_eq!(
+        row(&orchestrator.db, &uuid7).await["pipeline_status"],
+        "queued"
+    );
 }
 
 // ── Resume restores completely normal operation ───────────────────────
@@ -155,13 +160,20 @@ async fn resume_drains_everything_that_accumulated_while_paused() {
     }
     no_module_saw_anything(&mut rx);
     let queued = orchestrator.db.get_queued_uuids().await.unwrap();
-    assert_eq!(queued.len(), MESSAGES, "every paused message is persisted as 'queued'");
+    assert_eq!(
+        queued.len(),
+        MESSAGES,
+        "every paused message is persisted as 'queued'"
+    );
     assert_eq!(orchestrator.held_count().await, MESSAGES);
 
     let outcome = orchestrator.resume().await;
     assert!(outcome.was_paused);
     assert_eq!(outcome.resumed_messages, MESSAGES);
-    assert!(outcome.errors.is_empty(), "a clean resume reports nothing: {outcome:?}");
+    assert!(
+        outcome.errors.is_empty(),
+        "a clean resume reports nothing: {outcome:?}"
+    );
     assert!(!orchestrator.is_paused().await);
     assert_eq!(
         orchestrator.held_count().await,
@@ -173,8 +185,12 @@ async fn resume_drains_everything_that_accumulated_while_paused() {
     // time-ordered and the held set is a uuid7-ordered map, so "the order they
     // came in" is the order they go out — the same ordering the recovery drain
     // already relies on.
-    let uuids = wait_for_broadcasts(rx.get_mut("pre").unwrap(), MESSAGES, "the drained backlog").await;
-    assert_eq!(uuids, queued, "the accumulated queue must drain in uuid7 order");
+    let uuids =
+        wait_for_broadcasts(rx.get_mut("pre").unwrap(), MESSAGES, "the drained backlog").await;
+    assert_eq!(
+        uuids, queued,
+        "the accumulated queue must drain in uuid7 order"
+    );
     assert!(nothing_left(rx.get_mut("mid").unwrap()));
     assert!(nothing_left(rx.get_mut("post").unwrap()));
 
@@ -198,8 +214,14 @@ async fn resume_drains_everything_that_accumulated_while_paused() {
     }
     for uuid7 in &uuids {
         let r = row(&orchestrator.db, uuid7).await;
-        assert_eq!(r["pipeline_status"], "complete", "a drained message must finish, not linger");
-        assert_eq!(r["processed_message"], format!("done {}", uuids.iter().position(|u| u == uuid7).unwrap()));
+        assert_eq!(
+            r["pipeline_status"], "complete",
+            "a drained message must finish, not linger"
+        );
+        assert_eq!(
+            r["processed_message"],
+            format!("done {}", uuids.iter().position(|u| u == uuid7).unwrap())
+        );
         assert!(r["persisted_at"].is_number());
     }
     assert!(orchestrator.pipeline_states.lock().await.is_empty());
@@ -217,9 +239,15 @@ async fn resuming_an_engine_that_is_not_paused_changes_nothing() {
     let uuid7 = take_broadcast(rx.get_mut("pre").unwrap());
 
     let outcome = orchestrator.resume().await;
-    assert!(!outcome.was_paused, "nothing was paused, so nothing was resumed");
+    assert!(
+        !outcome.was_paused,
+        "nothing was paused, so nothing was resumed"
+    );
     assert_eq!(outcome.resumed_messages, 0);
-    assert!(nothing_left(rx.get_mut("mid").unwrap()), "a no-op resume must not re-dispatch");
+    assert!(
+        nothing_left(rx.get_mut("mid").unwrap()),
+        "a no-op resume must not re-dispatch"
+    );
 
     // The in-flight message is untouched and still completes.
     orchestrator
@@ -235,7 +263,10 @@ async fn resuming_an_engine_that_is_not_paused_changes_nothing() {
         .handle_message_from_module(&post_reply("post", &uuid7, "done"))
         .await
         .unwrap();
-    assert_eq!(row(&orchestrator.db, &uuid7).await["pipeline_status"], "complete");
+    assert_eq!(
+        row(&orchestrator.db, &uuid7).await["pipeline_status"],
+        "complete"
+    );
 }
 
 // ── THE rule: paused time does not count against a message ────────────
@@ -292,16 +323,29 @@ async fn a_message_mid_chain_when_the_pause_lands_still_completes_after_it() {
         orchestrator.ack_tracker.lock().await.has_pending(&uuid7),
         "the in-flight stage must still be waiting, not reaped"
     );
-    assert!(nothing_left(rx.get_mut("post").unwrap()), "a held chain must not advance");
-    assert_eq!(orchestrator.held_count().await, 0, "an in-flight message is not a held dispatch");
+    assert!(
+        nothing_left(rx.get_mut("post").unwrap()),
+        "a held chain must not advance"
+    );
+    assert_eq!(
+        orchestrator.held_count().await,
+        0,
+        "an in-flight message is not a held dispatch"
+    );
 
     // Resume. An in-flight message has no held dispatch to replay, but its ack
     // budget must start again from NOW — the 600ms just spent paused is not
     // 'mid's fault and must not be charged to it.
     let outcome = orchestrator.resume().await;
     assert!(outcome.was_paused);
-    assert_eq!(outcome.resumed_messages, 0, "the replay only covers held dispatches");
-    assert!(outcome.errors.is_empty(), "the resume sweep must not fail anything: {outcome:?}");
+    assert_eq!(
+        outcome.resumed_messages, 0,
+        "the replay only covers held dispatches"
+    );
+    assert!(
+        outcome.errors.is_empty(),
+        "the resume sweep must not fail anything: {outcome:?}"
+    );
 
     // The very first sweep after the resume is the one that used to kill it.
     orchestrator.handle_timeout().await.unwrap();
@@ -345,14 +389,21 @@ async fn a_message_held_between_stages_resumes_at_the_stage_it_reached() {
         .handle_message_from_module(&pre_reply("pre", &uuid7, "pre text"))
         .await
         .unwrap();
-    assert!(nothing_left(rx.get_mut("mid").unwrap()), "the held transition must not dispatch");
+    assert!(
+        nothing_left(rx.get_mut("mid").unwrap()),
+        "the held transition must not dispatch"
+    );
     assert_eq!(orchestrator.held_count().await, 1);
 
     let outcome = orchestrator.resume().await;
     assert_eq!(outcome.resumed_messages, 1);
     assert!(outcome.errors.is_empty());
     let reached = wait_for_broadcasts(rx.get_mut("mid").unwrap(), 1, "the resumed chain").await;
-    assert_eq!(reached, vec![uuid7.clone()], "the replay continues the chain");
+    assert_eq!(
+        reached,
+        vec![uuid7.clone()],
+        "the replay continues the chain"
+    );
 
     orchestrator
         .handle_message_from_module(&in_reply("mid", &uuid7, "done", false))
@@ -363,7 +414,10 @@ async fn a_message_held_between_stages_resumes_at_the_stage_it_reached() {
         .handle_message_from_module(&post_reply("post", &uuid7, "done"))
         .await
         .unwrap();
-    assert_eq!(row(&orchestrator.db, &uuid7).await["pipeline_status"], "complete");
+    assert_eq!(
+        row(&orchestrator.db, &uuid7).await["pipeline_status"],
+        "complete"
+    );
 }
 
 /// Pausing twice is not an error and does not re-hold what is already held —
@@ -414,7 +468,11 @@ async fn the_recovery_drain_terminates_with_a_row_that_stays_queued() {
         .unwrap();
     let live = take_broadcast(rx.get_mut("pre").unwrap());
     let queued = db.get_queued_uuids().await.unwrap();
-    assert_eq!(queued.len(), 2, "both rows read as 'queued' — that is the trap");
+    assert_eq!(
+        queued.len(),
+        2,
+        "both rows read as 'queued' — that is the trap"
+    );
     assert!(queued.contains(&stranded) && queued.contains(&live));
 
     let drain = tokio::time::timeout(BOUND, orchestrator.drain_queued_once())
@@ -426,8 +484,15 @@ async fn the_recovery_drain_terminates_with_a_row_that_stays_queued() {
     assert!(drain.failures.is_empty(), "{:?}", drain.failures);
 
     let pre = rx.get_mut("pre").unwrap();
-    assert_eq!(take_broadcast(pre), stranded, "the stranded row is re-driven");
-    assert!(nothing_left(pre), "the live message must not be re-broadcast");
+    assert_eq!(
+        take_broadcast(pre),
+        stranded,
+        "the stranded row is re-driven"
+    );
+    assert!(
+        nothing_left(pre),
+        "the live message must not be re-broadcast"
+    );
 
     // BOTH rows are 'queued' again — the live message, and now the recovered
     // one, which is in flight too — so the situation is unchanged rather than
@@ -437,10 +502,23 @@ async fn the_recovery_drain_terminates_with_a_row_that_stays_queued() {
         .await
         .expect("a second pass must terminate too")
         .unwrap();
-    assert_eq!(second.considered, 2, "both messages are in flight, so both rows read as 'queued'");
-    assert_eq!(second.claimed, 0, "a row the live pipeline owns is not a drain");
-    assert!(nothing_left(rx.get_mut("pre").unwrap()), "nothing may be re-broadcast");
-    assert_eq!(row(&db, &live).await["pipeline_status"], "queued", "the drain must not write to a live row");
+    assert_eq!(
+        second.considered, 2,
+        "both messages are in flight, so both rows read as 'queued'"
+    );
+    assert_eq!(
+        second.claimed, 0,
+        "a row the live pipeline owns is not a drain"
+    );
+    assert!(
+        nothing_left(rx.get_mut("pre").unwrap()),
+        "nothing may be re-broadcast"
+    );
+    assert_eq!(
+        row(&db, &live).await["pipeline_status"],
+        "queued",
+        "the drain must not write to a live row"
+    );
 }
 
 /// Structural guard for the same defect. The behavioural test above proves the
@@ -477,15 +555,24 @@ fn the_recovery_drain_task_is_a_single_pass() {
         !block.contains("loop"),
         "the recovery drain must not loop: an in-flight row is 'queued' for its whole flight, so the loop never ends"
     );
-    assert!(block.contains("drain_queued_once()"), "the drain must use the single pass");
+    assert!(
+        block.contains("drain_queued_once()"),
+        "the drain must use the single pass"
+    );
     // The two log lines the drain has always emitted, unchanged.
-    assert!(block.contains("Recovery error:"), "a SELECT failure must still be logged as before");
+    assert!(
+        block.contains("Recovery error:"),
+        "a SELECT failure must still be logged as before"
+    );
     assert!(
         block.contains("Recovery failed for {}: {}"),
         "a per-row failure must still be logged as before"
     );
     // The grace sleep is unchanged.
-    assert!(block.contains("sleep(std::time::Duration::from_secs(grace as u64))"), "the grace sleep must stay");
+    assert!(
+        block.contains("sleep(std::time::Duration::from_secs(grace as u64))"),
+        "the grace sleep must stay"
+    );
 }
 
 /// Structural guard for the other half: the engine must boot through the pause
@@ -503,11 +590,16 @@ fn the_engine_boots_through_the_pause_gate() {
     );
     // ...and the gate must be set BEFORE the ack sweep and recovery tasks are
     // spawned, or they can run against a running pipeline.
-    let gate = src.find("config::start_paused(&config)").expect("boot gate");
+    let gate = src
+        .find("config::start_paused(&config)")
+        .expect("boot gate");
     let sweep = src
         .find("crate::pipeline::TIMEOUT_SWEEP_INTERVAL")
         .expect("the timeout sweep");
-    assert!(gate < sweep, "the pause must be set before the sweep task starts");
+    assert!(
+        gate < sweep,
+        "the pause must be set before the sweep task starts"
+    );
 }
 
 /// A paused engine's recovery is deferred, not skipped: a stranded row is
@@ -528,8 +620,14 @@ async fn a_paused_engine_defers_recovered_rows_to_the_resume() {
         .await
         .expect("a paused drain still terminates")
         .unwrap();
-    assert_eq!(drain.claimed, 1, "the stranded row is still claimed while paused");
-    assert!(nothing_left(rx.get_mut("pre").unwrap()), "…and still not dispatched");
+    assert_eq!(
+        drain.claimed, 1,
+        "the stranded row is still claimed while paused"
+    );
+    assert!(
+        nothing_left(rx.get_mut("pre").unwrap()),
+        "…and still not dispatched"
+    );
     assert_eq!(orchestrator.held_count().await, 1);
 
     orchestrator.resume().await;
@@ -549,9 +647,15 @@ async fn a_block_gates_dispatch_and_is_distinct_from_a_pause() {
     assert!(!orchestrator.is_gated().await);
 
     orchestrator.set_block(BlockedReason::UserDb).await;
-    assert_eq!(orchestrator.blocked_reason().await, Some(BlockedReason::UserDb));
+    assert_eq!(
+        orchestrator.blocked_reason().await,
+        Some(BlockedReason::UserDb)
+    );
     assert!(orchestrator.is_gated().await, "a block gates dispatch");
-    assert!(!orchestrator.is_paused().await, "a block is not an operator pause");
+    assert!(
+        !orchestrator.is_paused().await,
+        "a block is not an operator pause"
+    );
 
     orchestrator
         .handle_message_from_module(&adapter_ingest("blocked at the door"))
@@ -590,7 +694,10 @@ async fn clear_block_stays_paused_when_a_pause_was_deferred() {
     let (orchestrator, _rx) = orchestrator_with(3000, false).await;
     orchestrator.set_block(BlockedReason::UserDb).await;
     orchestrator.defer_pause().await;
-    assert!(orchestrator.is_paused().await, "defer_pause holds immediately");
+    assert!(
+        orchestrator.is_paused().await,
+        "defer_pause holds immediately"
+    );
     assert!(!orchestrator.will_resume_on_unblock().await);
 
     assert!(
@@ -598,7 +705,10 @@ async fn clear_block_stays_paused_when_a_pause_was_deferred() {
         "a deferred pause must not auto-resume"
     );
     assert!(orchestrator.blocked_reason().await.is_none());
-    assert!(orchestrator.is_paused().await, "stays paused after the block clears");
+    assert!(
+        orchestrator.is_paused().await,
+        "stays paused after the block clears"
+    );
 }
 
 /// Timeline-DB is the more fundamental fault, so it outranks a user-DB block and

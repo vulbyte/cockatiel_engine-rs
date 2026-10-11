@@ -24,7 +24,11 @@ async fn test_db() -> DatabaseManager {
 /// / data_blob).
 async fn row(db: &DatabaseManager, uuid7: &[u8]) -> serde_json::Map<String, serde_json::Value> {
     let json = db.get_event_as_json(uuid7).await.unwrap().unwrap();
-    serde_json::from_str::<serde_json::Value>(&json).unwrap().as_object().unwrap().clone()
+    serde_json::from_str::<serde_json::Value>(&json)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .clone()
 }
 
 #[tokio::test]
@@ -33,23 +37,38 @@ async fn mark_processing_failed_and_get_queued_uuids_semantics() {
     let u1 = b"u1-uuid-bytes-0000000001".to_vec();
     let u2 = b"u2-uuid-bytes-0000000002".to_vec();
     let u3 = b"u3-uuid-bytes-0000000003".to_vec();
-    db.insert_event(&u1, 1, "twitch", &[], "hello one", "", "{}").await.unwrap();
-    db.insert_event(&u2, 1, "kick", &[], "hello two", "", "{}").await.unwrap();
-    db.insert_event(&u3, 1, "youtube", &[], "hello three", "", "{}").await.unwrap();
+    db.insert_event(&u1, 1, "twitch", &[], "hello one", "", "{}")
+        .await
+        .unwrap();
+    db.insert_event(&u2, 1, "kick", &[], "hello two", "", "{}")
+        .await
+        .unwrap();
+    db.insert_event(&u3, 1, "youtube", &[], "hello three", "", "{}")
+        .await
+        .unwrap();
 
     // u1 + u3 are mid-flight; u2 never started.
     db.set_pipeline_status(&u1, "processing").await.unwrap();
     db.set_pipeline_status(&u3, "processing").await.unwrap();
 
     // Only u2 is still queued.
-    assert_eq!(db.get_queued_uuids().await.unwrap(), vec![String::from_utf8(u2.clone()).unwrap()]);
+    assert_eq!(
+        db.get_queued_uuids().await.unwrap(),
+        vec![String::from_utf8(u2.clone()).unwrap()]
+    );
 
     // Marking the mid-flight rows failed leaves the queued set untouched.
     // (The exact count turso reports is a scan counter, not strictly the number
     // of modified rows — the real contract is the resulting row state below.)
-    let n = db.mark_all_processing_as_failed("interrupted by engine restart").await.unwrap();
+    let n = db
+        .mark_all_processing_as_failed("interrupted by engine restart")
+        .await
+        .unwrap();
     assert!(n >= 2);
-    assert_eq!(db.get_queued_uuids().await.unwrap(), vec![String::from_utf8(u2.clone()).unwrap()]);
+    assert_eq!(
+        db.get_queued_uuids().await.unwrap(),
+        vec![String::from_utf8(u2.clone()).unwrap()]
+    );
 
     // The failed rows carry the reason; the queued row still loads normally.
     let json = db.get_event_as_json(&u1).await.unwrap().unwrap();
@@ -74,8 +93,12 @@ async fn get_queued_uuids_is_ordered_ascending() {
     // "a-..." < "b-..." byte-wise → the earlier-uuid row sorts first.
     let a = b"a-queued-row".to_vec();
     let b = b"b-queued-row".to_vec();
-    db.insert_event(&b, 1, "twitch", &[], "bee", "", "{}").await.unwrap();
-    db.insert_event(&a, 1, "twitch", &[], "aye", "", "{}").await.unwrap();
+    db.insert_event(&b, 1, "twitch", &[], "bee", "", "{}")
+        .await
+        .unwrap();
+    db.insert_event(&a, 1, "twitch", &[], "aye", "", "{}")
+        .await
+        .unwrap();
     assert_eq!(
         db.get_queued_uuids().await.unwrap(),
         vec![String::from_utf8(a).unwrap(), String::from_utf8(b).unwrap()]
@@ -102,14 +125,22 @@ async fn sync_to_remote_writes_a_consistent_reusable_backup() {
     db.initialize().await.unwrap();
 
     let uuid = b"sync-backup-uuid-000001".to_vec();
-    db.insert_event(&uuid, 1, "twitch", &[], "backup me", "!test", "{}").await.unwrap();
+    db.insert_event(&uuid, 1, "twitch", &[], "backup me", "!test", "{}")
+        .await
+        .unwrap();
 
     // First sync creates the backup; a second sync over it must succeed and
     // leave the file present (no destroy-then-rename window).
     assert_eq!(db.sync_to_remote().await.unwrap(), 1);
-    assert!(backup_path.exists(), "backup file must exist after first sync");
+    assert!(
+        backup_path.exists(),
+        "backup file must exist after first sync"
+    );
     assert_eq!(db.sync_to_remote().await.unwrap(), 1);
-    assert!(backup_path.exists(), "backup file must survive a second sync");
+    assert!(
+        backup_path.exists(),
+        "backup file must survive a second sync"
+    );
 
     // The backup is a real DB: re-open it as a fresh manager and find the event.
     let restored = DatabaseManager::new(DatabaseConfig {
@@ -119,7 +150,11 @@ async fn sync_to_remote_writes_a_consistent_reusable_backup() {
         local_target_mb: 50,
     });
     restored.initialize().await.unwrap();
-    let json = restored.get_event_as_json(&uuid).await.unwrap().expect("backup must contain the synced event");
+    let json = restored
+        .get_event_as_json(&uuid)
+        .await
+        .unwrap()
+        .expect("backup must contain the synced event");
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v["raw_message"], "backup me");
     assert_eq!(v["command"], "!test");
@@ -136,7 +171,10 @@ async fn sync_to_remote_creates_a_missing_backup_directory() {
     std::fs::create_dir_all(&dir).unwrap();
     let local_path = dir.join("data.db");
     // Nested dirs that do not exist yet.
-    let backup_path = dir.join(".cockatiel").join("backups").join("cockatiel_backup.db");
+    let backup_path = dir
+        .join(".cockatiel")
+        .join("backups")
+        .join("cockatiel_backup.db");
 
     let db = DatabaseManager::new(DatabaseConfig {
         local_path,
@@ -146,15 +184,24 @@ async fn sync_to_remote_creates_a_missing_backup_directory() {
     });
     db.initialize().await.unwrap();
     let uuid = b"backup-dir-uuid-00000001".to_vec();
-    db.insert_event(&uuid, 1, "twitch", &[], "hi", "", "{}").await.unwrap();
+    db.insert_event(&uuid, 1, "twitch", &[], "hi", "", "{}")
+        .await
+        .unwrap();
 
     assert_eq!(db.sync_to_remote().await.unwrap(), 1);
-    assert!(backup_path.exists(), "backup written into the created directory");
+    assert!(
+        backup_path.exists(),
+        "backup written into the created directory"
+    );
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&backup_path).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(&backup_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600, "backup must be owner-only, got {mode:o}");
     }
 
@@ -176,22 +223,32 @@ async fn sync_to_remote_creates_a_missing_backup_directory() {
 async fn run_the_old_per_stage_writes(db: &DatabaseManager, uuid7: &[u8]) -> usize {
     let before = db.take_round_trips();
     // ingest
-    db.insert_event(uuid7, 1, "twitch", &[], "raw text", "", "{}").await.unwrap();
+    db.insert_event(uuid7, 1, "twitch", &[], "raw text", "", "{}")
+        .await
+        .unwrap();
     db.set_user_uuid(uuid7, "user-1").await.unwrap();
     // the pipeline starts
     db.set_pipeline_status(uuid7, "processing").await.unwrap();
     // pre-process: module rewrote the text and rendered audio
     db.set_processed_message(uuid7, "pre text").await.unwrap();
-    db.set_audio(uuid7, "audio/mpeg", b"PRE-AUDIO").await.unwrap();
-    db.update_stage_completed(uuid7, "pre_process").await.unwrap();
+    db.set_audio(uuid7, "audio/mpeg", b"PRE-AUDIO")
+        .await
+        .unwrap();
+    db.update_stage_completed(uuid7, "pre_process")
+        .await
+        .unwrap();
     // in-process: another module rewrote the text and re-rendered as wav
     db.set_processed_message(uuid7, "in text").await.unwrap();
     db.set_audio(uuid7, "audio/wav", b"IN-AUDIO").await.unwrap();
-    db.update_stage_completed(uuid7, "in_process").await.unwrap();
+    db.update_stage_completed(uuid7, "in_process")
+        .await
+        .unwrap();
     // post-process, then the completion tail
     db.set_processed_message(uuid7, "final text").await.unwrap();
     db.set_processed_message(uuid7, "final text").await.unwrap();
-    db.update_stage_completed(uuid7, "post_process").await.unwrap();
+    db.update_stage_completed(uuid7, "post_process")
+        .await
+        .unwrap();
     db.update_stage_completed(uuid7, "persisted").await.unwrap();
     db.set_pipeline_status(uuid7, "complete").await.unwrap();
     db.take_round_trips() - before
@@ -201,7 +258,9 @@ async fn run_the_old_per_stage_writes(db: &DatabaseManager, uuid7: &[u8]) -> usi
 /// accumulated in memory and emitted once. Returns the statements it cost.
 async fn run_the_consolidated_write(db: &DatabaseManager, uuid7: &[u8]) -> usize {
     let before = db.take_round_trips();
-    db.insert_event(uuid7, 1, "twitch", &[], "raw text", "", "{}").await.unwrap();
+    db.insert_event(uuid7, 1, "twitch", &[], "raw text", "", "{}")
+        .await
+        .unwrap();
     db.set_user_uuid(uuid7, "user-1").await.unwrap();
     db.write_terminal_outcome(
         uuid7,
@@ -273,17 +332,30 @@ async fn the_consolidated_write_lands_the_row_the_per_stage_writes_landed() {
     assert_eq!(new["user_uuid7"], "user-1");
     // Audio content type rides in `flags`; two stages rendered audio, so the
     // string carries BOTH markers, in the order they were appended.
-    assert_eq!(old["flags"], "{},audio_type=audio/mpeg,audio_type=audio/wav");
+    assert_eq!(
+        old["flags"],
+        "{},audio_type=audio/mpeg,audio_type=audio/wav"
+    );
     assert_eq!(new["flags"], old["flags"]);
     assert!(old["error_message"].is_null() && new["error_message"].is_null());
 
     // Every stage column is populated on both, in order.
     for (r, label) in [(&old, "per-stage writes"), (&new, "consolidated write")] {
-        let pre = r["pre_process_completed_at"].as_i64().expect("pre_process_completed_at");
-        let inp = r["in_process_completed_at"].as_i64().expect("in_process_completed_at");
-        let post = r["post_process_completed_at"].as_i64().expect("post_process_completed_at");
+        let pre = r["pre_process_completed_at"]
+            .as_i64()
+            .expect("pre_process_completed_at");
+        let inp = r["in_process_completed_at"]
+            .as_i64()
+            .expect("in_process_completed_at");
+        let post = r["post_process_completed_at"]
+            .as_i64()
+            .expect("post_process_completed_at");
         let persisted = r["persisted_at"].as_i64().expect("persisted_at");
-        assert!(pre <= inp && inp <= post && post <= persisted, "{}: stage timestamps are out of pipeline order", label);
+        assert!(
+            pre <= inp && inp <= post && post <= persisted,
+            "{}: stage timestamps are out of pipeline order",
+            label
+        );
     }
     // The two in-memory stamps must survive the write as captured, not be
     // replaced by the write's own clock.
@@ -295,8 +367,14 @@ async fn the_consolidated_write_lands_the_row_the_per_stage_writes_landed() {
     // the FIRST marker and the bytes are the LAST write: that mismatch is the
     // per-stage model's, and the consolidation reproduces it rather than
     // "fixing" it, because the point of this test is that the row is unchanged.
-    assert_eq!(db.get_audio(&old_uuid).await.unwrap(), db.get_audio(&new_uuid).await.unwrap());
-    assert_eq!(db.get_audio(&new_uuid).await.unwrap(), Some(("audio/mpeg".to_string(), b"IN-AUDIO".to_vec())));
+    assert_eq!(
+        db.get_audio(&old_uuid).await.unwrap(),
+        db.get_audio(&new_uuid).await.unwrap()
+    );
+    assert_eq!(
+        db.get_audio(&new_uuid).await.unwrap(),
+        Some(("audio/mpeg".to_string(), b"IN-AUDIO".to_vec()))
+    );
 }
 
 /// The point of the exercise, measured rather than asserted: the same message
@@ -312,9 +390,20 @@ async fn the_consolidated_write_replaces_fourteen_database_calls_with_three() {
     let old_calls = run_the_old_per_stage_writes(&db, b"count-old-path-000001".as_ref()).await;
     let new_calls = run_the_consolidated_write(&db, b"count-new-path-000001".as_ref()).await;
 
-    assert_eq!(old_calls, OLD_CALLS, "the per-stage write sequence changed shape");
-    assert_eq!(new_calls, NEW_CALLS, "the consolidated path must be the ingest writes plus ONE terminal write");
-    assert!(new_calls * 4 < old_calls, "expected a large reduction, got {} -> {}", old_calls, new_calls);
+    assert_eq!(
+        old_calls, OLD_CALLS,
+        "the per-stage write sequence changed shape"
+    );
+    assert_eq!(
+        new_calls, NEW_CALLS,
+        "the consolidated path must be the ingest writes plus ONE terminal write"
+    );
+    assert!(
+        new_calls * 4 < old_calls,
+        "expected a large reduction, got {} -> {}",
+        old_calls,
+        new_calls
+    );
 }
 
 /// A write with no audio must not wipe the audio the row already has: the
@@ -323,7 +412,9 @@ async fn the_consolidated_write_replaces_fourteen_database_calls_with_three() {
 async fn a_final_write_with_no_audio_leaves_existing_audio_intact() {
     let db = test_db().await;
     let uuid = b"no-clobber-audio-0000001".to_vec();
-    db.insert_event(&uuid, 1, "twitch", &[], "raw", "", "{}").await.unwrap();
+    db.insert_event(&uuid, 1, "twitch", &[], "raw", "", "{}")
+        .await
+        .unwrap();
     db.set_audio(&uuid, "audio/wav", b"KEEP-ME").await.unwrap();
 
     db.write_terminal_outcome(
@@ -337,15 +428,23 @@ async fn a_final_write_with_no_audio_leaves_existing_audio_intact() {
     .await
     .unwrap();
 
-    assert_eq!(db.get_audio(&uuid).await.unwrap(), Some(("audio/wav".to_string(), b"KEEP-ME".to_vec())));
+    assert_eq!(
+        db.get_audio(&uuid).await.unwrap(),
+        Some(("audio/wav".to_string(), b"KEEP-ME".to_vec()))
+    );
     let r = row(&db, &uuid).await;
-    assert_eq!(r["flags"], "{},audio_type=audio/wav", "the audio marker must not be rewritten either");
+    assert_eq!(
+        r["flags"], "{},audio_type=audio/wav",
+        "the audio marker must not be rewritten either"
+    );
     assert_eq!(r["processed_message"], "no audio in this run");
 
     // Same for a row whose flags column is empty: the marker is appended with no
     // leading separator, exactly as `set_audio` did.
     let bare = b"no-clobber-bare-000000001".to_vec();
-    db.insert_event(&bare, 1, "twitch", &[], "raw", "", "").await.unwrap();
+    db.insert_event(&bare, 1, "twitch", &[], "raw", "", "")
+        .await
+        .unwrap();
     db.write_terminal_outcome(
         &bare,
         &PipelineOutcome::Complete,
@@ -358,7 +457,10 @@ async fn a_final_write_with_no_audio_leaves_existing_audio_intact() {
     .await
     .unwrap();
     assert_eq!(row(&db, &bare).await["flags"], "audio_type=audio/mpeg");
-    assert_eq!(db.get_audio(&bare).await.unwrap(), Some(("audio/mpeg".to_string(), b"BYTES".to_vec())));
+    assert_eq!(
+        db.get_audio(&bare).await.unwrap(),
+        Some(("audio/mpeg".to_string(), b"BYTES".to_vec()))
+    );
 }
 
 /// Every terminal outcome lands its own status — and only a completed message
@@ -385,7 +487,9 @@ async fn each_terminal_outcome_lands_its_own_status() {
 
     for (uuid, outcome) in cases {
         let uuid = uuid.as_bytes().to_vec();
-        db.insert_event(&uuid, 1, "twitch", &[], "raw", "", "{}").await.unwrap();
+        db.insert_event(&uuid, 1, "twitch", &[], "raw", "", "{}")
+            .await
+            .unwrap();
         // Hold first for the AuditHeld case: a row that is already held stays
         // held, and the accumulated result still lands on it.
         if matches!(outcome, PipelineOutcome::AuditHeld) {
@@ -414,8 +518,14 @@ async fn each_terminal_outcome_lands_its_own_status() {
         };
         assert_eq!(r["pipeline_status"], expected_status, "{:?}", outcome);
         if completed {
-            assert!(r["post_process_completed_at"].is_number(), "a completed message must record post_process_completed_at");
-            assert!(r["persisted_at"].is_number(), "a completed message must record persisted_at");
+            assert!(
+                r["post_process_completed_at"].is_number(),
+                "a completed message must record post_process_completed_at"
+            );
+            assert!(
+                r["persisted_at"].is_number(),
+                "a completed message must record persisted_at"
+            );
         } else {
             assert!(
                 r["post_process_completed_at"].is_null() && r["persisted_at"].is_null(),
@@ -430,7 +540,9 @@ async fn each_terminal_outcome_lands_its_own_status() {
         assert_eq!(r["pre_process_completed_at"], 1, "{:?}", outcome);
         assert_eq!(r["in_process_completed_at"], 2, "{:?}", outcome);
         match &outcome {
-            PipelineOutcome::Failed(e) | PipelineOutcome::Dropped(e) => assert_eq!(r["error_message"], *e),
+            PipelineOutcome::Failed(e) | PipelineOutcome::Dropped(e) => {
+                assert_eq!(r["error_message"], *e)
+            }
             _ => assert!(r["error_message"].is_null(), "{:?}", outcome),
         }
         if let PipelineOutcome::Audit(reason) = &outcome {
@@ -445,7 +557,9 @@ async fn each_terminal_outcome_lands_its_own_status() {
 async fn an_audit_held_row_is_never_flipped_to_complete() {
     let db = test_db().await;
     let uuid = b"audit-not-completed-001".to_vec();
-    db.insert_event(&uuid, 1, "twitch", &[], "raw", "", "{}").await.unwrap();
+    db.insert_event(&uuid, 1, "twitch", &[], "raw", "", "{}")
+        .await
+        .unwrap();
     db.mark_audit(&uuid, "needs a moderator").await.unwrap();
 
     // The pipeline finishing the message tries to complete it.
@@ -462,8 +576,14 @@ async fn an_audit_held_row_is_never_flipped_to_complete() {
     .unwrap();
 
     let r = row(&db, &uuid).await;
-    assert_eq!(r["pipeline_status"], "audit", "a held message must not be completed behind the operator's back");
-    assert_eq!(r["flags"], "needs a moderator", "the hold reason must survive");
+    assert_eq!(
+        r["pipeline_status"], "audit",
+        "a held message must not be completed behind the operator's back"
+    );
+    assert_eq!(
+        r["flags"], "needs a moderator",
+        "the hold reason must survive"
+    );
     assert!(
         r["persisted_at"].is_null(),
         "a held message is not persisted until a moderator releases it"
@@ -503,13 +623,28 @@ async fn the_processing_sweep_cannot_touch_a_row_the_pipeline_owns() {
     let db = test_db().await;
     let live = b"sweep-live-row-000000001".to_vec();
     let legacy = b"sweep-legacy-row-00000001".to_vec();
-    db.insert_event(&live, 1, "twitch", &[], "in flight", "", "{}").await.unwrap();
-    db.insert_event(&legacy, 1, "twitch", &[], "stranded by an old build", "", "{}").await.unwrap();
+    db.insert_event(&live, 1, "twitch", &[], "in flight", "", "{}")
+        .await
+        .unwrap();
+    db.insert_event(
+        &legacy,
+        1,
+        "twitch",
+        &[],
+        "stranded by an old build",
+        "",
+        "{}",
+    )
+    .await
+    .unwrap();
     // An in-flight message is 'queued' now (the pipeline writes no intermediate
     // status); only an older engine build could leave a row 'processing'.
     db.set_pipeline_status(&legacy, "processing").await.unwrap();
 
-    let n = db.mark_all_processing_as_failed("interrupted by engine restart").await.unwrap();
+    let n = db
+        .mark_all_processing_as_failed("interrupted by engine restart")
+        .await
+        .unwrap();
     assert!(n >= 1);
 
     // The stranded row is failed, with the reason.
@@ -519,9 +654,15 @@ async fn the_processing_sweep_cannot_touch_a_row_the_pipeline_owns() {
 
     // The row the current pipeline owns is untouched — and still drainable.
     let r = row(&db, &live).await;
-    assert_eq!(r["pipeline_status"], "queued", "the sweep must not fail a message the pipeline can still finish");
+    assert_eq!(
+        r["pipeline_status"], "queued",
+        "the sweep must not fail a message the pipeline can still finish"
+    );
     assert!(r["error_message"].is_null());
-    assert_eq!(db.get_queued_uuids().await.unwrap(), vec![String::from_utf8(live.clone()).unwrap()]);
+    assert_eq!(
+        db.get_queued_uuids().await.unwrap(),
+        vec![String::from_utf8(live.clone()).unwrap()]
+    );
     assert!(db.load_queued_message(&live).await.unwrap().is_some());
 }
 
@@ -532,12 +673,18 @@ async fn the_processing_sweep_cannot_touch_a_row_the_pipeline_owns() {
 async fn a_terminal_write_with_nothing_to_say_is_a_no_op() {
     let db = test_db().await;
     let uuid = b"empty-terminal-write-00001".to_vec();
-    db.insert_event(&uuid, 1, "twitch", &[], "raw", "", "{}").await.unwrap();
-    db.mark_audit(&uuid, "held").await.unwrap();
-
-    db.write_terminal_outcome(&uuid, &PipelineOutcome::AuditHeld, &PipelineResult::default())
+    db.insert_event(&uuid, 1, "twitch", &[], "raw", "", "{}")
         .await
         .unwrap();
+    db.mark_audit(&uuid, "held").await.unwrap();
+
+    db.write_terminal_outcome(
+        &uuid,
+        &PipelineOutcome::AuditHeld,
+        &PipelineResult::default(),
+    )
+    .await
+    .unwrap();
 
     let r = row(&db, &uuid).await;
     assert_eq!(r["pipeline_status"], "audit");
@@ -550,10 +697,31 @@ async fn query_timeline_filters_by_prefix() {
     let db = test_db().await;
     for i in 0..5 {
         let u = format!("q-uuid-{:026}", i).into_bytes();
-        db.insert_event(&u, 1, "test", &[], &format!("screening-flood-x {}", i), "", "{}").await.unwrap();
+        db.insert_event(
+            &u,
+            1,
+            "test",
+            &[],
+            &format!("screening-flood-x {}", i),
+            "",
+            "{}",
+        )
+        .await
+        .unwrap();
     }
     let json = db
-        .query_timeline(None, Some(1), Some("test"), None, None, Some("screening-flood-x"), None, None, 500, 0)
+        .query_timeline(
+            None,
+            Some(1),
+            Some("test"),
+            None,
+            None,
+            Some("screening-flood-x"),
+            None,
+            None,
+            500,
+            0,
+        )
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -580,7 +748,9 @@ async fn concurrent_reads_and_writes_do_not_panic_the_wal() {
     db.initialize().await.unwrap();
 
     let seed = uuid::Uuid::now_v7().as_bytes().to_vec();
-    db.insert_event(&seed, 1, "twitch", &[], "seed", "", "{}").await.unwrap();
+    db.insert_event(&seed, 1, "twitch", &[], "seed", "", "{}")
+        .await
+        .unwrap();
 
     let mut handles = Vec::new();
     for _ in 0..16u32 {
@@ -591,10 +761,14 @@ async fn concurrent_reads_and_writes_do_not_panic_the_wal() {
                 // The exact operations the engine runs from SEPARATE tasks: the
                 // stats read path, a timeline read, a write, and the WAL
                 // checkpoint — all on the one shared connection.
-                db.execute_query("SELECT COUNT(*) AS n FROM timeline_events").await.unwrap();
+                db.execute_query("SELECT COUNT(*) AS n FROM timeline_events")
+                    .await
+                    .unwrap();
                 db.get_event_as_json(&seed).await.unwrap();
                 let u = uuid::Uuid::now_v7().as_bytes().to_vec();
-                db.insert_event(&u, 1, "twitch", &[], "hi", "", "{}").await.unwrap();
+                db.insert_event(&u, 1, "twitch", &[], "hi", "", "{}")
+                    .await
+                    .unwrap();
                 db.checkpoint_wal().await;
             }
         }));
@@ -602,6 +776,132 @@ async fn concurrent_reads_and_writes_do_not_panic_the_wal() {
     for h in handles {
         h.await.expect("a concurrent DB read panicked the WAL");
     }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `SELECT` that is stepped once and abandoned leaks turso's single WAL read
+/// transaction; the next read then panics with "cannot start a new read tx
+/// without ending an existing one" and the connection stays wedged forever.
+/// Every partial-read method now drains its `Rows` to `Done`; this hammers them
+/// (plus the two checkpoint drains) interleaved with writes on a real file DB
+/// and asserts nothing panics across many iterations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_reads_are_drained_and_do_not_wedge_the_wal() {
+    let dir = std::env::temp_dir().join(format!("ckt-drain-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = DatabaseManager::new(DatabaseConfig {
+        local_path: dir.join("timeline.db"),
+        remote_url: None,
+        sync_interval_secs: 15,
+        local_target_mb: 50,
+    });
+    db.initialize().await.unwrap();
+
+    let seed = uuid::Uuid::now_v7().as_bytes().to_vec();
+    db.insert_event(&seed, 1, "twitch", &[], "seed", "", "{}")
+        .await
+        .unwrap();
+    db.set_audio(&seed, "audio/mpeg", b"AUDIO").await.unwrap();
+    db.mark_audit(&seed, "held").await.unwrap();
+
+    for _ in 0..200u32 {
+        // The methods that used to step once and leave the read tx open.
+        db.is_audited(&seed).await.unwrap();
+        db.get_event_as_json(&seed).await.unwrap();
+        db.get_audio(&seed).await.unwrap();
+        db.get_next_queued().await.unwrap();
+        db.get_unsynced_count().await.unwrap();
+        db.load_queued_message(&seed).await.unwrap();
+        db.get_audit_entry(&seed).await.unwrap();
+        // Interleaved write and the WAL checkpoint, both of which must not
+        // collide with an open read tx.
+        let u = uuid::Uuid::now_v7().as_bytes().to_vec();
+        db.insert_event(&u, 1, "twitch", &[], "hi", "", "{}")
+            .await
+            .unwrap();
+        db.checkpoint_wal().await;
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A turso panic used to leave the shared connection internally inconsistent,
+/// and because a tokio Mutex is not poisoned the same broken connection was
+/// reused — so EVERY later read panicked (the 8,920-message cascade). A panic
+/// while holding the lock must mark the connection for replacement; the next
+/// operation opens a fresh connection and works, with the committed rows intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panicking_operation_reopens_the_connection() {
+    let dir = std::env::temp_dir().join(format!("ckt-reopen-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = DatabaseManager::new(DatabaseConfig {
+        local_path: dir.join("timeline.db"),
+        remote_url: None,
+        sync_interval_secs: 15,
+        local_target_mb: 50,
+    });
+    db.initialize().await.unwrap();
+
+    let uuid = uuid::Uuid::now_v7().as_bytes().to_vec();
+    db.insert_event(&uuid, 1, "twitch", &[], "survives", "!cmd", "{}")
+        .await
+        .unwrap();
+
+    // Simulate a turso panic mid-query: panic while holding the DB lock.
+    let panicking = db.clone();
+    let join = tokio::spawn(async move { panicking.force_panic_while_locked().await }).await;
+    assert!(join.is_err(), "the spawned operation was expected to panic");
+
+    // The next operation must reopen a fresh connection rather than reuse the
+    // poisoned one, and the committed row must still be there.
+    let json = db
+        .get_event_as_json(&uuid)
+        .await
+        .unwrap()
+        .expect("the row must survive a reopen");
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["raw_message"], "survives");
+    assert_eq!(v["command"], "!cmd");
+
+    // Writes work again too.
+    let u2 = uuid::Uuid::now_v7().as_bytes().to_vec();
+    db.insert_event(&u2, 1, "twitch", &[], "after", "", "{}")
+        .await
+        .unwrap();
+    assert!(db.get_event_as_json(&u2).await.unwrap().is_some());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `reopen_local` itself must leave a working connection behind: it is the
+/// recovery hook the panic path calls, and it must not drop the DB contents.
+#[tokio::test]
+async fn reopen_local_produces_a_working_connection() {
+    let dir = std::env::temp_dir().join(format!("ckt-reopenlocal-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = DatabaseManager::new(DatabaseConfig {
+        local_path: dir.join("timeline.db"),
+        remote_url: None,
+        sync_interval_secs: 15,
+        local_target_mb: 50,
+    });
+    db.initialize().await.unwrap();
+
+    let uuid = uuid::Uuid::now_v7().as_bytes().to_vec();
+    db.insert_event(&uuid, 1, "twitch", &[], "kept", "", "{}")
+        .await
+        .unwrap();
+
+    db.reopen_local().await.unwrap();
+    assert!(db.is_initialized().await);
+    let json = db
+        .get_event_as_json(&uuid)
+        .await
+        .unwrap()
+        .expect("the row must survive a reopen");
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["raw_message"], "kept");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

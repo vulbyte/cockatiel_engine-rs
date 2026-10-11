@@ -60,7 +60,10 @@ fn default_chart_path() -> PathBuf {
     // The engine runs with CWD = the engine submodule dir; the chart is one
     // level up at the repo root. `COCKATIEL_RANK_CHART` overrides it (the TUI
     // passes the absolute path so it works regardless of launch dir).
-    if let Some(p) = std::env::var("COCKATIEL_RANK_CHART").ok().filter(|p| !p.is_empty()) {
+    if let Some(p) = std::env::var("COCKATIEL_RANK_CHART")
+        .ok()
+        .filter(|p| !p.is_empty())
+    {
         return PathBuf::from(p);
     }
     match std::env::current_dir() {
@@ -162,11 +165,13 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "coal", "copper", "bronze", "silver", "gold", "sapphire",
-                "emerald", "ruby", "diamond", "opal"
+                "coal", "copper", "bronze", "silver", "gold", "sapphire", "emerald", "ruby",
+                "diamond", "opal"
             ]
         );
-        assert_eq!(c.tiers.iter().map(|t| t.min).collect::<Vec<f32>>(),
-            vec![0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]);
+        assert_eq!(
+            c.tiers.iter().map(|t| t.min).collect::<Vec<f32>>(),
+            vec![0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+        );
     }
 }

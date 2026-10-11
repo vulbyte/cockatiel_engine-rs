@@ -5,21 +5,30 @@
 //! outright. `classify_query` never falls through to SQL, and the wire
 //! `QueryOp` enum has no SQL operation.
 
-use crate::queries::{QueryRoute, classify_query, route_from_op};
 use crate::cockatiel_protobuf::QueryOp;
+use crate::queries::{QueryRoute, classify_query, route_from_op};
 
 #[test]
 fn unknown_query_ids_are_denied_not_executed() {
     assert!(
-        matches!(classify_query("DROP TABLE timeline_events"), QueryRoute::Unsupported),
+        matches!(
+            classify_query("DROP TABLE timeline_events"),
+            QueryRoute::Unsupported
+        ),
         "a DROP must be denied, never run"
     );
     assert!(
-        matches!(classify_query("SELECT * FROM timeline_events"), QueryRoute::Unsupported),
+        matches!(
+            classify_query("SELECT * FROM timeline_events"),
+            QueryRoute::Unsupported
+        ),
         "even a SELECT is denied — there is no raw-SQL fallback"
     );
     assert!(
-        matches!(classify_query("totally_made_up_query"), QueryRoute::Unsupported),
+        matches!(
+            classify_query("totally_made_up_query"),
+            QueryRoute::Unsupported
+        ),
         "an unknown name is denied, not guessed as SQL"
     );
 }
@@ -27,12 +36,24 @@ fn unknown_query_ids_are_denied_not_executed() {
 #[test]
 fn named_ops_still_classify() {
     assert!(matches!(classify_query("db_status"), QueryRoute::DbStatus));
-    assert!(matches!(classify_query("module_list"), QueryRoute::ModuleList));
+    assert!(matches!(
+        classify_query("module_list"),
+        QueryRoute::ModuleList
+    ));
     assert!(matches!(classify_query("stats"), QueryRoute::Stats));
-    assert!(matches!(classify_query("audit_list"), QueryRoute::AuditList));
-    assert!(matches!(classify_query("channel_viewers"), QueryRoute::ChannelViewers));
+    assert!(matches!(
+        classify_query("audit_list"),
+        QueryRoute::AuditList
+    ));
+    assert!(matches!(
+        classify_query("channel_viewers"),
+        QueryRoute::ChannelViewers
+    ));
     assert!(matches!(classify_query("mod_ban"), QueryRoute::ModFamily));
-    assert!(matches!(classify_query("userdb_get_user"), QueryRoute::UserdbFamily));
+    assert!(matches!(
+        classify_query("userdb_get_user"),
+        QueryRoute::UserdbFamily
+    ));
 }
 
 #[test]

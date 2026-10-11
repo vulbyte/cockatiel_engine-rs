@@ -28,8 +28,7 @@ fn lib_dir() -> PathBuf {
 
 fn read_proto(name: &str) -> String {
     let path = lib_dir().join(name);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
 fn strip_comments(src: &str) -> String {
@@ -90,7 +89,10 @@ fn message_bodies(src: &str) -> BTreeMap<String, String> {
             continue;
         }
         let brace = name_end + (src[name_end..].len() - after.len());
-        out.insert(src[name_start..name_end].to_string(), body_after(src, brace).to_string());
+        out.insert(
+            src[name_start..name_end].to_string(),
+            body_after(src, brace).to_string(),
+        );
         i = brace + 1;
     }
     out
@@ -151,10 +153,26 @@ fn load() -> Unified {
     let src = strip_comments(&read_proto("cockatiel_protobuf.proto"));
     let bodies = message_bodies(&src);
     Unified {
-        for_engine: oneof_payloads(bodies.get("ContainerForEngine").expect("ContainerForEngine")),
-        for_module: oneof_payloads(bodies.get("ContainerForModule").expect("ContainerForModule")),
-        engine_reserved: reserved_tags(bodies.get("ContainerForEngine").expect("ContainerForEngine")),
-        module_reserved: reserved_tags(bodies.get("ContainerForModule").expect("ContainerForModule")),
+        for_engine: oneof_payloads(
+            bodies
+                .get("ContainerForEngine")
+                .expect("ContainerForEngine"),
+        ),
+        for_module: oneof_payloads(
+            bodies
+                .get("ContainerForModule")
+                .expect("ContainerForModule"),
+        ),
+        engine_reserved: reserved_tags(
+            bodies
+                .get("ContainerForEngine")
+                .expect("ContainerForEngine"),
+        ),
+        module_reserved: reserved_tags(
+            bodies
+                .get("ContainerForModule")
+                .expect("ContainerForModule"),
+        ),
         bodies,
     }
 }
@@ -204,7 +222,15 @@ fn both_containers_carry_the_shared_payloads() {
     let module: BTreeSet<&str> = p.for_module.values().map(|s| s.as_str()).collect();
 
     // Payloads that flow in BOTH directions.
-    for shared in ["Ban", "Commands", "Log", "Err", "SendToPlatforms", "Prompt", "PromptResponse"] {
+    for shared in [
+        "Ban",
+        "Commands",
+        "Log",
+        "Err",
+        "SendToPlatforms",
+        "Prompt",
+        "PromptResponse",
+    ] {
         assert!(
             engine.contains(shared),
             "ContainerForEngine is missing the shared payload {shared}"
@@ -217,7 +243,11 @@ fn both_containers_carry_the_shared_payloads() {
 
     // The pipeline stage is the message type: all three stage messages travel
     // engine -> module, and their ack-with-result echoes travel module -> engine.
-    for stage in ["MessagePreProcess", "MessageInProcess", "MessagePostProcess"] {
+    for stage in [
+        "MessagePreProcess",
+        "MessageInProcess",
+        "MessagePostProcess",
+    ] {
         assert!(
             module.contains(stage),
             "{stage} is not engine -> module, so a message cannot advance"
@@ -243,7 +273,13 @@ fn direction_invalid_payloads_are_reserved() {
     let p = load();
 
     // Engine -> module only: the module must not be able to send them.
-    let module_only = ["AuthNew", "ConnectionRequestReturn", "Shutdown", "TimelineEvent", "UserData"];
+    let module_only = [
+        "AuthNew",
+        "ConnectionRequestReturn",
+        "Shutdown",
+        "TimelineEvent",
+        "UserData",
+    ];
     for payload in module_only {
         assert!(
             p.for_engine.values().all(|t| t != payload),
@@ -252,7 +288,13 @@ fn direction_invalid_payloads_are_reserved() {
     }
 
     // Module -> engine only: the engine must not offer them to a module.
-    let engine_only = ["ConnectionRequest", "Command", "MessageAck", "DatabaseQuery", "ModuleControl"];
+    let engine_only = [
+        "ConnectionRequest",
+        "Command",
+        "MessageAck",
+        "DatabaseQuery",
+        "ModuleControl",
+    ];
     for payload in engine_only {
         assert!(
             p.for_module.values().all(|t| t != payload),
@@ -317,11 +359,17 @@ fn the_pipeline_stage_is_the_message_type() {
 fn legacy_database_query_is_still_carried_pending_phase_2() {
     let p = load();
     assert!(
-        p.for_engine.get(&23).map(|t| t == "DatabaseQuery").unwrap_or(false),
+        p.for_engine
+            .get(&23)
+            .map(|t| t == "DatabaseQuery")
+            .unwrap_or(false),
         "ContainerForEngine tag 23 must carry DatabaseQuery during Phase 1"
     );
     assert!(
-        p.for_module.get(&24).map(|t| t == "DatabaseQueryResult").unwrap_or(false),
+        p.for_module
+            .get(&24)
+            .map(|t| t == "DatabaseQueryResult")
+            .unwrap_or(false),
         "ContainerForModule tag 24 must carry DatabaseQueryResult during Phase 1"
     );
 }
@@ -331,19 +379,31 @@ fn legacy_database_query_is_still_carried_pending_phase_2() {
 fn the_typed_surface_is_on_the_wire() {
     let p = load();
     assert!(
-        p.for_engine.get(&35).map(|t| t == "QueryRequest").unwrap_or(false),
+        p.for_engine
+            .get(&35)
+            .map(|t| t == "QueryRequest")
+            .unwrap_or(false),
         "ContainerForEngine tag 35 must carry QueryRequest"
     );
     assert!(
-        p.for_module.get(&35).map(|t| t == "QueryResponse").unwrap_or(false),
+        p.for_module
+            .get(&35)
+            .map(|t| t == "QueryResponse")
+            .unwrap_or(false),
         "ContainerForModule tag 35 must carry QueryResponse"
     );
     assert!(
-        p.for_engine.get(&34).map(|t| t == "TimelineQuery").unwrap_or(false),
+        p.for_engine
+            .get(&34)
+            .map(|t| t == "TimelineQuery")
+            .unwrap_or(false),
         "ContainerForEngine tag 34 must carry TimelineQuery"
     );
     assert!(
-        p.for_module.get(&34).map(|t| t == "TimelineQueryResult").unwrap_or(false),
+        p.for_module
+            .get(&34)
+            .map(|t| t == "TimelineQueryResult")
+            .unwrap_or(false),
         "ContainerForModule tag 34 must carry TimelineQueryResult"
     );
 }
@@ -352,7 +412,13 @@ fn the_typed_surface_is_on_the_wire() {
 #[test]
 fn the_user_database_lives_in_the_shared_spec() {
     let p = load();
-    for name in ["User", "ChannelRef", "RatingHistoryEntry", "UserDbRequest", "UserDbResponse"] {
+    for name in [
+        "User",
+        "ChannelRef",
+        "RatingHistoryEntry",
+        "UserDbRequest",
+        "UserDbResponse",
+    ] {
         assert!(
             p.bodies.contains_key(name),
             "the unified spec is missing {name}"

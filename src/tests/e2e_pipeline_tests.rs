@@ -147,7 +147,10 @@ async fn an_adapter_message_reaches_every_module_in_every_stage_and_completes_cl
     // ── The row is complete, with no error, and the processed text landed ──
     let r = row(&db, &uuid7).await;
     assert_eq!(r["pipeline_status"], "complete", "row: {r:?}");
-    assert!(r["error_message"].is_null(), "no error may be recorded: {r:?}");
+    assert!(
+        r["error_message"].is_null(),
+        "no error may be recorded: {r:?}"
+    );
     assert_eq!(r["raw_message"], "hello world");
     assert_eq!(r["user_uuid7"], "user-1");
     assert_eq!(r["processed_message"], "hello world!");
@@ -234,7 +237,11 @@ async fn a_burst_reaches_every_module_once_per_message_and_all_complete() {
     }
     // Every module drained, nothing left pending.
     for m in all_modules() {
-        assert!(nothing_left(rx.get_mut(m).unwrap()), "'{}' has leftovers", m);
+        assert!(
+            nothing_left(rx.get_mut(m).unwrap()),
+            "'{}' has leftovers",
+            m
+        );
     }
     assert!(orchestrator.pipeline_states.lock().await.is_empty());
 }

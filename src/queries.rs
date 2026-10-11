@@ -58,17 +58,29 @@ pub(crate) struct QueryOutcome {
 
 impl QueryOutcome {
     fn success(blob: Vec<u8>) -> Self {
-        Self { success: true, result_blob: blob, error: String::new() }
+        Self {
+            success: true,
+            result_blob: blob,
+            error: String::new(),
+        }
     }
 
     fn denied(error: impl Into<String>) -> Self {
-        Self { success: false, result_blob: Vec::new(), error: error.into() }
+        Self {
+            success: false,
+            result_blob: Vec::new(),
+            error: error.into(),
+        }
     }
 }
 
 impl From<(bool, Vec<u8>, String)> for QueryOutcome {
     fn from((success, result_blob, error): (bool, Vec<u8>, String)) -> Self {
-        Self { success, result_blob, error }
+        Self {
+            success,
+            result_blob,
+            error,
+        }
     }
 }
 
@@ -364,7 +376,6 @@ pub(crate) enum QueryRoute {
     Unsupported,
 }
 
-
 /// The routing decision, split out of the dispatch chain so the branch set is
 /// assertable.
 ///
@@ -457,8 +468,9 @@ fn is_stream_adapter(caller: &str) -> bool {
 
 pub(crate) fn caller_gate(route: QueryRoute, caller: &str) -> Option<&'static str> {
     match route {
-        QueryRoute::TestRun => (!is_control_surface(caller))
-            .then_some("Test runner access denied: not the TUI"),
+        QueryRoute::TestRun => {
+            (!is_control_surface(caller)).then_some("Test runner access denied: not the TUI")
+        }
         QueryRoute::TestProbe => (!is_control_surface(caller) && !is_test_runner(caller))
             .then_some("test_probe denied: not the TUI/test-runner"),
         QueryRoute::PipelineSetPaused => {
@@ -481,14 +493,10 @@ pub(crate) fn caller_gate(route: QueryRoute, caller: &str) -> Option<&'static st
             (!is_control_surface(caller) && caller != "score-messages" && caller != "events")
                 .then_some("userdb_adjust_score denied: not the TUI, score-messages, or events")
         }
-        QueryRoute::ChatReply => {
-            (!is_control_surface(caller) && caller != "clip")
-                .then_some("chat_reply denied: not the clip module or the TUI")
-        }
-        QueryRoute::PredictionGetScore => {
-            (!is_control_surface(caller) && caller != "events")
-                .then_some("prediction_get_score denied: not the events module")
-        }
+        QueryRoute::ChatReply => (!is_control_surface(caller) && caller != "clip")
+            .then_some("chat_reply denied: not the clip module or the TUI"),
+        QueryRoute::PredictionGetScore => (!is_control_surface(caller) && caller != "events")
+            .then_some("prediction_get_score denied: not the events module"),
         QueryRoute::UserdbFamily => {
             (!is_control_surface(caller)).then_some("User database access denied: not the TUI")
         }
@@ -504,17 +512,13 @@ pub(crate) fn caller_gate(route: QueryRoute, caller: &str) -> Option<&'static st
         QueryRoute::StreamLeaderboard => {
             (!is_control_surface(caller)).then_some("stream_leaderboard denied: not the TUI")
         }
-        QueryRoute::StreamLeaderboardReport => {
-            (caller != "stream-leaderboard")
-                .then_some("leaderboard_report denied: not the stream-leaderboard module")
-        }
+        QueryRoute::StreamLeaderboardReport => (caller != "stream-leaderboard")
+            .then_some("leaderboard_report denied: not the stream-leaderboard module"),
         QueryRoute::StreamControl => {
             (!is_control_surface(caller)).then_some("stream_control denied: not the TUI")
         }
-        QueryRoute::StreamControlStatus => {
-            (!is_stream_adapter(caller))
-                .then_some("stream_control_status denied: not a platform adapter")
-        }
+        QueryRoute::StreamControlStatus => (!is_stream_adapter(caller))
+            .then_some("stream_control_status denied: not a platform adapter"),
         // There is no raw-SQL escape hatch and no unknown-query path: a query
         // the engine does not name is denied outright.
         QueryRoute::Unsupported => Some("query denied: no such operation"),
@@ -574,7 +578,10 @@ pub(crate) async fn send_query_response(
         Err(_) => {
             log_event_broadcast(
                 ctx.ui_state,
-                format!("[{}] dropped query response (outbound full)", ctx.module_name),
+                format!(
+                    "[{}] dropped query response (outbound full)",
+                    ctx.module_name
+                ),
             );
             false
         }
@@ -738,9 +745,7 @@ pub(crate) fn route_from_op(op: WireQueryOp) -> Option<QueryRoute> {
 /// families, set_credentials, pipeline pause, test_archive) that blob is the
 /// `params.json` escape; the rest ignore params entirely.
 fn sql_from_params(params: Option<&QueryParams>) -> String {
-    params
-        .map(|p| p.json.clone())
-        .unwrap_or_default()
+    params.map(|p| p.json.clone()).unwrap_or_default()
 }
 
 /// Answer one typed `QueryRequest` (the Phase-2 wire surface) and return the
@@ -858,7 +863,8 @@ async fn dispatch(
             for (name, discovered) in discovered_registry.lock().unwrap().iter() {
                 let (price, min_rank, authority) = live_gate(discovered);
                 let cred_values = credential_values_map(discovered);
-                let config_complete = is_config_complete(&discovered.manifest.credentials, &cred_values);
+                let config_complete =
+                    is_config_complete(&discovered.manifest.credentials, &cred_values);
                 let exposed_values = if expose_creds {
                     cred_values
                 } else {
@@ -889,9 +895,8 @@ async fn dispatch(
 
             // 2. Registered modules — persisted knowledge from modules.json
             for m in &registered {
-                let entry = entries
-                    .entry(m.name.clone())
-                    .or_insert_with(|| serde_json::json!({
+                let entry = entries.entry(m.name.clone()).or_insert_with(|| {
+                    serde_json::json!({
                         "name": m.name,
                         "uuid7": null,
                         "position": "unknown",
@@ -900,16 +905,22 @@ async fn dispatch(
                         "avg_ms": null,
                         "connected_at": null,
                         "shutdown_at": null,
-                    }));
+                    })
+                });
                 entry["uuid7"] = serde_json::json!(m.instance_uuid7);
-                entry["avg_ms"] = module_timings.get(m.name.as_str()).copied().map(|v| serde_json::json!(v)).unwrap_or(serde_json::Value::Null);
+                entry["avg_ms"] = module_timings
+                    .get(m.name.as_str())
+                    .copied()
+                    .map(|v| serde_json::json!(v))
+                    .unwrap_or(serde_json::Value::Null);
                 // Position comes from the CONFIG ordering lists, not the
                 // connect-time registration in modules.json — an operator stage
                 // move rewrites config.json and must be what a UI reports, even
                 // for a module that is not currently connected. Only fall back
                 // to the recorded position if the module is not in any list.
                 entry["position"] = serde_json::json!(
-                    module_position_from_config(&config, &m.name).unwrap_or_else(|| m.position.clone())
+                    module_position_from_config(&config, &m.name)
+                        .unwrap_or_else(|| m.position.clone())
                 );
                 entry["priority"] = serde_json::json!(m.priority);
             }
@@ -920,9 +931,8 @@ async fn dispatch(
             // as connected (that made UIs probe a dead module
             // and restart it).
             for s in sessions.iter().filter(|s| s.shutdown_at.is_none()) {
-                let entry = entries
-                    .entry(s.module_name.clone())
-                    .or_insert_with(|| serde_json::json!({
+                let entry = entries.entry(s.module_name.clone()).or_insert_with(|| {
+                    serde_json::json!({
                         "name": s.module_name,
                         "uuid7": null,
                         "position": "unknown",
@@ -931,10 +941,18 @@ async fn dispatch(
                         "avg_ms": null,
                         "connected_at": null,
                         "shutdown_at": null,
-                    }));
+                    })
+                });
                 entry["uuid7"] = serde_json::json!(s.instance_uuid7);
-                entry["avg_ms"] = module_timings.get(s.module_name.as_str()).copied().map(|v| serde_json::json!(v)).unwrap_or(serde_json::Value::Null);
-                entry["position"] = serde_json::json!(module_position_from_config(&config, &s.module_name).unwrap_or_else(|| s.position.clone()));
+                entry["avg_ms"] = module_timings
+                    .get(s.module_name.as_str())
+                    .copied()
+                    .map(|v| serde_json::json!(v))
+                    .unwrap_or(serde_json::Value::Null);
+                entry["position"] = serde_json::json!(
+                    module_position_from_config(&config, &s.module_name)
+                        .unwrap_or_else(|| s.position.clone())
+                );
                 entry["priority"] = serde_json::json!(s.priority);
                 entry["connected_at"] = serde_json::json!(s.connected_at);
                 entry["shutdown_at"] = serde_json::json!(s.shutdown_at);
@@ -957,7 +975,11 @@ async fn dispatch(
                             let (price, min_rank, authority) = live_gate(m);
                             (
                                 name.clone(),
-                                crate::pipeline::ModuleGate { authority, min_rank, price },
+                                crate::pipeline::ModuleGate {
+                                    authority,
+                                    min_rank,
+                                    price,
+                                },
                             )
                         })
                         .collect()
@@ -984,7 +1006,8 @@ async fn dispatch(
                 "port": config.port,
                 "pin": pin,
                 "timeline_database_location": config.timeline_database_location,
-            }).to_string();
+            })
+            .to_string();
             QueryOutcome::success(json.into_bytes())
         }
         QueryRoute::PipelineSetPaused => {
@@ -1014,7 +1037,10 @@ async fn dispatch(
                     orchestrator.pause().await
                 };
                 if changed {
-                    log_event_broadcast(ui_state, "[pipeline] paused by the control surface — messages are queued but nothing is dispatched");
+                    log_event_broadcast(
+                        ui_state,
+                        "[pipeline] paused by the control surface — messages are queued but nothing is dispatched",
+                    );
                 }
                 let json = serde_json::json!({
                     "paused": true,
@@ -1022,7 +1048,8 @@ async fn dispatch(
                     "held_messages": orchestrator.held_count().await,
                     "blocked_reason": blocked.map(|r| r.as_str()),
                     "resume_when_unblocked": orchestrator.will_resume_on_unblock().await,
-                }).to_string();
+                })
+                .to_string();
                 QueryOutcome::success(json.into_bytes())
             } else if let Some(reason) = blocked {
                 // A resume request while blocked does NOT open the gate (the
@@ -1041,14 +1068,18 @@ async fn dispatch(
                     "changed": false,
                     "blocked_reason": reason.as_str(),
                     "resume_when_unblocked": true,
-                }).to_string();
+                })
+                .to_string();
                 QueryOutcome::success(json.into_bytes())
             } else {
                 let outcome = orchestrator.resume().await;
                 if outcome.was_paused {
                     log_event_broadcast(
                         ui_state,
-                        format!("[pipeline] resumed by the control surface — releasing {} held message(s)", outcome.resumed_messages),
+                        format!(
+                            "[pipeline] resumed by the control surface — releasing {} held message(s)",
+                            outcome.resumed_messages
+                        ),
                     );
                 }
                 for error in &outcome.errors {
@@ -1061,11 +1092,14 @@ async fn dispatch(
                     "errors": outcome.errors,
                     "blocked_reason": serde_json::Value::Null,
                     "resume_when_unblocked": false,
-                }).to_string();
+                })
+                .to_string();
                 QueryOutcome::success(json.into_bytes())
             }
         }
-        QueryRoute::EngineShutdown => engine_shutdown(config_state, shutdown, ui_state, module_name),
+        QueryRoute::EngineShutdown => {
+            engine_shutdown(config_state, shutdown, ui_state, module_name)
+        }
         QueryRoute::TestRun => {
             // Compliance test runner — TUI-only gate, mirrors userdb.
             let engine_pin = crate::config::get_pin(config_state);
@@ -1082,7 +1116,8 @@ async fn dispatch(
         }
         QueryRoute::AuditList => {
             // List held-for-audit messages. TUI-only.
-            let payload: serde_json::Value = serde_json::from_str(sql).unwrap_or(serde_json::json!({}));
+            let payload: serde_json::Value =
+                serde_json::from_str(sql).unwrap_or(serde_json::json!({}));
             let limit = payload.get("limit").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
             let offset = payload.get("offset").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             match db.list_audit(limit, offset).await {
@@ -1095,7 +1130,8 @@ async fn dispatch(
         }
         QueryRoute::AuditApprove | QueryRoute::AuditReject => {
             // Approve (resubmit as normal) or reject an audited message. TUI-only.
-            let payload: serde_json::Value = serde_json::from_str(sql).unwrap_or(serde_json::json!({}));
+            let payload: serde_json::Value =
+                serde_json::from_str(sql).unwrap_or(serde_json::json!({}));
             let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
             if uuid7.is_empty() {
                 QueryOutcome::denied("audit action requires uuid7")
@@ -1103,7 +1139,8 @@ async fn dispatch(
                 let approve = route == QueryRoute::AuditApprove;
                 match db.release_audit(uuid7.as_bytes(), approve).await {
                     Ok(_) => {
-                        let json = serde_json::json!({ "uuid7": uuid7, "released": approve }).to_string();
+                        let json =
+                            serde_json::json!({ "uuid7": uuid7, "released": approve }).to_string();
                         QueryOutcome::success(json.into_bytes())
                     }
                     Err(e) => QueryOutcome::denied(format!("audit action failed: {}", e)),
@@ -1114,18 +1151,24 @@ async fn dispatch(
             // Mod commands from adapters: resolve the target user
             // by platform + handle, then apply the action. The
             // actor (human trigger) is verified first.
-            mod_virtual_query(user_db_client, query_id, sql, ui_state, module_name).await.into()
+            mod_virtual_query(user_db_client, query_id, sql, ui_state, module_name)
+                .await
+                .into()
         }
         QueryRoute::ChatCommend | QueryRoute::ChatReprimand => {
             // Chat-command ratings (commend/reprimand modules):
             // ANY verified user may rate another user (no mod
             // status required). The 24h reprimand cooldown is
             // enforced in the user-db rating_history.
-            chat_rating_virtual_query(user_db_client, query_id, sql, ui_state, module_name).await.into()
+            chat_rating_virtual_query(user_db_client, query_id, sql, ui_state, module_name)
+                .await
+                .into()
         }
         QueryRoute::ChatVerifyIdentity => {
             // Identity bootstrap / write-through — term-chat only.
-            chat_verify_identity_virtual_query(user_db_client, sql, ui_state, module_name).await.into()
+            chat_verify_identity_virtual_query(user_db_client, sql, ui_state, module_name)
+                .await
+                .into()
         }
         QueryRoute::ChatReply => {
             // Engine-originated platform reply on behalf of a module. The engine
@@ -1134,17 +1177,30 @@ async fn dispatch(
             // { "platform": "twitch", "channel_id": "...", "message": "..." }.
             let payload: serde_json::Value =
                 serde_json::from_str(sql).unwrap_or(serde_json::json!({}));
-            let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
-            let channel_id = payload.get("channel_id").and_then(|v| v.as_str()).unwrap_or("");
-            let message = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            let platform = payload
+                .get("platform")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let channel_id = payload
+                .get("channel_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let message = payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if platform.is_empty() || message.is_empty() {
                 QueryOutcome::denied("chat_reply requires platform and message")
             } else {
-                crate::engine_reply_to_platform(orchestrator, ui_state, platform, channel_id, message)
-                    .await;
-                QueryOutcome::success(
-                    serde_json::json!({ "sent": true }).to_string().into_bytes(),
+                crate::engine_reply_to_platform(
+                    orchestrator,
+                    ui_state,
+                    platform,
+                    channel_id,
+                    message,
                 )
+                .await;
+                QueryOutcome::success(serde_json::json!({ "sent": true }).to_string().into_bytes())
             }
         }
         QueryRoute::UserdbAdjustScore => {
@@ -1159,7 +1215,9 @@ async fn dispatch(
             // Read a user's current score BEFORE the predictions module
             // places a bet. uuid-only: the brain passes the actor's
             // `chat.user_uuid7` directly — no platform+handle resolution.
-            prediction_get_score_virtual_query(user_db_client, sql).await.into()
+            prediction_get_score_virtual_query(user_db_client, sql)
+                .await
+                .into()
         }
         QueryRoute::ChannelViewers => {
             // Read the engine's in-memory per-channel viewer/member counts.
@@ -1193,9 +1251,16 @@ async fn dispatch(
         QueryRoute::UserdbFamily => {
             // User database is engine-internal — only the TUI
             // control surface may access it. Modules are denied.
-            userdb_virtual_query(user_db_client, query_id, sql, ui_state, module_name, *peer_loopback)
-                .await
-                .into()
+            userdb_virtual_query(
+                user_db_client,
+                query_id,
+                sql,
+                ui_state,
+                module_name,
+                *peer_loopback,
+            )
+            .await
+            .into()
         }
         QueryRoute::SetCredentials => {
             // Writing credentials to another module's `.env` /
@@ -1207,10 +1272,12 @@ async fn dispatch(
             // NOTE: the `module_name` bound below SHADOWS the caller's name for
             // the rest of this branch — the log line and the "Unknown module"
             // error name the TARGET module, not the caller. Preserved as-is.
-            let mut result =
-                QueryOutcome::denied("Failed to parse set_credentials payload");
+            let mut result = QueryOutcome::denied("Failed to parse set_credentials payload");
             if let Ok(payload) = serde_json::from_str::<serde_json::Value>(sql) {
-                let module_name = payload.get("module_name").and_then(|v| v.as_str()).unwrap_or("");
+                let module_name = payload
+                    .get("module_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let values: HashMap<String, String> = payload
                     .get("values")
                     .and_then(|v| v.as_object())
@@ -1221,7 +1288,11 @@ async fn dispatch(
                     })
                     .unwrap_or_default();
 
-                let found = discovered_registry.lock().unwrap().get(module_name).cloned();
+                let found = discovered_registry
+                    .lock()
+                    .unwrap()
+                    .get(module_name)
+                    .cloned();
                 match found {
                     Some(module) => {
                         let fields = module.manifest.credentials.clone();
@@ -1229,7 +1300,13 @@ async fn dispatch(
                             Ok(()) => {
                                 match save_module_credentials(&module, &fields, &values) {
                                     Ok(()) => {
-                                        log_event_broadcast(ui_state, format!("[{}] Credentials updated for '{}'", module_name, module_name));
+                                        log_event_broadcast(
+                                            ui_state,
+                                            format!(
+                                                "[{}] Credentials updated for '{}'",
+                                                module_name, module_name
+                                            ),
+                                        );
                                         // The TUI supervisor owns process lifecycle — it restarts the
                                         // module after this query so the new config is picked up.
                                         result = QueryOutcome::success(serde_json::json!({"success": true, "message": format!("Credentials saved for '{}'", module_name)}).to_string().into_bytes());
@@ -1240,7 +1317,9 @@ async fn dispatch(
                             Err(e) => result = QueryOutcome::denied(e),
                         }
                     }
-                    None => result = QueryOutcome::denied(format!("Unknown module: {}", module_name)),
+                    None => {
+                        result = QueryOutcome::denied(format!("Unknown module: {}", module_name))
+                    }
                 }
             }
             result
@@ -1252,7 +1331,10 @@ async fn dispatch(
             // INSERTs through the SQL fallback.
             let payload: serde_json::Value =
                 serde_json::from_str(sql).unwrap_or(serde_json::json!({}));
-            let batch_uuid = payload.get("batch_uuid").and_then(|v| v.as_str()).unwrap_or("test");
+            let batch_uuid = payload
+                .get("batch_uuid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test");
             let mut inserted = 0u32;
             let mut error = String::new();
             if let Some(entries) = payload.get("entries").and_then(|v| v.as_array()) {
@@ -1262,7 +1344,12 @@ async fn dispatch(
                         continue;
                     }
                     match db
-                        .insert_archival_event("test", "test_archive", json, &format!("test-runner|{}", batch_uuid))
+                        .insert_archival_event(
+                            "test",
+                            "test_archive",
+                            json,
+                            &format!("test-runner|{}", batch_uuid),
+                        )
                         .await
                     {
                         Ok(()) => inserted += 1,
@@ -1277,7 +1364,10 @@ async fn dispatch(
                 let out = serde_json::json!({ "inserted": inserted }).to_string();
                 QueryOutcome::success(out.into_bytes())
             } else {
-                QueryOutcome::denied(format!("test_archive failed after {} inserts: {}", inserted, error))
+                QueryOutcome::denied(format!(
+                    "test_archive failed after {} inserts: {}",
+                    inserted, error
+                ))
             }
         }
         QueryRoute::Stats => {
@@ -1397,7 +1487,10 @@ fn engine_shutdown(
     if !get_config(config_state).shutdown_on_request {
         log_event_broadcast(
             ui_state,
-            format!("[{}] engine_shutdown refused: shutdown_on_request is false in config.json", requester),
+            format!(
+                "[{}] engine_shutdown refused: shutdown_on_request is false in config.json",
+                requester
+            ),
         );
         // The engine keeps running — an unconfigured engine is not killable
         // over the wire, and the refusal says which key would change that.
@@ -1406,7 +1499,10 @@ fn engine_shutdown(
 
     log_event_broadcast(
         ui_state,
-        format!("[{}] engine_shutdown: accepted — answering, then exiting", requester),
+        format!(
+            "[{}] engine_shutdown: accepted — answering, then exiting",
+            requester
+        ),
     );
     // Requested, not answered: the response for this very query is still to be
     // written. See the doc comment above for who closes that gap.
@@ -1417,8 +1513,7 @@ fn engine_shutdown(
 
 /// The refusal the engine returns when `shutdown_on_request` is false. Names
 /// the config key, because the caller's only useful move is to go and set it.
-const ENGINE_SHUTDOWN_DISABLED: &str =
-    "engine_shutdown denied: engine shutdown is disabled (shutdown_on_request is false in config.json)";
+const ENGINE_SHUTDOWN_DISABLED: &str = "engine_shutdown denied: engine shutdown is disabled (shutdown_on_request is false in config.json)";
 
 /// Handle a `test_run` virtual query from the TUI. The SQL field carries a JSON
 /// payload: { "suite": "chain"|"modules"|"all", "module": "name?", "iterations": n }.
@@ -1430,12 +1525,24 @@ async fn run_test_suite(
 ) -> (bool, Vec<u8>, String) {
     let payload: serde_json::Value = match serde_json::from_str(sql) {
         Ok(v) => v,
-        Err(e) => return (false, Vec::new(), format!("Invalid test_run payload: {}", e)),
+        Err(e) => {
+            return (
+                false,
+                Vec::new(),
+                format!("Invalid test_run payload: {}", e),
+            );
+        }
     };
 
-    let suite = payload.get("suite").and_then(|v| v.as_str()).unwrap_or("all");
+    let suite = payload
+        .get("suite")
+        .and_then(|v| v.as_str())
+        .unwrap_or("all");
     let module = payload.get("module").and_then(|v| v.as_str()).unwrap_or("");
-    let iterations = payload.get("iterations").and_then(|v| v.as_i64()).unwrap_or(100);
+    let iterations = payload
+        .get("iterations")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(100);
 
     let mut args = vec!["--suite".to_string(), suite.to_string()];
     if !module.is_empty() {
@@ -1448,12 +1555,22 @@ async fn run_test_suite(
 
     // Locate the runner binary relative to the engine's working directory.
     let engine_dir = env::current_dir().unwrap_or_default();
-    let runner_dir = engine_dir.parent().unwrap_or(&engine_dir).join("modules").join("cockatiel_module-test_runner-rs");
-    let runner_bin = runner_dir.join("target").join("release").join("cockatiel-test-runner");
+    let runner_dir = engine_dir
+        .parent()
+        .unwrap_or(&engine_dir)
+        .join("modules")
+        .join("cockatiel_module-test_runner-rs");
+    let runner_bin = runner_dir
+        .join("target")
+        .join("release")
+        .join("cockatiel-test-runner");
     let runner_bin = if runner_bin.exists() {
         runner_bin
     } else {
-        runner_dir.join("target").join("debug").join("cockatiel-test-runner")
+        runner_dir
+            .join("target")
+            .join("debug")
+            .join("cockatiel-test-runner")
     };
 
     if !runner_bin.exists() {
@@ -1464,7 +1581,13 @@ async fn run_test_suite(
         );
     }
 
-    log_event(ui_state, format!("[test] running suite '{}' (module: '{}', n={})", suite, module, iterations));
+    log_event(
+        ui_state,
+        format!(
+            "[test] running suite '{}' (module: '{}', n={})",
+            suite, module, iterations
+        ),
+    );
 
     let output = match tokio::time::timeout(
         Duration::from_secs(300),
@@ -1477,8 +1600,20 @@ async fn run_test_suite(
     .await
     {
         Ok(Ok(o)) => o,
-        Ok(Err(e)) => return (false, Vec::new(), format!("failed to spawn test runner: {}", e)),
-        Err(_) => return (false, Vec::new(), "test runner timed out after 300s".to_string()),
+        Ok(Err(e)) => {
+            return (
+                false,
+                Vec::new(),
+                format!("failed to spawn test runner: {}", e),
+            );
+        }
+        Err(_) => {
+            return (
+                false,
+                Vec::new(),
+                "test runner timed out after 300s".to_string(),
+            );
+        }
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -1493,7 +1628,11 @@ async fn run_test_suite(
     }
 
     let exit_ok = output.status.success();
-    (exit_ok, stdout.into_bytes(), if exit_ok { String::new() } else { stderr })
+    (
+        exit_ok,
+        stdout.into_bytes(),
+        if exit_ok { String::new() } else { stderr },
+    )
 }
 
 /// Handle a `userdb_*` virtual query from the TUI. The SQL field carries a JSON
@@ -1514,25 +1653,45 @@ async fn userdb_virtual_query(
 
     let outcome = match query_id {
         "userdb_add_user" => {
-            let username = payload.get("username").and_then(|v| v.as_str()).unwrap_or("");
+            let username = payload
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let channel = parse_channel_ref(payload.get("channel"));
             client.add_user(username, channel.as_ref()).await
         }
         "userdb_delete_user" => {
             let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let actor = payload.get("actor_uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let role = userdb_actor_perm(peer_loopback, payload.get("actor_role").and_then(|v| v.as_str()).unwrap_or("user"));
+            let actor = payload
+                .get("actor_uuid7")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let role = userdb_actor_perm(
+                peer_loopback,
+                payload
+                    .get("actor_role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("user"),
+            );
             client.delete_user(uuid7, actor, &role).await
         }
         "userdb_add_score" => {
             let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let delta = payload.get("delta").and_then(|v| v.as_i64()).map(|d| d as i32).unwrap_or(1);
+            let delta = payload
+                .get("delta")
+                .and_then(|v| v.as_i64())
+                .map(|d| d as i32)
+                .unwrap_or(1);
             let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
             client.add_score(uuid7, delta, reason).await
         }
         "userdb_remove_score" => {
             let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let delta = payload.get("delta").and_then(|v| v.as_i64()).map(|d| d as i32).unwrap_or(1);
+            let delta = payload
+                .get("delta")
+                .and_then(|v| v.as_i64())
+                .map(|d| d as i32)
+                .unwrap_or(1);
             let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
             client.remove_score(uuid7, delta, reason).await
         }
@@ -1543,37 +1702,78 @@ async fn userdb_virtual_query(
         }
         "userdb_remove_channel" => {
             let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
-            let channel_id = payload.get("channel_id").and_then(|v| v.as_str()).unwrap_or("");
+            let platform = payload
+                .get("platform")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let channel_id = payload
+                .get("channel_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             client.remove_channel(uuid7, platform, channel_id).await
         }
         "userdb_get_user" => {
             let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
-            let channel_id = payload.get("channel_id").and_then(|v| v.as_str()).unwrap_or("");
+            let platform = payload
+                .get("platform")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let channel_id = payload
+                .get("channel_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let handle = payload.get("handle").and_then(|v| v.as_str()).unwrap_or("");
             client.get_user(uuid7, platform, channel_id, handle).await
         }
         "userdb_list_users" => {
-            let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
+            let platform = payload
+                .get("platform")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let limit = payload.get("limit").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
             let offset = payload.get("offset").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             client.list_users(platform, limit, offset).await
         }
         "userdb_update_flags" => {
             let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let flags = payload.get("flags").and_then(|v| v.as_str()).unwrap_or("{}");
+            let flags = payload
+                .get("flags")
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}");
             client.update_flags(uuid7, flags).await
         }
         "userdb_set_roles" => {
             let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let actor = payload.get("actor_uuid7").and_then(|v| v.as_str()).unwrap_or("");
-            let role = userdb_actor_perm(peer_loopback, payload.get("actor_role").and_then(|v| v.as_str()).unwrap_or("user"));
-            let sponsor = payload.get("is_sponsor").and_then(|v| v.as_bool()).unwrap_or(false);
-            let mod_ = payload.get("is_moderator").and_then(|v| v.as_bool()).unwrap_or(false);
-            let admin = payload.get("is_admin").and_then(|v| v.as_bool()).unwrap_or(false);
-            let owner = payload.get("is_owner").and_then(|v| v.as_bool()).unwrap_or(false);
-            client.set_roles(uuid7, actor, &role, sponsor, mod_, admin, owner).await
+            let actor = payload
+                .get("actor_uuid7")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let role = userdb_actor_perm(
+                peer_loopback,
+                payload
+                    .get("actor_role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("user"),
+            );
+            let sponsor = payload
+                .get("is_sponsor")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mod_ = payload
+                .get("is_moderator")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let admin = payload
+                .get("is_admin")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let owner = payload
+                .get("is_owner")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            client
+                .set_roles(uuid7, actor, &role, sponsor, mod_, admin, owner)
+                .await
         }
         "userdb_read_user_value" => {
             let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
@@ -1616,14 +1816,18 @@ async fn userdb_virtual_query(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis().to_string())
                 .unwrap_or_default();
-            let flag = serde_json::json!({ "banned": true, "reason": reason, "at": now }).to_string();
+            let flag =
+                serde_json::json!({ "banned": true, "reason": reason, "at": now }).to_string();
             client.write_user_value(uuid7, "ban", &flag).await
         }
         "userdb_timeout" => {
             // { uuid7, duration_secs, reason? } → set timeout value with expiry
             let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
             let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-            let duration_secs = payload.get("duration_secs").and_then(|v| v.as_i64()).unwrap_or(300);
+            let duration_secs = payload
+                .get("duration_secs")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(300);
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
@@ -1633,16 +1837,31 @@ async fn userdb_virtual_query(
                 "timed_out": true,
                 "reason": reason,
                 "expires_at_ms": expires,
-            }).to_string();
+            })
+            .to_string();
             client.write_user_value(uuid7, "timeout", &flag).await
         }
-        _ => return (false, Vec::new(), format!("Unknown userdb query: {}", query_id)),
+        _ => {
+            return (
+                false,
+                Vec::new(),
+                format!("Unknown userdb query: {}", query_id),
+            );
+        }
     };
 
     match outcome {
         Ok(resp) => {
             let json = userdb_response_to_json(&resp);
-            (resp.success, json.into_bytes(), if resp.success { String::new() } else { resp.error.clone() })
+            (
+                resp.success,
+                json.into_bytes(),
+                if resp.success {
+                    String::new()
+                } else {
+                    resp.error.clone()
+                },
+            )
         }
         Err(e) => {
             log_event(ui_state, format!("[{}] UserDB error: {}", requester, e));
@@ -1666,15 +1885,31 @@ async fn userdb_adjust_score_virtual_query(
 ) -> (bool, Vec<u8>, String) {
     let payload: serde_json::Value = match serde_json::from_str(sql) {
         Ok(v) => v,
-        Err(e) => return (false, Vec::new(), format!("Invalid userdb_adjust_score payload: {}", e)),
+        Err(e) => {
+            return (
+                false,
+                Vec::new(),
+                format!("Invalid userdb_adjust_score payload: {}", e),
+            );
+        }
     };
 
-    let delta = payload.get("delta").and_then(|v| v.as_i64()).map(|d| d as i32).unwrap_or(0);
-    let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("userdb_adjust_score");
+    let delta = payload
+        .get("delta")
+        .and_then(|v| v.as_i64())
+        .map(|d| d as i32)
+        .unwrap_or(0);
+    let reason = payload
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("userdb_adjust_score");
 
     // Resolve the target user: prefer an explicit uuid7, else by (platform, handle).
     let explicit_uuid = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
-    let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
+    let platform = payload
+        .get("platform")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let handle = payload.get("handle").and_then(|v| v.as_str()).unwrap_or("");
 
     let uuid7 = if !explicit_uuid.is_empty() {
@@ -1685,15 +1920,33 @@ async fn userdb_adjust_score_virtual_query(
             Err(e) => return (false, Vec::new(), e),
         };
         if !resolved.success {
-            log_event(ui_state, format!("[{}] userdb_adjust_score: target '{}' not found on '{}'", requester, handle, platform));
-            return (false, Vec::new(), format!("User '{}' not found on {}", handle, platform));
+            log_event(
+                ui_state,
+                format!(
+                    "[{}] userdb_adjust_score: target '{}' not found on '{}'",
+                    requester, handle, platform
+                ),
+            );
+            return (
+                false,
+                Vec::new(),
+                format!("User '{}' not found on {}", handle, platform),
+            );
         }
         let Some(user) = resolved.user else {
-            return (false, Vec::new(), format!("User '{}' not found on {}", handle, platform));
+            return (
+                false,
+                Vec::new(),
+                format!("User '{}' not found on {}", handle, platform),
+            );
         };
         user.uuid7
     } else {
-        return (false, Vec::new(), "userdb_adjust_score requires uuid7 or platform + handle".to_string());
+        return (
+            false,
+            Vec::new(),
+            "userdb_adjust_score requires uuid7 or platform + handle".to_string(),
+        );
     };
 
     if delta == 0 {
@@ -1705,12 +1958,29 @@ async fn userdb_adjust_score_virtual_query(
 
     match outcome {
         Ok(resp) => {
-            log_event(ui_state, format!("[{}] userdb_adjust_score {} by {} -> {}", requester, delta, requester, uuid7));
+            log_event(
+                ui_state,
+                format!(
+                    "[{}] userdb_adjust_score {} by {} -> {}",
+                    requester, delta, requester, uuid7
+                ),
+            );
             let json = userdb_response_to_json(&resp);
-            (resp.success, json.into_bytes(), if resp.success { String::new() } else { resp.error.clone() })
+            (
+                resp.success,
+                json.into_bytes(),
+                if resp.success {
+                    String::new()
+                } else {
+                    resp.error.clone()
+                },
+            )
         }
         Err(e) => {
-            log_event(ui_state, format!("[{}] userdb_adjust_score error: {}", requester, e));
+            log_event(
+                ui_state,
+                format!("[{}] userdb_adjust_score error: {}", requester, e),
+            );
             (false, Vec::new(), e)
         }
     }
@@ -1729,12 +1999,22 @@ async fn prediction_get_score_virtual_query(
 ) -> (bool, Vec<u8>, String) {
     let payload: serde_json::Value = match serde_json::from_str(sql) {
         Ok(v) => v,
-        Err(e) => return (false, Vec::new(), format!("Invalid prediction_get_score payload: {}", e)),
+        Err(e) => {
+            return (
+                false,
+                Vec::new(),
+                format!("Invalid prediction_get_score payload: {}", e),
+            );
+        }
     };
 
     let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
     if uuid7.is_empty() {
-        return (false, Vec::new(), "prediction_get_score requires uuid7".to_string());
+        return (
+            false,
+            Vec::new(),
+            "prediction_get_score requires uuid7".to_string(),
+        );
     }
 
     let resolved = match client.get_user(uuid7, "", "", "").await {
@@ -1865,7 +2145,10 @@ fn stream_control_status_write(store: &SharedStreamSchedule, sql: &str) -> Query
     }
     let status = StreamControlStatus {
         platform: platform.clone(),
-        revision: payload.get("revision").and_then(|v| v.as_u64()).unwrap_or(0),
+        revision: payload
+            .get("revision")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
         ok: payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
         message: payload
             .get("message")
@@ -1928,47 +2211,81 @@ async fn mod_virtual_query(
             let resolved = if !actor_uuid.is_empty() {
                 client.get_user(actor_uuid, "", "", "").await
             } else {
-                client.get_user("", actor_platform, actor_handle, actor_handle).await
+                client
+                    .get_user("", actor_platform, actor_handle, actor_handle)
+                    .await
             };
             let resolved = match resolved {
                 Ok(r) => r,
                 Err(e) => return (false, Vec::new(), format!("Actor lookup failed: {}", e)),
             };
             let Some(user) = resolved.user else {
-                let actor_where = if actor_platform.is_empty() { String::new() } else { format!(" on {}", actor_platform) };
+                let actor_where = if actor_platform.is_empty() {
+                    String::new()
+                } else {
+                    format!(" on {}", actor_platform)
+                };
                 log_event(
                     ui_state,
-                    format!("[{}] {} denied: actor '{}{}' not found in user DB", requester, query_id, actor_handle, actor_where),
+                    format!(
+                        "[{}] {} denied: actor '{}{}' not found in user DB",
+                        requester, query_id, actor_handle, actor_where
+                    ),
                 );
-                return (false, Vec::new(), "permission denied: actor is not a moderator/admin/owner".to_string());
+                return (
+                    false,
+                    Vec::new(),
+                    "permission denied: actor is not a moderator/admin/owner".to_string(),
+                );
             };
             if !(user.is_moderator || user.is_admin || user.is_owner) {
                 log_event(
                     ui_state,
-                    format!("[{}] {} denied: actor '{}' lacks a mod/admin/owner role", requester, query_id, user.username),
+                    format!(
+                        "[{}] {} denied: actor '{}' lacks a mod/admin/owner role",
+                        requester, query_id, user.username
+                    ),
                 );
-                return (false, Vec::new(), "permission denied: actor is not a moderator/admin/owner".to_string());
+                return (
+                    false,
+                    Vec::new(),
+                    "permission denied: actor is not a moderator/admin/owner".to_string(),
+                );
             }
             (user.uuid7, user.username)
         }
         None => {
             // SYSTEM path: the automated scorer applies ±1 score deltas for
             // every message. No other mod_* action may run without an actor.
-            if !matches!(query_id, "mod_commend" | "mod_reprimand") || requester != "score-messages" {
+            if !matches!(query_id, "mod_commend" | "mod_reprimand") || requester != "score-messages"
+            {
                 log_event(
                     ui_state,
-                    format!("[{}] {} denied: missing actor (module '{}')", requester, query_id, requester),
+                    format!(
+                        "[{}] {} denied: missing actor (module '{}')",
+                        requester, query_id, requester
+                    ),
                 );
-                return (false, Vec::new(), "permission denied: missing actor".to_string());
+                return (
+                    false,
+                    Vec::new(),
+                    "permission denied: missing actor".to_string(),
+                );
             }
             (String::new(), format!("system:{}", requester))
         }
     };
 
-    let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
+    let platform = payload
+        .get("platform")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let handle = payload.get("handle").and_then(|v| v.as_str()).unwrap_or("");
     let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-    let duration_secs = payload.get("duration_secs").and_then(|v| v.as_i64()).unwrap_or(300);
+    let duration_secs = payload
+        .get("duration_secs")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(300);
 
     // Resolve the target user: prefer an explicit uuid7, else by (platform, handle).
     let explicit_uuid = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
@@ -1980,15 +2297,33 @@ async fn mod_virtual_query(
             Err(e) => return (false, Vec::new(), e),
         };
         if !resolved.success {
-            log_event(ui_state, format!("[{}] mod: target '{}' not found on '{}'", requester, handle, platform));
-            return (false, Vec::new(), format!("User '{}' not found on {}", handle, platform));
+            log_event(
+                ui_state,
+                format!(
+                    "[{}] mod: target '{}' not found on '{}'",
+                    requester, handle, platform
+                ),
+            );
+            return (
+                false,
+                Vec::new(),
+                format!("User '{}' not found on {}", handle, platform),
+            );
         }
         let Some(user) = resolved.user else {
-            return (false, Vec::new(), format!("User '{}' not found on {}", handle, platform));
+            return (
+                false,
+                Vec::new(),
+                format!("User '{}' not found on {}", handle, platform),
+            );
         };
         user.uuid7
     } else {
-        return (false, Vec::new(), "mod query requires uuid7 or platform + handle".to_string());
+        return (
+            false,
+            Vec::new(),
+            "mod query requires uuid7 or platform + handle".to_string(),
+        );
     };
 
     let outcome = match query_id {
@@ -1999,7 +2334,8 @@ async fn mod_virtual_query(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis().to_string())
                 .unwrap_or_default();
-            let flag = serde_json::json!({ "banned": true, "reason": reason, "at": now }).to_string();
+            let flag =
+                serde_json::json!({ "banned": true, "reason": reason, "at": now }).to_string();
             client.write_user_value(&uuid7, "ban", &flag).await
         }
         "mod_timeout" => {
@@ -2012,23 +2348,44 @@ async fn mod_virtual_query(
                 "timed_out": true,
                 "reason": reason,
                 "expires_at_ms": expires,
-            }).to_string();
+            })
+            .to_string();
             client.write_user_value(&uuid7, "timeout", &flag).await
         }
-        _ => return (false, Vec::new(), format!("Unknown mod query: {}", query_id)),
+        _ => {
+            return (
+                false,
+                Vec::new(),
+                format!("Unknown mod query: {}", query_id),
+            );
+        }
     };
 
     match outcome {
         Ok(resp) => {
             log_event(
                 ui_state,
-                format!("[{}] {} by {} -> {} (actor={})", requester, query_id, actor_handle, handle, actor_uuid7),
+                format!(
+                    "[{}] {} by {} -> {} (actor={})",
+                    requester, query_id, actor_handle, handle, actor_uuid7
+                ),
             );
             let json = userdb_response_to_json(&resp);
-            (resp.success, json.into_bytes(), if resp.success { String::new() } else { resp.error.clone() })
+            (
+                resp.success,
+                json.into_bytes(),
+                if resp.success {
+                    String::new()
+                } else {
+                    resp.error.clone()
+                },
+            )
         }
         Err(e) => {
-            log_event(ui_state, format!("[{}] Mod command error: {}", requester, e));
+            log_event(
+                ui_state,
+                format!("[{}] Mod command error: {}", requester, e),
+            );
             (false, Vec::new(), e)
         }
     }
@@ -2047,13 +2404,24 @@ async fn chat_rating_virtual_query(
     requester: &str,
 ) -> (bool, Vec<u8>, String) {
     // Gate to the two dedicated modules so no random module can fake ratings.
-    let expected = if query_id == "chat_commend" { "commend" } else { "reprimand" };
+    let expected = if query_id == "chat_commend" {
+        "commend"
+    } else {
+        "reprimand"
+    };
     if requester != expected {
         log_event(
             ui_state,
-            format!("[{}] {} denied: requester '{}' is not the '{}' module", requester, query_id, requester, expected),
+            format!(
+                "[{}] {} denied: requester '{}' is not the '{}' module",
+                requester, query_id, requester, expected
+            ),
         );
-        return (false, Vec::new(), format!("{} denied: not the '{}' module", query_id, expected));
+        return (
+            false,
+            Vec::new(),
+            format!("{} denied: not the '{}' module", query_id, expected),
+        );
     }
 
     let payload: serde_json::Value = match serde_json::from_str(sql) {
@@ -2072,20 +2440,40 @@ async fn chat_rating_virtual_query(
     let giver_uuid7 = if !actor_uuid.is_empty() {
         actor_uuid.to_string()
     } else if !actor_platform.is_empty() && !actor_handle.is_empty() {
-        match client.get_user("", actor_platform, actor_handle, actor_handle).await {
+        match client
+            .get_user("", actor_platform, actor_handle, actor_handle)
+            .await
+        {
             Ok(resp) if resp.success && resp.user.is_some() => resp.user.unwrap().uuid7,
             Ok(_) => {
-                log_event(ui_state, format!("[{}] rating denied: giver '{}' not found", requester, actor_handle));
-                return (false, Vec::new(), format!("giver '{}' not found on {}", actor_handle, actor_platform));
+                log_event(
+                    ui_state,
+                    format!(
+                        "[{}] rating denied: giver '{}' not found",
+                        requester, actor_handle
+                    ),
+                );
+                return (
+                    false,
+                    Vec::new(),
+                    format!("giver '{}' not found on {}", actor_handle, actor_platform),
+                );
             }
             Err(e) => return (false, Vec::new(), format!("giver lookup failed: {}", e)),
         }
     } else {
-        return (false, Vec::new(), "rating actor requires uuid7 or platform+handle".to_string());
+        return (
+            false,
+            Vec::new(),
+            "rating actor requires uuid7 or platform+handle".to_string(),
+        );
     };
 
     // Target (the recipient) — resolve by uuid7 or platform + handle.
-    let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
+    let platform = payload
+        .get("platform")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let handle = payload.get("handle").and_then(|v| v.as_str()).unwrap_or("");
     let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
     let explicit_uuid = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
@@ -2095,13 +2483,27 @@ async fn chat_rating_virtual_query(
         match client.get_user("", platform, handle, handle).await {
             Ok(resp) if resp.success && resp.user.is_some() => resp.user.unwrap().uuid7,
             Ok(_) => {
-                log_event(ui_state, format!("[{}] rating denied: target '{}' not found", requester, handle));
-                return (false, Vec::new(), format!("target '{}' not found on {}", handle, platform));
+                log_event(
+                    ui_state,
+                    format!(
+                        "[{}] rating denied: target '{}' not found",
+                        requester, handle
+                    ),
+                );
+                return (
+                    false,
+                    Vec::new(),
+                    format!("target '{}' not found on {}", handle, platform),
+                );
             }
             Err(e) => return (false, Vec::new(), format!("target lookup failed: {}", e)),
         }
     } else {
-        return (false, Vec::new(), "rating requires uuid7 or platform+handle".to_string());
+        return (
+            false,
+            Vec::new(),
+            "rating requires uuid7 or platform+handle".to_string(),
+        );
     };
 
     if recipient_uuid7 == giver_uuid7 {
@@ -2110,17 +2512,34 @@ async fn chat_rating_virtual_query(
 
     let is_commendation = query_id == "chat_commend";
     match client
-        .rate_user(&giver_uuid7, &recipient_uuid7, is_commendation, platform, handle, reason)
+        .rate_user(
+            &giver_uuid7,
+            &recipient_uuid7,
+            is_commendation,
+            platform,
+            handle,
+            reason,
+        )
         .await
     {
         Ok(resp) => {
             if resp.success {
-                log_event(ui_state, format!("[{}] {} applied to '{}'", requester, query_id, handle));
+                log_event(
+                    ui_state,
+                    format!("[{}] {} applied to '{}'", requester, query_id, handle),
+                );
                 (true, resp.message.into_bytes(), String::new())
             } else {
                 // Cooldown denial — surface the reason to the module (it logs it).
-                let err = if resp.error.is_empty() { resp.message } else { resp.error };
-                log_event(ui_state, format!("[{}] {} denied: {}", requester, query_id, err));
+                let err = if resp.error.is_empty() {
+                    resp.message
+                } else {
+                    resp.error
+                };
+                log_event(
+                    ui_state,
+                    format!("[{}] {} denied: {}", requester, query_id, err),
+                );
                 (false, Vec::new(), err)
             }
         }
@@ -2140,16 +2559,35 @@ async fn chat_verify_identity_virtual_query(
     module_name: &str,
 ) -> (bool, Vec<u8>, String) {
     if module_name != "term-chat" {
-        log_event(ui_state, format!("[{}] chat_verify_identity denied: not term-chat", module_name));
-        return (false, Vec::new(), "access denied: not term-chat".to_string());
+        log_event(
+            ui_state,
+            format!(
+                "[{}] chat_verify_identity denied: not term-chat",
+                module_name
+            ),
+        );
+        return (
+            false,
+            Vec::new(),
+            "access denied: not term-chat".to_string(),
+        );
     }
 
     let payload: serde_json::Value = match serde_json::from_str(sql) {
         Ok(v) => v,
-        Err(e) => return (false, Vec::new(), format!("Invalid chat_verify_identity payload: {}", e)),
+        Err(e) => {
+            return (
+                false,
+                Vec::new(),
+                format!("Invalid chat_verify_identity payload: {}", e),
+            );
+        }
     };
 
-    let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
+    let platform = payload
+        .get("platform")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let handle = payload.get("handle").and_then(|v| v.as_str()).unwrap_or("");
 
     // Create-or-find the user keyed by channel (the service already does
@@ -2162,7 +2600,10 @@ async fn chat_verify_identity_virtual_query(
     let add_resp = match client.add_user(handle, channel.as_ref()).await {
         Ok(r) => r,
         Err(e) => {
-            log_event(ui_state, format!("[{}] chat_verify_identity userdb error: {}", module_name, e));
+            log_event(
+                ui_state,
+                format!("[{}] chat_verify_identity userdb error: {}", module_name, e),
+            );
             return (false, Vec::new(), e);
         }
     };
@@ -2170,7 +2611,11 @@ async fn chat_verify_identity_virtual_query(
         return (false, Vec::new(), add_resp.error.clone());
     }
     let Some(user) = add_resp.user else {
-        return (false, Vec::new(), "chat_verify_identity: no user returned".to_string());
+        return (
+            false,
+            Vec::new(),
+            "chat_verify_identity: no user returned".to_string(),
+        );
     };
 
     // term-chat asserts its platform-verified roles as booleans under
@@ -2184,10 +2629,22 @@ async fn chat_verify_identity_virtual_query(
     let verified_roles = payload.get("verified_roles");
     let (is_sponsor, is_moderator, is_admin, is_owner) = match verified_roles {
         Some(verified) if verified.is_object() => (
-            verified.get("is_sponsor").and_then(|v| v.as_bool()).unwrap_or(false),
-            verified.get("is_moderator").and_then(|v| v.as_bool()).unwrap_or(false),
-            verified.get("is_admin").and_then(|v| v.as_bool()).unwrap_or(false),
-            verified.get("is_owner").and_then(|v| v.as_bool()).unwrap_or(false),
+            verified
+                .get("is_sponsor")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            verified
+                .get("is_moderator")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            verified
+                .get("is_admin")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            verified
+                .get("is_owner")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         ),
         _ => {
             log_event(
@@ -2197,17 +2654,36 @@ async fn chat_verify_identity_virtual_query(
                     module_name, handle, platform
                 ),
             );
-            (user.is_sponsor, user.is_moderator, user.is_admin, user.is_owner)
+            (
+                user.is_sponsor,
+                user.is_moderator,
+                user.is_admin,
+                user.is_owner,
+            )
         }
     };
 
     let set_resp = match client
-        .set_roles(&user.uuid7, "", "owner", is_sponsor, is_moderator, is_admin, is_owner)
+        .set_roles(
+            &user.uuid7,
+            "",
+            "owner",
+            is_sponsor,
+            is_moderator,
+            is_admin,
+            is_owner,
+        )
         .await
     {
         Ok(r) => r,
         Err(e) => {
-            log_event(ui_state, format!("[{}] chat_verify_identity set_roles error: {}", module_name, e));
+            log_event(
+                ui_state,
+                format!(
+                    "[{}] chat_verify_identity set_roles error: {}",
+                    module_name, e
+                ),
+            );
             return (false, Vec::new(), e);
         }
     };
@@ -2217,14 +2693,19 @@ async fn chat_verify_identity_virtual_query(
 
     log_event(
         ui_state,
-        format!("[{}] verified identity: {} on {} (mod={})", module_name, handle, platform, is_moderator),
+        format!(
+            "[{}] verified identity: {} on {} (mod={})",
+            module_name, handle, platform, is_moderator
+        ),
     );
 
     let json = userdb_response_to_json(&set_resp);
     (true, json.into_bytes(), String::new())
 }
 
-fn parse_channel_ref(value: Option<&serde_json::Value>) -> Option<crate::user_db_client::proto::ChannelRef> {
+fn parse_channel_ref(
+    value: Option<&serde_json::Value>,
+) -> Option<crate::user_db_client::proto::ChannelRef> {
     let Some(value) = value else {
         return None;
     };
@@ -2232,9 +2713,21 @@ fn parse_channel_ref(value: Option<&serde_json::Value>) -> Option<crate::user_db
         return None;
     }
     Some(crate::user_db_client::proto::ChannelRef {
-        platform: value.get("platform").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        channel_id: value.get("channel_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        handle: value.get("handle").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        platform: value
+            .get("platform")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        channel_id: value
+            .get("channel_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        handle: value
+            .get("handle")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
     })
 }
 
@@ -2258,23 +2751,36 @@ fn module_position_from_config(config: &Config, name: &str) -> Option<String> {
     }
 }
 
-
 /// Build a ContainerForModule payload of the requested probe type. `payload_json`
 /// carries optional fields (e.g. a log line, a SQL string). Unknown types
 /// yield None (the probe is skipped).
 fn build_probe_payload(ptype: &str, json: &serde_json::Value) -> Option<Payload> {
     match ptype {
-        "auth_verify" => Some(Payload::AuthVerify(AuthVerify { cur_auth: String::new() })),
+        "auth_verify" => Some(Payload::AuthVerify(AuthVerify {
+            cur_auth: String::new(),
+        })),
         "log" => Some(Payload::Log(Log {
-            log: json.get("log").and_then(|v| v.as_str()).unwrap_or("test probe").to_string(),
+            log: json
+                .get("log")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test probe")
+                .to_string(),
             blob: vec![],
         })),
         "message_pre_process" => Some(Payload::MessagePreProcess(MessagePreProcess {
             message_uuid7: String::new(),
             raw_message: Some(ChatMessage {
-                platform: json.get("platform").and_then(|v| v.as_str()).unwrap_or("test").to_string(),
+                platform: json
+                    .get("platform")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("test")
+                    .to_string(),
                 raw_data: vec![],
-                raw_message: json.get("raw_message").and_then(|v| v.as_str()).unwrap_or("probe").to_string(),
+                raw_message: json
+                    .get("raw_message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("probe")
+                    .to_string(),
                 user_uuid7: String::new(),
                 command: None,
                 user_data: None,
@@ -2285,8 +2791,16 @@ fn build_probe_payload(ptype: &str, json: &serde_json::Value) -> Option<Payload>
         })),
         "prompt" => Some(Payload::Prompt(Prompt {
             prompt_id_uuid7: Uuid::now_v7().to_string(),
-            prompt: json.get("prompt").and_then(|v| v.as_str()).unwrap_or("test probe").to_string(),
-            details: json.get("details").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            prompt: json
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test probe")
+                .to_string(),
+            details: json
+                .get("details")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             yes_dialog: String::new(),
             no_dialog: String::new(),
             timeout: 30,
@@ -2297,7 +2811,9 @@ fn build_probe_payload(ptype: &str, json: &serde_json::Value) -> Option<Payload>
             input_label: String::new(),
             prompt_type: 0,
         })),
-        "shutdown" => Some(Payload::Shutdown(Shutdown { reason: "test probe".to_string() })),
+        "shutdown" => Some(Payload::Shutdown(Shutdown {
+            reason: "test probe".to_string(),
+        })),
         _ => None,
     }
 }
@@ -2314,9 +2830,20 @@ async fn handle_test_probe(
 ) -> Result<String, String> {
     let payload: serde_json::Value =
         serde_json::from_str(sql).map_err(|e| format!("Invalid test_probe payload: {}", e))?;
-    let module = payload.get("module").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let ptype = payload.get("type").and_then(|v| v.as_str()).unwrap_or("log").to_string();
-    let pjson = payload.get("payload_json").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let module = payload
+        .get("module")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let ptype = payload
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("log")
+        .to_string();
+    let pjson = payload
+        .get("payload_json")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
     if module.is_empty() {
         return Err("test_probe requires a module".to_string());
     }
@@ -2337,7 +2864,13 @@ async fn handle_test_probe(
         .encode(&mut buf)
         .map_err(|e| format!("probe encode failed: {}", e))?;
 
-    let sent = crate::pipeline::send_to_module(&orchestrator.module_senders, &module, container, "test_probe").await;
+    let sent = crate::pipeline::send_to_module(
+        &orchestrator.module_senders,
+        &module,
+        container,
+        "test_probe",
+    )
+    .await;
     if !matches!(sent, SendOutcome::Sent) {
         return Err(format!("module '{}' has no sender", module));
     }
@@ -2363,7 +2896,10 @@ async fn handle_test_probe(
     }
     log_event_broadcast(
         ui_state,
-        format!("[test_probe] '{}' <- {} responded={} latency={}ms", module, ptype, responded, latency),
+        format!(
+            "[test_probe] '{}' <- {} responded={} latency={}ms",
+            module, ptype, responded, latency
+        ),
     );
     Ok(serde_json::json!({
         "module": module,
@@ -2373,7 +2909,6 @@ async fn handle_test_probe(
     })
     .to_string())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -2642,7 +3177,10 @@ mod tests {
             denial("prediction_get_score", NORMAL),
             Some("prediction_get_score denied: not the events module")
         );
-        assert_eq!(denial("set_credentials", NORMAL), Some("set_credentials denied: not the TUI"));
+        assert_eq!(
+            denial("set_credentials", NORMAL),
+            Some("set_credentials denied: not the TUI")
+        );
         // Admitted callers get no denial at all.
         assert_eq!(denial("test_run", TUI), None);
         assert_eq!(denial("test_archive", TEST_RUNNER), None);
@@ -2756,7 +3294,14 @@ mod tests {
         // prefix matches, so they route to the family handler (which refuses
         // them) rather than to the deny. That is the original's behaviour and
         // it is why the families are modelled explicitly.
-        let falls_through = ["", "nonsense", "chat_", "audit_", "set_credential", "userdbx"];
+        let falls_through = [
+            "",
+            "nonsense",
+            "chat_",
+            "audit_",
+            "set_credential",
+            "userdbx",
+        ];
         let mut reachable: Vec<QueryRoute> = RECOGNISED.iter().map(|(_, r)| *r).collect();
         reachable.extend(falls_through.iter().map(|q| classify_query(q)));
         reachable.push(classify_query("mod_"));
@@ -2817,10 +3362,19 @@ mod tests {
         // three-way (control surface OR score-messages OR predictions) gate
         // with the family's control-surface-only gate, locking score-messages
         // and predictions out of their own op.
-        assert_eq!(classify_query("userdb_adjust_score"), QueryRoute::UserdbAdjustScore);
-        assert!(query_id_starts_with_family("userdb_adjust_score", "userdb_"));
+        assert_eq!(
+            classify_query("userdb_adjust_score"),
+            QueryRoute::UserdbAdjustScore
+        );
+        assert!(query_id_starts_with_family(
+            "userdb_adjust_score",
+            "userdb_"
+        ));
         // And it must not be reachable by the family, whatever else changes.
-        assert_ne!(classify_query("userdb_adjust_score"), QueryRoute::UserdbFamily);
+        assert_ne!(
+            classify_query("userdb_adjust_score"),
+            QueryRoute::UserdbFamily
+        );
         // The three-way gate is the one that depends on it.
         assert!(allows("userdb_adjust_score", SCORE_MESSAGES));
         assert!(!allows("userdb_get_user", SCORE_MESSAGES));
@@ -2847,7 +3401,11 @@ mod tests {
             "mod_anything_else",
             "mod_",
         ] {
-            assert_eq!(classify_query(query_id), QueryRoute::ModFamily, "{query_id:?}");
+            assert_eq!(
+                classify_query(query_id),
+                QueryRoute::ModFamily,
+                "{query_id:?}"
+            );
         }
     }
 
@@ -2902,10 +3460,12 @@ mod tests {
         let shutdown = ShutdownSignal::new();
         let ui_state = Arc::new(Mutex::new(EngineState::new()));
 
-        let outcome =
-            engine_shutdown(&config_state, &shutdown, &ui_state, TUI);
+        let outcome = engine_shutdown(&config_state, &shutdown, &ui_state, TUI);
 
-        assert!(!outcome.success, "a disabled engine must not report success");
+        assert!(
+            !outcome.success,
+            "a disabled engine must not report success"
+        );
         assert_eq!(outcome.error, ENGINE_SHUTDOWN_DISABLED);
         // The refusal has to be actionable: it names the config key.
         assert!(
@@ -3011,17 +3571,27 @@ mod tests {
 
         // 2. The connection task queues the answer…
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ContainerForModule>(64);
-        tx.send(build_query_response("tok", "uuid", "engine_shutdown", outcome))
-            .await
-            .expect("the answer is queued");
+        tx.send(build_query_response(
+            "tok",
+            "uuid",
+            "engine_shutdown",
+            outcome,
+        ))
+        .await
+        .expect("the answer is queued");
         // …and only THEN arms the flush. Everything enqueued after this point
         // is behind the answer, because the channel is FIFO.
         let shutdown_flush = true;
 
         // Traffic from another task (the log broadcast) lands after the arm.
-        tx.send(build_query_response("tok", "uuid", "db_status", QueryOutcome::success(b"{}".to_vec())))
-            .await
-            .expect("later traffic is queued behind the answer");
+        tx.send(build_query_response(
+            "tok",
+            "uuid",
+            "db_status",
+            QueryOutcome::success(b"{}".to_vec()),
+        ))
+        .await
+        .expect("later traffic is queued behind the answer");
 
         // 3. The process must still be waiting: the answer is on the channel,
         //    not on the socket yet.
@@ -3036,7 +3606,8 @@ mod tests {
         //    completes, and only then does the connection hand the exit back.
         let first = rx.recv().await.expect("a frame is written");
         assert_eq!(
-            result_of(&first).query_id, "engine_shutdown",
+            result_of(&first).query_id,
+            "engine_shutdown",
             "the first frame after the flush is armed must be the answer"
         );
         assert!(result_of(&first).success);
@@ -3140,7 +3711,9 @@ mod tests {
 
     // ── 4. The response envelope ──────────────────────────────────────────
 
-    fn result_of(container: &ContainerForModule) -> &crate::cockatiel_protobuf::DatabaseQueryResult {
+    fn result_of(
+        container: &ContainerForModule,
+    ) -> &crate::cockatiel_protobuf::DatabaseQueryResult {
         match container.payload.as_ref().expect("payload present") {
             Payload::DatabaseQueryResult(r) => r,
             other => panic!("expected DatabaseQueryResult, got {other:?}"),
@@ -3159,7 +3732,10 @@ mod tests {
         // Envelope.
         assert_eq!(container.version, 2);
         assert_eq!(container.auth_token, "token-abc");
-        assert_eq!(container.module_instance_uuid7, "0192f0aa-1111-7aaa-8000-000000000001");
+        assert_eq!(
+            container.module_instance_uuid7,
+            "0192f0aa-1111-7aaa-8000-000000000001"
+        );
         // Result.
         let r = result_of(&container);
         assert!(r.success);
@@ -3209,7 +3785,10 @@ mod tests {
             let r = result_of(&container);
             assert!(!r.success, "{query_id:?} denial must not report success");
             assert_eq!(r.error, expected, "{query_id:?}");
-            assert!(r.result_blob.is_empty(), "{query_id:?} denial must not carry a blob");
+            assert!(
+                r.result_blob.is_empty(),
+                "{query_id:?} denial must not carry a blob"
+            );
         }
     }
 
@@ -3246,7 +3825,8 @@ fn module_position_from_config_uses_the_ordering_lists() {
     // TUI rewrites them at runtime, so a connected module's reported stage must
     // follow config.json, not the stage it connected on. This is what stops the
     // TUI's stage-move view from resetting on the next module_list poll.
-    let config: Config = serde_json::from_str(r#"{
+    let config: Config = serde_json::from_str(
+        r#"{
         "timeline_database_location": "./t.db",
         "timeline_database_backup_location": "./b.db",
         "port": 9734,
@@ -3254,12 +3834,26 @@ fn module_position_from_config_uses_the_ordering_lists() {
         "preprocessModules": [{"name":"clip","priority":100}],
         "inprocessModules": [{"name":"ban","priority":100}],
         "postprocessModules": [{"name":"tts","priority":100}]
-    }"#).unwrap();
+    }"#,
+    )
+    .unwrap();
 
-    assert_eq!(module_position_from_config(&config, "twitch").as_deref(), Some("input"));
-    assert_eq!(module_position_from_config(&config, "clip").as_deref(), Some("preprocess"));
-    assert_eq!(module_position_from_config(&config, "ban").as_deref(), Some("inprocess"));
-    assert_eq!(module_position_from_config(&config, "tts").as_deref(), Some("postprocess"));
+    assert_eq!(
+        module_position_from_config(&config, "twitch").as_deref(),
+        Some("input")
+    );
+    assert_eq!(
+        module_position_from_config(&config, "clip").as_deref(),
+        Some("preprocess")
+    );
+    assert_eq!(
+        module_position_from_config(&config, "ban").as_deref(),
+        Some("inprocess")
+    );
+    assert_eq!(
+        module_position_from_config(&config, "tts").as_deref(),
+        Some("postprocess")
+    );
     assert_eq!(module_position_from_config(&config, "not-listed"), None);
 }
 
@@ -3268,7 +3862,8 @@ fn sort_module_list_keeps_the_inprocess_chain_order_visible() {
     // The in-process stage is an ordered chain; the TUI renders module_list in
     // response order, so the chain position must be preserved there while the
     // unordered stages stay alphabetical.
-    let config: Config = serde_json::from_str(r#"{
+    let config: Config = serde_json::from_str(
+        r#"{
         "timeline_database_location": "./t.db",
         "timeline_database_backup_location": "./b.db",
         "port": 9734,
@@ -3278,7 +3873,9 @@ fn sort_module_list_keeps_the_inprocess_chain_order_visible() {
             {"name":"predictions","priority":100}
         ],
         "preprocessModules": [{"name":"banned-words","priority":100},{"name":"clip","priority":100}]
-    }"#).unwrap();
+    }"#,
+    )
+    .unwrap();
 
     let mk = |name: &str, pos: &str| serde_json::json!({ "name": name, "position": pos });
     let mut list = vec![
@@ -3293,7 +3890,13 @@ fn sort_module_list_keeps_the_inprocess_chain_order_visible() {
     let names: Vec<&str> = list.iter().map(|e| e["name"].as_str().unwrap()).collect();
     assert_eq!(
         names,
-        vec!["score-messages", "reprimand", "predictions", "banned-words", "clip"],
+        vec![
+            "score-messages",
+            "reprimand",
+            "predictions",
+            "banned-words",
+            "clip"
+        ],
         "in-process modules must keep their chain order (config order), pre-process stays alphabetical"
     );
 }
@@ -3306,7 +3909,11 @@ fn current_autostart_reads_the_live_manifest_not_the_discovery_snapshot() {
     // flip back on the next poll).
     let dir = std::env::temp_dir().join(format!("cockatiel-autostart-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("cockatiel_module_info.json"), r#"{"name":"m","autostart":false}"#).unwrap();
+    std::fs::write(
+        dir.join("cockatiel_module_info.json"),
+        r#"{"name":"m","autostart":false}"#,
+    )
+    .unwrap();
     let discovered = crate::module_manager::DiscoveredModule {
         manifest: crate::module_manager::ModuleManifest {
             name: "m".into(),
@@ -3333,12 +3940,22 @@ fn current_autostart_reads_the_live_manifest_not_the_discovery_snapshot() {
 
     // Toggle the file (what the TUI's `a` press does); the helper now reports
     // true even though the discovery snapshot is still false.
-    std::fs::write(dir.join("cockatiel_module_info.json"), r#"{"name":"m","autostart":true}"#).unwrap();
-    assert!(current_autostart(&discovered), "must read the live manifest, not the snapshot");
+    std::fs::write(
+        dir.join("cockatiel_module_info.json"),
+        r#"{"name":"m","autostart":true}"#,
+    )
+    .unwrap();
+    assert!(
+        current_autostart(&discovered),
+        "must read the live manifest, not the snapshot"
+    );
 
     // A missing/unreadable file falls back to the snapshot value.
     std::fs::remove_file(dir.join("cockatiel_module_info.json")).unwrap();
-    assert!(!current_autostart(&discovered), "fallback to the discovery value");
+    assert!(
+        !current_autostart(&discovered),
+        "fallback to the discovery value"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3395,7 +4012,10 @@ fn live_gate_reads_the_live_manifest_not_the_discovery_snapshot() {
 
 #[test]
 fn live_gate_falls_back_to_the_snapshot_when_the_manifest_is_missing_or_partial() {
-    let dir = std::env::temp_dir().join(format!("cockatiel-livegate-fallback-{}", uuid::Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!(
+        "cockatiel-livegate-fallback-{}",
+        uuid::Uuid::new_v4()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let discovered = stale_gate_discovered(&dir);
 
@@ -3508,7 +4128,10 @@ fn leaderboard_report_then_read_round_trips() {
     assert!(!bad.success);
     let read = leaderboard_read(&store);
     let json: serde_json::Value = serde_json::from_slice(&read.result_blob).unwrap();
-    assert_eq!(json["entries"][0]["username"], "vulbyte", "cache survived a bad report");
+    assert_eq!(
+        json["entries"][0]["username"], "vulbyte",
+        "cache survived a bad report"
+    );
 }
 
 #[test]
@@ -3547,9 +4170,16 @@ fn stream_control_round_trips_and_statuses_reset_on_write() {
     let w = stream_control_write(&store, r#"{"title":"New Title"}"#);
     let json: serde_json::Value = serde_json::from_slice(&w.result_blob).unwrap();
     assert_eq!(json["title"], "New Title");
-    assert_eq!(json["scheduled_start_ms"], 1_700_000_000_000i64, "unset field kept");
+    assert_eq!(
+        json["scheduled_start_ms"], 1_700_000_000_000i64,
+        "unset field kept"
+    );
     assert_eq!(json["revision"], 2);
-    assert_eq!(json["statuses"].as_array().unwrap().len(), 0, "stale statuses cleared");
+    assert_eq!(
+        json["statuses"].as_array().unwrap().len(),
+        0,
+        "stale statuses cleared"
+    );
 
     // Malformed payloads are refused, and so is a status with no platform.
     assert!(!stream_control_write(&store, "not-json").success);
@@ -3563,7 +4193,10 @@ fn stream_schedule_load_round_trips_through_disk() {
     let path = dir.join("stream_schedule.json");
 
     let store: SharedStreamSchedule = Arc::new(Mutex::new(StreamSchedule::load(path.clone())));
-    stream_control_write(&store, r#"{"title":"Persisted","thumbnail_path":"/tmp/t.png"}"#);
+    stream_control_write(
+        &store,
+        r#"{"title":"Persisted","thumbnail_path":"/tmp/t.png"}"#,
+    );
 
     // Reload from disk: the control survives (statuses are transient, not saved).
     let reloaded = StreamSchedule::load(path.clone());

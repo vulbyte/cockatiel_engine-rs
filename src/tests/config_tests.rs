@@ -10,7 +10,10 @@ use std::sync::{Arc, Mutex};
 
 /// A ConfigState pointed at a throwaway temp config.json, parsed from the given
 /// content (missing keys fall back to serde defaults — same as engine startup).
-fn temp_state(dir: &std::path::Path, content: &str) -> (Arc<Mutex<ConfigState>>, std::path::PathBuf) {
+fn temp_state(
+    dir: &std::path::Path,
+    content: &str,
+) -> (Arc<Mutex<ConfigState>>, std::path::PathBuf) {
     std::fs::create_dir_all(dir).unwrap();
     let path = dir.join("config.json");
     std::fs::write(&path, content).unwrap();
@@ -53,7 +56,10 @@ fn backfill_writes_missing_keys_and_preserves_existing() {
     assert_eq!(v["handshake_timeout_secs"], 10);
     assert_eq!(v["send_timeout_secs"], 5);
     assert_eq!(v["recovery_grace_secs"], 10);
-    assert_eq!(v["start_paused"], true, "a fresh config must be explicit about booting paused");
+    assert_eq!(
+        v["start_paused"], true,
+        "a fresh config must be explicit about booting paused"
+    );
     assert_eq!(
         v["shutdown_on_request"], false,
         "a fresh config must say the engine is NOT shuttable over the wire"
@@ -96,9 +102,15 @@ fn backfill_is_a_noop_when_all_keys_present() {
     assert_eq!(v["handshake_timeout_secs"], 3);
     assert_eq!(v["send_timeout_secs"], 4);
     assert_eq!(v["recovery_grace_secs"], 5);
-    assert_eq!(v["start_paused"], false, "an explicit choice is never overwritten by a default");
+    assert_eq!(
+        v["start_paused"], false,
+        "an explicit choice is never overwritten by a default"
+    );
     assert_eq!(v["shutdown_on_request"], false);
-    assert_eq!(v["prediction_creator_role"], "owner", "an explicit choice is never overwritten by a default");
+    assert_eq!(
+        v["prediction_creator_role"], "owner",
+        "an explicit choice is never overwritten by a default"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -119,14 +131,19 @@ const MINIMAL: &str = r#"{
 #[test]
 fn the_engine_boots_paused_by_default() {
     let absent: Config = serde_json::from_str(MINIMAL).unwrap();
-    assert!(absent.start_paused, "a missing key must resolve to paused, not to running");
+    assert!(
+        absent.start_paused,
+        "a missing key must resolve to paused, not to running"
+    );
     assert!(resolve_start_paused(&absent, None));
 
-    let explicit: Config = serde_json::from_str(&MINIMAL.replace('}', ",\"start_paused\": true}")).unwrap();
+    let explicit: Config =
+        serde_json::from_str(&MINIMAL.replace('}', ",\"start_paused\": true}")).unwrap();
     assert!(resolve_start_paused(&explicit, None));
 
     // An operator who wants it running on every boot says so in the file.
-    let unpaused: Config = serde_json::from_str(&MINIMAL.replace('}', ",\"start_paused\": false}")).unwrap();
+    let unpaused: Config =
+        serde_json::from_str(&MINIMAL.replace('}', ",\"start_paused\": false}")).unwrap();
     assert!(!unpaused.start_paused);
     assert!(!resolve_start_paused(&unpaused, None));
 
@@ -146,7 +163,8 @@ fn the_engine_boots_paused_by_default() {
 #[test]
 fn the_auto_resume_escape_hatch_flips_the_boot_state() {
     let paused: Config = serde_json::from_str(MINIMAL).unwrap();
-    let running: Config = serde_json::from_str(&MINIMAL.replace('}', ",\"start_paused\": false}")).unwrap();
+    let running: Config =
+        serde_json::from_str(&MINIMAL.replace('}', ",\"start_paused\": false}")).unwrap();
 
     for off in ["0", "false", "no", "off", "FALSE", " off ", "0\n"] {
         assert!(
@@ -165,12 +183,21 @@ fn the_auto_resume_escape_hatch_flips_the_boot_state() {
 
     // Nothing set, or set to something meaningless, is the file's answer.
     for junk in [None, Some(""), Some("   "), Some("maybe"), Some("2")] {
-        assert!(resolve_start_paused(&paused, junk), "an unusable value must not silently start the engine");
+        assert!(
+            resolve_start_paused(&paused, junk),
+            "an unusable value must not silently start the engine"
+        );
         assert!(!resolve_start_paused(&running, junk));
     }
 
     // The live entry point reads the real environment and delegates here.
-    assert_eq!(start_paused(&paused), resolve_start_paused(&paused, std::env::var("COCKATIEL_START_PAUSED").ok().as_deref()));
+    assert_eq!(
+        start_paused(&paused),
+        resolve_start_paused(
+            &paused,
+            std::env::var("COCKATIEL_START_PAUSED").ok().as_deref()
+        )
+    );
 }
 
 // ── The shutdown gate ────────────────────────────────────────────────
@@ -239,9 +266,10 @@ fn the_prediction_creator_role_defaults_to_mod_and_round_trips() {
     // rewrites config.json through `update_config`, so a field that could not be
     // serialised back would silently reset on the first write).
     for role in ["owner", "admin", "mod", "user"] {
-        let configured: Config =
-            serde_json::from_str(&MINIMAL.replace('}', &format!(",\"prediction_creator_role\": \"{role}\"}}")))
-                .unwrap();
+        let configured: Config = serde_json::from_str(
+            &MINIMAL.replace('}', &format!(",\"prediction_creator_role\": \"{role}\"}}")),
+        )
+        .unwrap();
         assert_eq!(configured.prediction_creator_role, role);
 
         let json = serde_json::to_string(&configured).unwrap();
@@ -250,7 +278,10 @@ fn the_prediction_creator_role_defaults_to_mod_and_round_trips() {
             "the role must be serialised under its own key, not skipped"
         );
         let back: Config = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.prediction_creator_role, role, "the role must survive a serde round trip");
+        assert_eq!(
+            back.prediction_creator_role, role,
+            "the role must survive a serde round trip"
+        );
     }
 
     // A freshly generated config says so on disk, not just in code.
@@ -290,17 +321,27 @@ fn refresh_config_picks_up_a_same_size_rewrite_the_size_gate_would_miss() {
 
     // Rewrite the SAME SIZE file, swapping the two names.
     let swapped = r#"{"timeline_database_location":"./t.db","timeline_database_backup_location":"./t-backup.db","port":9734,"preprocessModules":[{"name":"bbb","priority":100}],"inprocessModules":[{"name":"aaa","priority":100}]}"#;
-    assert_eq!(original.len(), swapped.len(), "the swap must not change file size");
+    assert_eq!(
+        original.len(),
+        swapped.len(),
+        "the swap must not change file size"
+    );
     std::fs::write(&path, swapped).unwrap();
 
     // Without refresh, the size gate hides the change.
     let c2 = get_config(&state);
-    assert_eq!(c2.preprocess_modules[0].name, "aaa", "the size gate must skip a same-size rewrite");
+    assert_eq!(
+        c2.preprocess_modules[0].name, "aaa",
+        "the size gate must skip a same-size rewrite"
+    );
 
     // With refresh, the new order is read.
     crate::config::refresh_config(&state);
     let c3 = get_config(&state);
-    assert_eq!(c3.preprocess_modules[0].name, "bbb", "refresh_config must force the re-read");
+    assert_eq!(
+        c3.preprocess_modules[0].name, "bbb",
+        "refresh_config must force the re-read"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -338,7 +379,11 @@ fn add_module_to_config_does_not_revert_an_operator_stage_move() {
     std::fs::write(&path, moved).unwrap();
     // Size changed, so the size gate re-reads it.
     assert_eq!(
-        get_config(&state).inprocess_modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+        get_config(&state)
+            .inprocess_modules
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
         vec!["clip"],
         "move must put clip in in-process"
     );
@@ -349,20 +394,31 @@ fn add_module_to_config_does_not_revert_an_operator_stage_move() {
     // on-disk move with a stale in-memory snapshot either.
     add_module_to_config(&state, "clip", "preprocess", 100);
     assert_eq!(
-        get_config(&state).inprocess_modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+        get_config(&state)
+            .inprocess_modules
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
         vec!["clip"],
         "a reconnect must not revert the operator's stage move"
     );
     assert_eq!(
-        get_config(&state).preprocess_modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+        get_config(&state)
+            .preprocess_modules
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
         Vec::<&str>::new(),
         "a reconnect must not re-add the module to its connect-time stage"
     );
     // And the file on disk must still hold the move after the engine's write.
-    let on_disk: Config =
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let on_disk: Config = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(
-        on_disk.inprocess_modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+        on_disk
+            .inprocess_modules
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
         vec!["clip"],
         "the engine's config write must preserve the on-disk move"
     );
@@ -403,19 +459,31 @@ fn update_config_re_reads_disk_so_it_never_clobbers_an_external_move() {
     // module connects now; update_config must read the on-disk moved config,
     // apply its change on top, and write it back WITHOUT reverting the move.
     update_config(&state, |config| {
-        if let Some(m) = config.inprocess_modules.iter_mut().find(|m| m.name == "clip") {
+        if let Some(m) = config
+            .inprocess_modules
+            .iter_mut()
+            .find(|m| m.name == "clip")
+        {
             m.priority = 50;
         }
     });
 
     let on_disk: Config = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(
-        on_disk.inprocess_modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+        on_disk
+            .inprocess_modules
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
         vec!["clip"],
         "update_config must preserve the operator's move on disk"
     );
     assert_eq!(
-        on_disk.preprocess_modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+        on_disk
+            .preprocess_modules
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
         Vec::<&str>::new(),
         "update_config must not resurrect clip in pre-process"
     );

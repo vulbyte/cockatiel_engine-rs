@@ -299,7 +299,11 @@ mod tests {
     #[test]
     fn discovers_a_module_nested_two_levels_deep() {
         let root = temp_root("nested");
-        write_manifest(&root.join("group").join("deep-module"), "deep-module", "module");
+        write_manifest(
+            &root.join("group").join("deep-module"),
+            "deep-module",
+            "module",
+        );
 
         let mut registry = ModuleRegistry::new();
         registry
@@ -348,7 +352,10 @@ mod tests {
             .discover(std::slice::from_ref(&root))
             .expect("discovery succeeds");
 
-        assert!(registry.get("engine").is_none(), "core kind must be skipped");
+        assert!(
+            registry.get("engine").is_none(),
+            "core kind must be skipped"
+        );
         assert!(registry.get("real-module").is_some());
         assert_eq!(registry.len(), 1);
         let _ = fs::remove_dir_all(&root);

@@ -8,16 +8,16 @@ use std::{
     env, fs,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU32, Ordering},
         Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_tungstenite::{
-    accept_async_with_config, tungstenite::protocol::{Message as WsMessage, WebSocketConfig},
-    WebSocketStream,
+    WebSocketStream, accept_async_with_config,
+    tungstenite::protocol::{Message as WsMessage, WebSocketConfig},
 };
 use uuid::Uuid;
 
@@ -49,28 +49,26 @@ use database::{DatabaseConfig, DatabaseManager};
 
 mod credentials;
 
-mod pipeline;
 mod help;
+mod pipeline;
 use pipeline::{PipelineConfig, PipelineOrchestrator, SendOutcome};
 
 /* QUERY SURFACE */
 mod queries;
 use queries::{QueryContext, SharedShutdown, ShutdownStage};
 
-mod user_db_client;
 mod rank_chart;
+mod user_db_client;
 use user_db_client::{SharedUserDbClient, UserDbClient};
 
 /* PROTOBUF STUFF */
 pub use cockatiel_proto::proto as cockatiel_protobuf;
 
 use cockatiel_protobuf::{
-    container_for_engine::Payload as EnginePayload,
+    ContainerForEngine, ContainerForModule, Log, ProcessPosition, Prompt, PromptType,
+    TimelineQueryResult, container_for_engine::Payload as EnginePayload,
     container_for_module::Payload as ModulePayload,
-    ContainerForEngine, ContainerForModule, ProcessPosition, Prompt, PromptType, Log,
-    TimelineQueryResult,
 };
-
 
 /// Where a PromptResponse should be routed. The engine's own prompts (module
 /// connection approval) wait on a oneshot; prompts originating from a module
@@ -102,8 +100,12 @@ pub(crate) type SharedChannelStats = Arc<Mutex<HashMap<String, ChannelStatsEntry
 /// The platform adapters allowed to publish channel stats. A random module
 /// spoofing viewer counts would poison every consumer, so the relay gate keys
 /// off these names.
-pub(crate) const CHANNEL_STATS_ADAPTERS: [&str; 4] =
-    ["twitch-adapter", "kick-adapter", "youtube-adapter", "discord-adapter"];
+pub(crate) const CHANNEL_STATS_ADAPTERS: [&str; 4] = [
+    "twitch-adapter",
+    "kick-adapter",
+    "youtube-adapter",
+    "discord-adapter",
+];
 
 /// The outcome of asking the user via a broadcast prompt.
 enum PromptOutcome {
@@ -475,7 +477,9 @@ pub fn should_fetch_user_data(
 /// Snapshot of the module names that are currently connected with a live
 /// outbound channel. This is the liveness input to [`should_fetch_user_data`].
 async fn connected_module_names(
-    senders: &Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<ContainerForModule>>>>,
+    senders: &Arc<
+        tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<ContainerForModule>>>,
+    >,
 ) -> Vec<String> {
     let senders = senders.lock().await;
     senders
@@ -517,9 +521,9 @@ pub async fn handle_command_on_ingest(
                 match arg {
                     Some(module) => match crate::help::format_module(&reg, &module) {
                         Some(text) => text,
-                        None => format!(
-                            "no module named '{module}' — try '!help' to see all modules"
-                        ),
+                        None => {
+                            format!("no module named '{module}' — try '!help' to see all modules")
+                        }
                     },
                     None => crate::help::format_overview(&reg),
                 }
@@ -529,7 +533,12 @@ pub async fn handle_command_on_ingest(
             engine_reply_to_platform(orchestrator, ui_state, &platform, &channel_id, &reply).await;
         }
         CommandAction::Alert => {
-            let who = if chat.user_data.as_ref().map(|u| !u.username.is_empty()).unwrap_or(false) {
+            let who = if chat
+                .user_data
+                .as_ref()
+                .map(|u| !u.username.is_empty())
+                .unwrap_or(false)
+            {
                 chat.user_data.as_ref().unwrap().username.clone()
             } else if !chat.user_uuid7.is_empty() {
                 chat.user_uuid7.clone()
@@ -559,7 +568,12 @@ pub async fn engine_reply_to_platform(
     msg: &str,
 ) {
     let targets: Vec<&str> = match platform {
-        "all" => vec!["twitch-adapter", "kick-adapter", "youtube-adapter", "discord-adapter"],
+        "all" => vec![
+            "twitch-adapter",
+            "kick-adapter",
+            "youtube-adapter",
+            "discord-adapter",
+        ],
         "twitch" => vec!["twitch-adapter"],
         "kick" => vec!["kick-adapter"],
         "youtube" => vec!["youtube-adapter"],
@@ -584,11 +598,17 @@ pub async fn engine_reply_to_platform(
         payload: Some(ModulePayload::SendToPlatforms(send)),
     };
     for name in targets {
-            let sent = crate::pipeline::send_to_module(&orchestrator.module_senders, name, container.clone(), "commands").await;
-            if matches!(sent, SendOutcome::Sent) {
-                log_event_broadcast(&ui_state, format!("[Commands] reply '{}' -> {}", name, msg));
-            }
+        let sent = crate::pipeline::send_to_module(
+            &orchestrator.module_senders,
+            name,
+            container.clone(),
+            "commands",
+        )
+        .await;
+        if matches!(sent, SendOutcome::Sent) {
+            log_event_broadcast(&ui_state, format!("[Commands] reply '{}' -> {}", name, msg));
         }
+    }
 }
 
 pub async fn enrich_chat_user(
@@ -691,7 +711,9 @@ pub async fn enrich_chat_user(
         is_owner: user.is_owner,
         bans: Vec::new(),
         commendations: Vec::new(),
-        styling: Some(cockatiel_protobuf::UserStylingTemplate { css_properties: css }),
+        styling: Some(cockatiel_protobuf::UserStylingTemplate {
+            css_properties: css,
+        }),
         platform_ids: std::collections::HashMap::new(),
     });
 }
@@ -700,9 +722,7 @@ pub async fn enrich_chat_user(
 /// own connection waiting on a prompt it is supposed to show. The compliance
 /// test runner is also trusted so it can run without an interactive prompt.
 fn is_always_trusted(name: &str) -> bool {
-    name == "cockatiel-tui"
-        || name == "cockatiel-tui-child"
-        || name == "cockatiel-test-runner"
+    name == "cockatiel-tui" || name == "cockatiel-tui-child" || name == "cockatiel-test-runner"
     // NOTE: cockatiel-audit-viewer is intentionally NOT always-trusted. It
     // connects via the client SDK, which performs a first-contact handshake
     // with a fresh instance uuid on every connect — and the control-surface
@@ -751,7 +771,11 @@ fn remediate_secret_file_permissions(
         if let Err(e) = config::chmod_owner_only(&path) {
             log_event_broadcast(
                 ui_state,
-                format!("WARN: could not tighten permissions on {}: {}", path.display(), e),
+                format!(
+                    "WARN: could not tighten permissions on {}: {}",
+                    path.display(),
+                    e
+                ),
             );
         }
     }
@@ -809,7 +833,10 @@ async fn log_to_timeline(db: &DatabaseManager, kind: &str, source: &str, message
     let flags = serde_json::json!({ "source": source, "kind": kind }).to_string();
     // Module lifecycle events are NOT platform sends — label them distinctly so
     // the `command` column stays meaningful (send_to_platforms vs lifecycle).
-    if let Err(e) = db.insert_archival_event("engine", "module_lifecycle", message, &flags).await {
+    if let Err(e) = db
+        .insert_archival_event("engine", "module_lifecycle", message, &flags)
+        .await
+    {
         eprintln!("[Timeline] failed to record {}: {}", kind, e);
     }
 }
@@ -826,7 +853,11 @@ async fn broadcast_prompt_and_wait(
     log_label: &str,
 ) -> PromptOutcome {
     let prompt_id = prompt.prompt_id_uuid7.clone();
-    let timeout = if prompt.timeout > 0 { prompt.timeout } else { 30 };
+    let timeout = if prompt.timeout > 0 {
+        prompt.timeout
+    } else {
+        30
+    };
 
     let senders: Vec<tokio::sync::mpsc::Sender<ContainerForModule>> = {
         let senders = module_senders.lock().await;
@@ -937,7 +968,13 @@ async fn prompt_user_to_allow(
 /// to approve (resubmit as a normal message) or reject it. First response wins.
 /// If no UI answers, the message stays held.
 /// Human-readable broadcast line for a rejected message (shown in UIs/log).
-fn compose_rejection_broadcast(origin: &str, uuid: &str, reason: &str, raw: &str, processed: &str) -> String {
+fn compose_rejection_broadcast(
+    origin: &str,
+    uuid: &str,
+    reason: &str,
+    raw: &str,
+    processed: &str,
+) -> String {
     format!(
         "[{}] rejected {}: {} (\"{}\" -> \"{}\")",
         origin, uuid, reason, raw, processed
@@ -963,16 +1000,30 @@ async fn handle_chat_message_rejected(
 ) {
     let origin = &rej.origin;
     let reason = &rej.reason;
-    let raw = &rej.message.as_ref().map(|m| m.raw_message.clone()).unwrap_or_default();
+    let raw = &rej
+        .message
+        .as_ref()
+        .map(|m| m.raw_message.clone())
+        .unwrap_or_default();
     let processed = rej.processed_message.as_deref().unwrap_or("");
     log_event_broadcast(
         ui_state,
         compose_rejection_broadcast(origin, &rej.message_uuid7, reason, raw, processed),
     );
-    let platform = rej.message.as_ref().map(|m| m.platform.clone()).unwrap_or_default();
+    let platform = rej
+        .message
+        .as_ref()
+        .map(|m| m.platform.clone())
+        .unwrap_or_default();
     let record = compose_rejection_record(origin, reason, raw, processed);
-    if let Err(e) = db.insert_archival_event(&platform, "chat_rejected", &record, raw).await {
-        log_event(ui_state, format!("[chat_rejected] failed to persist record: {}", e));
+    if let Err(e) = db
+        .insert_archival_event(&platform, "chat_rejected", &record, raw)
+        .await
+    {
+        log_event(
+            ui_state,
+            format!("[chat_rejected] failed to persist record: {}", e),
+        );
     }
 }
 
@@ -998,7 +1049,9 @@ async fn handle_audit_flag(
             e.get("platform").and_then(|v| v.as_str()).unwrap_or("?"),
             e.get("user_uuid7").and_then(|v| v.as_str()).unwrap_or("?"),
             e.get("raw_message").and_then(|v| v.as_str()).unwrap_or(""),
-            e.get("reason").and_then(|v| v.as_str()).unwrap_or("flagged"),
+            e.get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("flagged"),
         ),
         None => format!(
             "Message [{}] held for audit (reason: {})",
@@ -1006,7 +1059,7 @@ async fn handle_audit_flag(
         ),
     };
 
-let prompt = Prompt {
+    let prompt = Prompt {
         prompt_id_uuid7: Uuid::now_v7().to_string(),
         prompt: "Audit message".to_string(),
         details,
@@ -1020,10 +1073,7 @@ let prompt = Prompt {
         },
         origin_uuid7: String::new(),
         instructions: String::new(),
-        link: format!(
-            "http://localhost:3000/message/{}",
-            flag.message_uuid7
-        ),
+        link: format!("http://localhost:3000/message/{}", flag.message_uuid7),
         input_label: String::new(),
         prompt_type: PromptType::Boolean as i32,
     };
@@ -1040,16 +1090,25 @@ let prompt = Prompt {
     match outcome {
         PromptOutcome::Decided(true) => {
             if db.release_audit(&uuid_bytes, true).await.is_ok() {
-                log_event(ui_state, format!("[audit] approved + released: {}", flag.message_uuid7));
+                log_event(
+                    ui_state,
+                    format!("[audit] approved + released: {}", flag.message_uuid7),
+                );
             }
         }
         PromptOutcome::Decided(false) => {
             if db.release_audit(&uuid_bytes, false).await.is_ok() {
-                log_event(ui_state, format!("[audit] rejected: {}", flag.message_uuid7));
+                log_event(
+                    ui_state,
+                    format!("[audit] rejected: {}", flag.message_uuid7),
+                );
             }
         }
         _ => {
-            log_event(ui_state, format!("[audit] held (no UI response): {}", flag.message_uuid7));
+            log_event(
+                ui_state,
+                format!("[audit] held (no UI response): {}", flag.message_uuid7),
+            );
         }
     }
 }
@@ -1109,7 +1168,10 @@ cockatiel
 
     let mut discovered_registry_inner = ModuleRegistry::new();
     let search_paths = module_search_paths();
-    log_event_broadcast(&ui_state, format!("Searching for modules in {} paths...", search_paths.len()));
+    log_event_broadcast(
+        &ui_state,
+        format!("Searching for modules in {} paths...", search_paths.len()),
+    );
 
     match discovered_registry_inner.discover(&search_paths) {
         Ok(()) => {}
@@ -1120,10 +1182,21 @@ cockatiel
         }
     }
 
-    log_event_broadcast(&ui_state, format!("Discovered {} module(s)", discovered_registry_inner.len()));
+    log_event_broadcast(
+        &ui_state,
+        format!("Discovered {} module(s)", discovered_registry_inner.len()),
+    );
     for (name, m) in discovered_registry_inner.iter() {
-        let auto = if m.manifest.autostart { " [autostart]" } else { "" };
-        let term = if m.manifest.terminal { " [terminal]" } else { "" };
+        let auto = if m.manifest.autostart {
+            " [autostart]"
+        } else {
+            ""
+        };
+        let term = if m.manifest.terminal {
+            " [terminal]"
+        } else {
+            ""
+        };
         log_event_broadcast(&ui_state, format!("  - {}{}{}", name, auto, term));
     }
 
@@ -1182,13 +1255,19 @@ cockatiel
     let mut startup_block: Option<crate::pipeline::BlockedReason> = None;
     match crate::database::timeline_db_path_problem(&config.timeline_database_location) {
         Some(reason) => {
-            log_event_broadcast(&ui_state, format!("Timeline DB unavailable: {} — engine BLOCKED", reason));
+            log_event_broadcast(
+                &ui_state,
+                format!("Timeline DB unavailable: {} — engine BLOCKED", reason),
+            );
             startup_block = Some(crate::pipeline::BlockedReason::TimelineDb);
         }
         None => match db.initialize().await {
             Ok(()) => {}
             Err(e) => {
-                log_event_broadcast(&ui_state, format!("Timeline DB init failed: {} — engine BLOCKED", e));
+                log_event_broadcast(
+                    &ui_state,
+                    format!("Timeline DB init failed: {} — engine BLOCKED", e),
+                );
                 startup_block = Some(crate::pipeline::BlockedReason::TimelineDb);
             }
         },
@@ -1198,7 +1277,10 @@ cockatiel
     // a real secret — never fall back to a known constant. The TUI supervisor
     // generates one and passes it when it launches the engine.
     let user_db_host = env::var("USER_DB_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let user_db_port: u16 = env::var("USER_DB_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(9736);
+    let user_db_port: u16 = env::var("USER_DB_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9736);
     let user_db_token = env::var("USER_DB_TOKEN")
         .ok()
         .filter(|t| !t.trim().is_empty())
@@ -1210,23 +1292,34 @@ cockatiel
                  Refusing to start with a default token.",
             )
         })?;
-    let user_db_client: SharedUserDbClient = Arc::new(UserDbClient::new(&user_db_host, user_db_port, &user_db_token));
-    log_event_broadcast(&ui_state, format!("UserDB client configured for {}:{}", user_db_host, user_db_port));
+    let user_db_client: SharedUserDbClient = Arc::new(UserDbClient::new(
+        &user_db_host,
+        user_db_port,
+        &user_db_token,
+    ));
+    log_event_broadcast(
+        &ui_state,
+        format!(
+            "UserDB client configured for {}:{}",
+            user_db_host, user_db_port
+        ),
+    );
 
     // Pipeline
-    let module_senders: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<ContainerForModule>>>> =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let module_senders: Arc<
+        tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<ContainerForModule>>>,
+    > = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     // Command registry: which modules subscribe to which chat commands
     // (populated by `commands_payload` registrations). Shared with the
     // pipeline for targeted command routing.
-    let cmd_registry: Arc<Mutex<CommandRegistry>> = Arc::new(Mutex::new(CommandRegistry::default()));
+    let cmd_registry: Arc<Mutex<CommandRegistry>> =
+        Arc::new(Mutex::new(CommandRegistry::default()));
 
     // Per-session kill switch: the probe task signals a hung module's
     // connection task to close, so the normal disconnect cleanup runs.
-    let kill_map: Arc<
-        tokio::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>,
-    > = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let kill_map: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     // Liveness probing: opportunistically AuthVerify modules during dead air.
     {
@@ -1293,11 +1386,8 @@ cockatiel
                         )
                         .await;
                         auth_store.mark_unresponsive(&session.instance_uuid7);
-                        if let Some(kill) = kill_map
-                            .lock()
-                            .await
-                            .get(&session.instance_uuid7)
-                            .cloned()
+                        if let Some(kill) =
+                            kill_map.lock().await.get(&session.instance_uuid7).cloned()
                         {
                             let _ = kill.send(true);
                         }
@@ -1316,11 +1406,19 @@ cockatiel
                             version: 2,
                             auth_token: String::new(),
                             module_instance_uuid7: String::new(),
-                            payload: Some(ModulePayload::AuthVerify(cockatiel_protobuf::AuthVerify {
-                                cur_auth: String::new(),
-                            })),
+                            payload: Some(ModulePayload::AuthVerify(
+                                cockatiel_protobuf::AuthVerify {
+                                    cur_auth: String::new(),
+                                },
+                            )),
                         };
-                        let _ = crate::pipeline::send_to_module(&module_senders, &session.module_name, probe, "probe").await;
+                        let _ = crate::pipeline::send_to_module(
+                            &module_senders,
+                            &session.module_name,
+                            probe,
+                            "probe",
+                        )
+                        .await;
                     }
                 }
             }
@@ -1361,9 +1459,21 @@ cockatiel
     }
 
     let pipeline_config = PipelineConfig {
-        pre_process_modules: config.preprocess_modules.iter().map(|m| m.name.clone()).collect(),
-        in_process_modules: config.inprocess_modules.iter().map(|m| m.name.clone()).collect(),
-        post_process_modules: config.postprocess_modules.iter().map(|m| m.name.clone()).collect(),
+        pre_process_modules: config
+            .preprocess_modules
+            .iter()
+            .map(|m| m.name.clone())
+            .collect(),
+        in_process_modules: config
+            .inprocess_modules
+            .iter()
+            .map(|m| m.name.clone())
+            .collect(),
+        post_process_modules: config
+            .postprocess_modules
+            .iter()
+            .map(|m| m.name.clone())
+            .collect(),
         ack_timeout_ms: 3000,
         critical_modules: Vec::new(),
     };
@@ -1413,9 +1523,15 @@ cockatiel
     // task below deliberately does not touch it.
     if config::start_paused(&config) {
         orchestrator.pause().await;
-        log_event_broadcast(&ui_state, "Pipeline: paused at startup — messages are queued but nothing is dispatched (resume from the TUI)");
+        log_event_broadcast(
+            &ui_state,
+            "Pipeline: paused at startup — messages are queued but nothing is dispatched (resume from the TUI)",
+        );
     } else {
-        log_event_broadcast(&ui_state, "Pipeline: running (COCKATIEL_START_PAUSED is off)");
+        log_event_broadcast(
+            &ui_state,
+            "Pipeline: running (COCKATIEL_START_PAUSED is off)",
+        );
     }
 
     // A missing timeline DB blocks dispatch. The user-db reachability task
@@ -1432,7 +1548,10 @@ cockatiel
         // bytes; a BLOB param never equals a TEXT column in SQLite). Do this
         // before the recovery drain so stranded rows are found and progressed.
         match db.normalize_uuid_storage().await {
-            Ok(n) if n > 0 => log_event_broadcast(&ui_state, format!("Recovery: normalized {} uuid columns to BLOB", n)),
+            Ok(n) if n > 0 => log_event_broadcast(
+                &ui_state,
+                format!("Recovery: normalized {} uuid columns to BLOB", n),
+            ),
             _ => {}
         }
 
@@ -1440,9 +1559,15 @@ cockatiel
         // died — they can never complete, so mark them failed. Stranded 'queued'
         // rows (inserted but never started) are drained by the recovery task
         // spawned below.
-        match db.mark_all_processing_as_failed("interrupted by engine restart").await {
+        match db
+            .mark_all_processing_as_failed("interrupted by engine restart")
+            .await
+        {
             Ok(count) if count > 0 => {
-                log_event_broadcast(&ui_state, format!("Recovery: marked {} interrupted messages failed", count));
+                log_event_broadcast(
+                    &ui_state,
+                    format!("Recovery: marked {} interrupted messages failed", count),
+                );
             }
             _ => {}
         }
@@ -1461,22 +1586,39 @@ cockatiel
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 let config = get_config(&config_state);
-                if crate::database::timeline_db_path_problem(&config.timeline_database_location).is_some() {
+                if crate::database::timeline_db_path_problem(&config.timeline_database_location)
+                    .is_some()
+                {
                     continue;
                 }
                 if db.initialize().await.is_ok() {
                     match db.normalize_uuid_storage().await {
-                        Ok(n) if n > 0 => log_event_broadcast(&ui_state, format!("Recovery: normalized {} uuid columns to BLOB", n)),
+                        Ok(n) if n > 0 => log_event_broadcast(
+                            &ui_state,
+                            format!("Recovery: normalized {} uuid columns to BLOB", n),
+                        ),
                         _ => {}
                     }
-                    match db.mark_all_processing_as_failed("interrupted by engine restart").await {
-                        Ok(count) if count > 0 => log_event_broadcast(&ui_state, format!("Recovery: marked {} interrupted messages failed", count)),
+                    match db
+                        .mark_all_processing_as_failed("interrupted by engine restart")
+                        .await
+                    {
+                        Ok(count) if count > 0 => log_event_broadcast(
+                            &ui_state,
+                            format!("Recovery: marked {} interrupted messages failed", count),
+                        ),
                         _ => {}
                     }
                     log_event_broadcast(&ui_state, "Timeline DB available — engine unblocked");
                     if orchestrator.clear_block(reason).await {
                         let outcome = orchestrator.resume().await;
-                        log_event_broadcast(&ui_state, format!("[pipeline] resumed after unblock — releasing {} held message(s)", outcome.resumed_messages));
+                        log_event_broadcast(
+                            &ui_state,
+                            format!(
+                                "[pipeline] resumed after unblock — releasing {} held message(s)",
+                                outcome.resumed_messages
+                            ),
+                        );
                     }
                     break;
                 }
@@ -1503,18 +1645,37 @@ cockatiel
                 .map(|r| r.is_ok())
                 .unwrap_or(false);
                 if !up {
-                    orchestrator.set_block(crate::pipeline::BlockedReason::UserDb).await;
+                    orchestrator
+                        .set_block(crate::pipeline::BlockedReason::UserDb)
+                        .await;
                     if prev == Some(true) {
-                        log_event_broadcast(&ui_state, format!("User database unreachable at {}:{} — engine BLOCKED", host, port));
+                        log_event_broadcast(
+                            &ui_state,
+                            format!(
+                                "User database unreachable at {}:{} — engine BLOCKED",
+                                host, port
+                            ),
+                        );
                     }
                 } else {
-                    let resume = orchestrator.clear_block(crate::pipeline::BlockedReason::UserDb).await;
+                    let resume = orchestrator
+                        .clear_block(crate::pipeline::BlockedReason::UserDb)
+                        .await;
                     if prev == Some(false) {
-                        log_event_broadcast(&ui_state, "User database reachable — engine unblocked");
+                        log_event_broadcast(
+                            &ui_state,
+                            "User database reachable — engine unblocked",
+                        );
                     }
                     if resume {
                         let outcome = orchestrator.resume().await;
-                        log_event_broadcast(&ui_state, format!("[pipeline] resumed after unblock — releasing {} held message(s)", outcome.resumed_messages));
+                        log_event_broadcast(
+                            &ui_state,
+                            format!(
+                                "[pipeline] resumed after unblock — releasing {} held message(s)",
+                                outcome.resumed_messages
+                            ),
+                        );
                     }
                 }
                 prev = Some(up);
@@ -1632,9 +1793,18 @@ cockatiel
             match orchestrator.drain_queued_once().await {
                 Ok(drain) => {
                     for (uuid, error) in drain.failures {
-                        log_event_broadcast(&ui_state, format!("Recovery failed for {}: {}", uuid, error));
+                        log_event_broadcast(
+                            &ui_state,
+                            format!("Recovery failed for {}: {}", uuid, error),
+                        );
                     }
-                    log_event_broadcast(&ui_state, format!("Recovery: drained {} stranded 'queued' message(s) of {}", drain.claimed, drain.considered));
+                    log_event_broadcast(
+                        &ui_state,
+                        format!(
+                            "Recovery: drained {} stranded 'queued' message(s) of {}",
+                            drain.claimed, drain.considered
+                        ),
+                    );
                 }
                 Err(e) => log_event_broadcast(&ui_state, format!("Recovery error: {}", e)),
             }
@@ -1657,9 +1827,21 @@ cockatiel
                 config::refresh_config(&config_state);
                 let config = get_config(&config_state);
                 let updated = PipelineConfig {
-                    pre_process_modules: config.preprocess_modules.iter().map(|m| m.name.clone()).collect(),
-                    in_process_modules: config.inprocess_modules.iter().map(|m| m.name.clone()).collect(),
-                    post_process_modules: config.postprocess_modules.iter().map(|m| m.name.clone()).collect(),
+                    pre_process_modules: config
+                        .preprocess_modules
+                        .iter()
+                        .map(|m| m.name.clone())
+                        .collect(),
+                    in_process_modules: config
+                        .inprocess_modules
+                        .iter()
+                        .map(|m| m.name.clone())
+                        .collect(),
+                    post_process_modules: config
+                        .postprocess_modules
+                        .iter()
+                        .map(|m| m.name.clone())
+                        .collect(),
                     ack_timeout_ms: 3000,
                     critical_modules: Vec::new(),
                 };
@@ -1668,7 +1850,7 @@ cockatiel
         });
     }
 
-let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_string());
     let listener = TcpListener::bind(format!("{}:{}", bind_ip, config.port)).await?;
 
     // The engine only accepts WSS:// — every connection must complete a TLS
@@ -1695,8 +1877,17 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
         .map_err(|e| format!("remediation task failed: {}", e))?;
     }
     // Never print the actual PIN (it lives in `.env` as COCKATIEL_PIN).
-    log_event_broadcast(&ui_state, format!("Listening on {}:{} (WSS) | PIN: see .env (COCKATIEL_PIN)", bind_ip, config.port));
-    log_event_broadcast(&ui_state, format!("TLS certificate: {}", cert_path.display()));
+    log_event_broadcast(
+        &ui_state,
+        format!(
+            "Listening on {}:{} (WSS) | PIN: see .env (COCKATIEL_PIN)",
+            bind_ip, config.port
+        ),
+    );
+    log_event_broadcast(
+        &ui_state,
+        format!("TLS certificate: {}", cert_path.display()),
+    );
 
     let prompt_routes: SharedPromptRoutes = Arc::new(Mutex::new(HashMap::new()));
 
@@ -1711,10 +1902,9 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
     // Desired stream control (title / scheduled start / thumbnail), set by the
     // TUI via `stream_control` and polled by the adapters via `stream_schedule`.
     // Persisted next to the engine's config so a schedule survives a restart.
-    let stream_schedule: queries::SharedStreamSchedule =
-        Arc::new(Mutex::new(queries::StreamSchedule::load(
-            std::path::PathBuf::from("stream_schedule.json"),
-        )));
+    let stream_schedule: queries::SharedStreamSchedule = Arc::new(Mutex::new(
+        queries::StreamSchedule::load(std::path::PathBuf::from("stream_schedule.json")),
+    ));
 
     // Control-surface shutdown signal. Parked at Idle until an accepted
     // `engine_shutdown` request moves it to Requested; the accept loop below
@@ -1810,7 +2000,7 @@ let bind_ip = env::var("COCKATIEL_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_st
             // completes it must not squat a task (and a connection slot)
             // forever.
             match tokio::time::timeout(
-Duration::from_secs(bounds.handshake_timeout_secs as u64),
+                Duration::from_secs(bounds.handshake_timeout_secs as u64),
                 tls_acceptor.accept(stream),
             )
             .await
@@ -1842,15 +2032,24 @@ Duration::from_secs(bounds.handshake_timeout_secs as u64),
                     )
                     .await
                     {
-                        log_event_broadcast(&ui_state, format!("Connection error from {}: {}", address, error));
+                        log_event_broadcast(
+                            &ui_state,
+                            format!("Connection error from {}: {}", address, error),
+                        );
                     }
                 }
                 Ok(Err(e)) => {
                     // Plain ws:// (or a bogus handshake) lands here.
-                    log_event_broadcast(&ui_state, format!("Rejected non-TLS connection from {}: {}", address, e));
+                    log_event_broadcast(
+                        &ui_state,
+                        format!("Rejected non-TLS connection from {}: {}", address, e),
+                    );
                 }
                 Err(_) => {
-                    log_event_broadcast(&ui_state, format!("TLS handshake timed out from {}", address));
+                    log_event_broadcast(
+                        &ui_state,
+                        format!("TLS handshake timed out from {}", address),
+                    );
                 }
             }
         });
@@ -1901,7 +2100,12 @@ async fn bounded_ws_send<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    match tokio::time::timeout(Duration::from_secs(timeout_secs as u64), websocket.send(msg)).await {
+    match tokio::time::timeout(
+        Duration::from_secs(timeout_secs as u64),
+        websocket.send(msg),
+    )
+    .await
+    {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e.into()),
         Err(_) => Err("outbound WebSocket send timed out".into()),
@@ -1977,7 +2181,13 @@ where
                 container.module_name
             ),
         );
-        log_to_timeline(&db, "module_reject", &container.module_name, "first message was not a ConnectionRequest").await;
+        log_to_timeline(
+            &db,
+            "module_reject",
+            &container.module_name,
+            "first message was not a ConnectionRequest",
+        )
+        .await;
         return Ok(());
     };
 
@@ -1989,12 +2199,7 @@ where
     // registered commands immediately after connecting had them dropped, so the
     // engine never learned which commands it owned.)
     for _ in 0..32 {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(40),
-            websocket.next(),
-        )
-        .await
-        {
+        match tokio::time::timeout(std::time::Duration::from_millis(40), websocket.next()).await {
             Ok(Some(Ok(WsMessage::Binary(_)))) => {
                 log_event_broadcast(
                     &ui_state,
@@ -2026,15 +2231,27 @@ where
         if !token_valid {
             log_event(
                 &ui_state,
-                format!("Rejected: invalid auth token from '{}'", container.module_name),
+                format!(
+                    "Rejected: invalid auth token from '{}'",
+                    container.module_name
+                ),
             );
-            log_to_timeline(&db, "module_reject", &container.module_name, "invalid auth token").await;
+            log_to_timeline(
+                &db,
+                "module_reject",
+                &container.module_name,
+                "invalid auth token",
+            )
+            .await;
             websocket.close(None).await?;
             return Ok(());
         }
         log_event(
             &ui_state,
-            format!("Reconnected: {} [{}]", container.module_name, container.module_instance_uuid7),
+            format!(
+                "Reconnected: {} [{}]",
+                container.module_name, container.module_instance_uuid7
+            ),
         );
         module_name = container.module_name.clone();
         assigned_uuid = container.module_instance_uuid7.clone();
@@ -2054,7 +2271,8 @@ where
         // position/priority ride along on the ConnectionRequest.
         if auth_store.get(&assigned_uuid).is_none() {
             let position = process_position_to_string(
-                ProcessPosition::try_from(request.process_position).unwrap_or(ProcessPosition::Unspecified),
+                ProcessPosition::try_from(request.process_position)
+                    .unwrap_or(ProcessPosition::Unspecified),
             );
             auth_store.insert(AuthSession {
                 module_name: container.module_name.clone(),
@@ -2091,7 +2309,12 @@ where
         };
         let mut bytes = Vec::new();
         response.encode(&mut bytes)?;
-        bounded_ws_send(&mut websocket, WsMessage::Binary(bytes), bounds.send_timeout_secs).await?;
+        bounded_ws_send(
+            &mut websocket,
+            WsMessage::Binary(bytes),
+            bounds.send_timeout_secs,
+        )
+        .await?;
     } else {
         // New connection: validate PIN (throttled per (peer IP, module name) —
         // 5 consecutive failures lock that identity out for 60s). Keying by
@@ -2115,7 +2338,12 @@ where
             };
             let mut bytes = Vec::new();
             response.encode(&mut bytes)?;
-            bounded_ws_send(&mut websocket, WsMessage::Binary(bytes), bounds.send_timeout_secs).await?;
+            bounded_ws_send(
+                &mut websocket,
+                WsMessage::Binary(bytes),
+                bounds.send_timeout_secs,
+            )
+            .await?;
             websocket.close(None).await?;
             return Ok(());
         }
@@ -2139,7 +2367,12 @@ where
             };
             let mut bytes = Vec::new();
             response.encode(&mut bytes)?;
-            bounded_ws_send(&mut websocket, WsMessage::Binary(bytes), bounds.send_timeout_secs).await?;
+            bounded_ws_send(
+                &mut websocket,
+                WsMessage::Binary(bytes),
+                bounds.send_timeout_secs,
+            )
+            .await?;
             websocket.close(None).await?;
             return Ok(());
         }
@@ -2159,7 +2392,13 @@ where
                     container.module_name
                 ),
             );
-            log_to_timeline(&db, "module_reject", claimed, "blank/unnamed module identity").await;
+            log_to_timeline(
+                &db,
+                "module_reject",
+                claimed,
+                "blank/unnamed module identity",
+            )
+            .await;
             let response = ContainerForModule {
                 version: 2,
                 auth_token: String::new(),
@@ -2173,14 +2412,22 @@ where
             };
             let mut bytes = Vec::new();
             response.encode(&mut bytes)?;
-            bounded_ws_send(&mut websocket, WsMessage::Binary(bytes), bounds.send_timeout_secs).await?;
+            bounded_ws_send(
+                &mut websocket,
+                WsMessage::Binary(bytes),
+                bounds.send_timeout_secs,
+            )
+            .await?;
             websocket.close(None).await?;
             return Ok(());
         }
 
         module_name = container.module_name.clone();
         let requested_uuid = request.module_instance_uuid7.clone();
-        let mut position = process_position_to_string(ProcessPosition::try_from(request.process_position).unwrap_or(ProcessPosition::Unspecified));
+        let mut position = process_position_to_string(
+            ProcessPosition::try_from(request.process_position)
+                .unwrap_or(ProcessPosition::Unspecified),
+        );
         let priority = request.priority as i32;
 
         // Trust the NORMALIZED manifest capability over the requested
@@ -2299,7 +2546,10 @@ where
         };
 
         if !approved {
-            log_event_broadcast(&ui_state, format!("Rejected: user denied module '{}'", module_name));
+            log_event_broadcast(
+                &ui_state,
+                format!("Rejected: user denied module '{}'", module_name),
+            );
             log_to_timeline(&db, "module_reject", &module_name, "user denied").await;
             let response = ContainerForModule {
                 version: 2,
@@ -2314,7 +2564,12 @@ where
             };
             let mut bytes = Vec::new();
             response.encode(&mut bytes)?;
-            bounded_ws_send(&mut websocket, WsMessage::Binary(bytes), bounds.send_timeout_secs).await?;
+            bounded_ws_send(
+                &mut websocket,
+                WsMessage::Binary(bytes),
+                bounds.send_timeout_secs,
+            )
+            .await?;
             websocket.close(None).await?;
             return Ok(());
         }
@@ -2354,7 +2609,10 @@ where
         config::add_module_to_config(&config_state, &module_name, &position, priority);
         warn_stage_capability_mismatch(&module_name, &discovered_registry, &ui_state);
 
-        log_event_broadcast(&ui_state, format!("Approved: {} on {}", module_name, position));
+        log_event_broadcast(
+            &ui_state,
+            format!("Approved: {} on {}", module_name, position),
+        );
         log_to_timeline(
             &db,
             "module_connect",
@@ -2374,24 +2632,62 @@ where
                 },
             )),
         };
-let mut bytes = Vec::new();
+        let mut bytes = Vec::new();
         response.encode(&mut bytes)?;
-        bounded_ws_send(&mut websocket, WsMessage::Binary(bytes), bounds.send_timeout_secs).await?;
+        bounded_ws_send(
+            &mut websocket,
+            WsMessage::Binary(bytes),
+            bounds.send_timeout_secs,
+        )
+        .await?;
     }
 
     let instance_uuid7 = assigned_uuid;
 
     // Register module sender for pipeline routing (keyed by module name,
-    // matching the pipeline's lookups).
+    // matching the pipeline's lookups). A duplicate same-name connection from a
+    // DIFFERENT instance must NOT evict a live incumbent's routing slot: it is
+    // accepted as a silent "shadow" and only takes the slot once the incumbent's
+    // sender is closed. A reconnect of the SAME instance always takes the slot —
+    // its new socket must become the routing target even if the old socket's
+    // task has not finished closing yet (otherwise the module would be routed
+    // to a dead socket and flagged unresponsive).
     {
         let mut senders = orchestrator.module_senders.lock().await;
-        senders.insert(module_name.clone(), tx.clone());
+        let mut slot_owner = orchestrator.slot_owner.lock().await;
+        let same_instance = slot_owner
+            .get(&module_name)
+            .map(|o| o == &instance_uuid7)
+            .unwrap_or(false);
+        let live_incumbent = senders
+            .get(&module_name)
+            .map(|s| !s.is_closed())
+            .unwrap_or(false);
+        if crate::pipeline::should_shadow(live_incumbent, same_instance) {
+            let current_owner = slot_owner
+                .get(&module_name)
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            log_event_broadcast(
+                &ui_state,
+                format!(
+                    "Duplicate connection for '{}' accepted as shadow — routing slot retained by [{}]",
+                    module_name, current_owner
+                ),
+            );
+        } else {
+            senders.insert(module_name.clone(), tx.clone());
+            slot_owner.insert(module_name.clone(), instance_uuid7.clone());
+        }
     }
 
     // Register a kill switch so the probe task can close this connection
     // (running the normal cleanup) when the module goes unresponsive.
     let (kill_tx, mut kill_rx) = tokio::sync::watch::channel(false);
-    kill_map.lock().await.insert(instance_uuid7.clone(), kill_tx);
+    kill_map
+        .lock()
+        .await
+        .insert(instance_uuid7.clone(), kill_tx);
 
     // Set once this connection has queued the answer to an accepted
     // `engine_shutdown` request. The answer is, by construction, the next
@@ -2401,744 +2697,744 @@ let mut bytes = Vec::new();
 
     loop {
         tokio::select! {
-            incoming = websocket.next() => {
-                let Some(incoming) = incoming else {
-                    break;
-                };
+                    incoming = websocket.next() => {
+                        let Some(incoming) = incoming else {
+                            break;
+                        };
 
-                let message = match incoming {
-                    Ok(m) => m,
-                    Err(e) => {
-                        log_event_broadcast(&ui_state, format!("Connection error: {}", e));
-                        break;
-                    }
-                };
-                let WsMessage::Binary(data) = message else {
-                    continue;
-                };
+                        let message = match incoming {
+                            Ok(m) => m,
+                            Err(e) => {
+                                log_event_broadcast(&ui_state, format!("Connection error: {}", e));
+                                break;
+                            }
+                        };
+                        let WsMessage::Binary(data) = message else {
+                            continue;
+                        };
 
-                let container = match ContainerForEngine::decode(data.as_ref()) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        log_event_broadcast(&ui_state, format!("Decode error: {}", e));
-                        break;
-                    }
-                };
+                        let container = match ContainerForEngine::decode(data.as_ref()) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                log_event_broadcast(&ui_state, format!("Decode error: {}", e));
+                                break;
+                            }
+                        };
 
-                // Auth check on every message: the token must be valid AND
-                // bound to the name the container claims (name-trust: a valid
-                // token can't be replayed under a trusted module name), AND the
-                // session must actually be authenticated/authorized. Anything
-                // else is rejected outright — no payload is processed without
-                // valid auth.
-                if !auth_store.verify_token(
-                    &container.module_instance_uuid7,
-                    &container.auth_token,
-                    &container.module_name,
-                ) || !auth_store.is_authenticated(&container.module_instance_uuid7)
-                {
-                    log_event(
-                        &ui_state,
-                        format!(
-                            "Severed: invalid auth from '{}' ({})",
-                            container.module_name, container.module_instance_uuid7
-                        ),
-                    );
-                    websocket.close(None).await?;
-                    return Ok(());
-                }
-
-                // Any valid container proves the module is alive (this also
-                // clears a pending probe window).
-                let activity_now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64;
-                auth_store.update_activity(&container.module_instance_uuid7, activity_now);
-
-                match container.payload {
-                    Some(EnginePayload::ConnectionRequest(_)) => {
-                        log_event_broadcast(&ui_state, "Ignoring ConnectionRequest from authenticated module");
-                    }
-                    Some(EnginePayload::AuthVerify(_)) => {
-                        // Liveness probe response. The generic per-message auth
-                        // check above already verified the token; nothing more
-                        // to do — last_activity was refreshed.
-                    }
-                    Some(EnginePayload::MessagePreProcess(ref msg)) => {
-                        let mut enriched = msg.clone();
-                        if let Some(chat) = enriched.raw_message.as_mut() {
-                            // Command parsing FIRST: if the raw message starts
-                            // with a registered flag, attach the parsed Command
-                            // (with flag values) so the pipeline routes it to the
-                            // owning module (+ catch-alls). Unknown commands on
-                            // an alerting flag get the apology reply; `!help`
-                            // lists every registered command. This has to
-                            // complete before the user-data fetch below, because
-                            // whether a command was attached is an input to the
-                            // decision of whether to fetch at all.
-                            let command_outcome = handle_command_on_ingest(
-                                chat,
-                                &cmd_registry,
-                                &orchestrator,
+                        // Auth check on every message: the token must be valid AND
+                        // bound to the name the container claims (name-trust: a valid
+                        // token can't be replayed under a trusted module name), AND the
+                        // session must actually be authenticated/authorized. Anything
+                        // else is rejected outright — no payload is processed without
+                        // valid auth.
+                        if !auth_store.verify_token(
+                            &container.module_instance_uuid7,
+                            &container.auth_token,
+                            &container.module_name,
+                        ) || !auth_store.is_authenticated(&container.module_instance_uuid7)
+                        {
+                            log_event(
                                 &ui_state,
-                            )
-                            .await;
-                            // Then enrich the chat message with user data from
-                            // the user DB (if the adapter supplied a user
-                            // identifier) — but only when something downstream
-                            // will actually consume it, since the lookup costs
-                            // two WebSocket round-trips. A plain message that
-                            // no catch-all, command module or connected display
-                            // cares about is left with `user_data == None`.
-                            // Every guard is dropped before the enrich await:
-                            // a std MutexGuard must never be held across one.
-                            let connected = connected_module_names(&orchestrator.module_senders).await;
-                            let fetch = {
-                                let cfg = orchestrator.config.lock().await;
-                                let reg = cmd_registry.lock().unwrap();
-                                should_fetch_user_data(
-                                    command_outcome.command_attached(),
-                                    &reg,
-                                    &cfg,
-                                    &connected,
-                                )
-                            };
-                            if fetch {
-                                enrich_chat_user(&user_db_client, chat).await;
+                                format!(
+                                    "Severed: invalid auth from '{}' ({})",
+                                    container.module_name, container.module_instance_uuid7
+                                ),
+                            );
+                            websocket.close(None).await?;
+                            return Ok(());
+                        }
+
+                        // Any valid container proves the module is alive (this also
+                        // clears a pending probe window).
+                        let activity_now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as i64;
+                        auth_store.update_activity(&container.module_instance_uuid7, activity_now);
+
+                        match container.payload {
+                            Some(EnginePayload::ConnectionRequest(_)) => {
+                                log_event_broadcast(&ui_state, "Ignoring ConnectionRequest from authenticated module");
                             }
-                            // A real user message from an adapter: count it toward
-                            // the user's `messages_sent` (a rank factor). Best-effort
-                            // and non-blocking — a failed count never stalls ingest.
-                            if !chat.user_uuid7.is_empty() {
-                                let _ = user_db_client.increment_messages_sent(&chat.user_uuid7).await;
+                            Some(EnginePayload::AuthVerify(_)) => {
+                                // Liveness probe response. The generic per-message auth
+                                // check above already verified the token; nothing more
+                                // to do — last_activity was refreshed.
                             }
-                        }
-                        let enriched_container = ContainerForEngine {
-                            version: container.version,
-                            auth_token: container.auth_token.clone(),
-                            module_name: container.module_name.clone(),
-                            module_instance_uuid7: container.module_instance_uuid7.clone(),
-                            payload: Some(EnginePayload::MessagePreProcess(enriched)),
-                        };
-                        if let Err(e) = orchestrator.handle_message_from_module(&enriched_container).await {
-                            log_event_broadcast(&ui_state, format!("Pipeline error: {}", e));
-                        }
-                    }
-                    Some(EnginePayload::MessageInProcess(_))
-                    | Some(EnginePayload::MessagePostProcess(_))
-                    | Some(EnginePayload::MessageAck(_)) => {
-                        if let Err(e) = orchestrator.handle_message_from_module(&container).await {
-                            log_event_broadcast(&ui_state, format!("Pipeline error: {}", e));
-                        }
-                    }
-                    Some(EnginePayload::TimelineQuery(query)) => {
-                        // A module requests timeline events. Build the response
-                        // and ship it back on the same outbound channel.
-                        let id = if query.timeline_id_uuid7.is_empty() {
-                            None
-                        } else {
-                            uuid::Uuid::parse_str(&query.timeline_id_uuid7)
-                                .ok()
-                                .map(|u| u.as_bytes().to_vec())
-                        };
-                        let event_type = if query.event_type == 0 {
-                            None
-                        } else {
-                            Some(query.event_type as i32)
-                        };
-                        let platform = if query.platform.is_empty() { None } else { Some(query.platform.as_str()) };
-                        let user = if query.user_uuid7.is_empty() { None } else { Some(query.user_uuid7.as_str()) };
-                        let kind = if query.kind.is_empty() { None } else { Some(query.kind.as_str()) };
-                        let raw_prefix = if query.raw_prefix.is_empty() { None } else { Some(query.raw_prefix.as_str()) };
-                        let since = if query.since_ms == 0 { None } else { Some(query.since_ms) };
-                        let pipeline_status = if query.pipeline_status.is_empty() {
-                            None
-                        } else {
-                            Some(query.pipeline_status.as_str())
-                        };
-                        let rows = db
-                            .query_timeline(
-                                id.as_deref(),
-                                event_type,
-                                platform,
-                                user,
-                                kind,
-                                raw_prefix,
-                                since,
-                                pipeline_status,
-                                query.limit,
-                                query.offset,
-                            )
-                            .await;
-                        match rows {
-                            Ok(json) => {
-                                let events = serde_json::from_str::<Vec<serde_json::Value>>(&json)
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .filter_map(|row| {
-                                        Some(cockatiel_protobuf::TimelineEvent {
-                                            timeline_id_uuid7: row.get("timeline_id_uuid7")?.as_str()?.to_string(),
-                                            event_type: row
-                                                .get("event_type")
-                                                .and_then(|v| v.as_i64())
-                                                .unwrap_or(0) as i32,
-                                            command_flag: row.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                                            data_blob: Vec::new(),
-                                            error_message: row.get("error_message").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                                            raw_flags: row.get("flags").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                                            message_origin: String::new(),
-                                            stream_origin: row.get("platform").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                                            raw_message: row.get("raw_message").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                                            processed_message: row.get("processed_message").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                                            user_uuid7: row.get("user_uuid7").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                                            version: 0,
-                                            pipeline_status: row.get("pipeline_status").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                                        })
-                                    })
-                                    .collect();
-                                let result = TimelineQueryResult {
-                                    events,
-                                    truncated: false,
-                                    request_id: query.request_id.clone(),
+                            Some(EnginePayload::MessagePreProcess(ref msg)) => {
+                                let mut enriched = msg.clone();
+                                if let Some(chat) = enriched.raw_message.as_mut() {
+                                    // Command parsing FIRST: if the raw message starts
+                                    // with a registered flag, attach the parsed Command
+                                    // (with flag values) so the pipeline routes it to the
+                                    // owning module (+ catch-alls). Unknown commands on
+                                    // an alerting flag get the apology reply; `!help`
+                                    // lists every registered command. This has to
+                                    // complete before the user-data fetch below, because
+                                    // whether a command was attached is an input to the
+                                    // decision of whether to fetch at all.
+                                    let command_outcome = handle_command_on_ingest(
+                                        chat,
+                                        &cmd_registry,
+                                        &orchestrator,
+                                        &ui_state,
+                                    )
+                                    .await;
+                                    // Then enrich the chat message with user data from
+                                    // the user DB (if the adapter supplied a user
+                                    // identifier) — but only when something downstream
+                                    // will actually consume it, since the lookup costs
+                                    // two WebSocket round-trips. A plain message that
+                                    // no catch-all, command module or connected display
+                                    // cares about is left with `user_data == None`.
+                                    // Every guard is dropped before the enrich await:
+                                    // a std MutexGuard must never be held across one.
+                                    let connected = connected_module_names(&orchestrator.module_senders).await;
+                                    let fetch = {
+                                        let cfg = orchestrator.config.lock().await;
+                                        let reg = cmd_registry.lock().unwrap();
+                                        should_fetch_user_data(
+                                            command_outcome.command_attached(),
+                                            &reg,
+                                            &cfg,
+                                            &connected,
+                                        )
+                                    };
+                                    if fetch {
+                                        enrich_chat_user(&user_db_client, chat).await;
+                                    }
+                                    // A real user message from an adapter: count it toward
+                                    // the user's `messages_sent` (a rank factor). Best-effort
+                                    // and non-blocking — a failed count never stalls ingest.
+                                    if !chat.user_uuid7.is_empty() {
+                                        let _ = user_db_client.increment_messages_sent(&chat.user_uuid7).await;
+                                    }
+                                }
+                                let enriched_container = ContainerForEngine {
+                                    version: container.version,
+                                    auth_token: container.auth_token.clone(),
+                                    module_name: container.module_name.clone(),
+                                    module_instance_uuid7: container.module_instance_uuid7.clone(),
+                                    payload: Some(EnginePayload::MessagePreProcess(enriched)),
                                 };
+                                if let Err(e) = orchestrator.handle_message_from_module(&enriched_container).await {
+                                    log_event_broadcast(&ui_state, format!("Pipeline error: {}", e));
+                                }
+                            }
+                            Some(EnginePayload::MessageInProcess(_))
+                            | Some(EnginePayload::MessagePostProcess(_))
+                            | Some(EnginePayload::MessageAck(_)) => {
+                                if let Err(e) = orchestrator.handle_message_from_module(&container).await {
+                                    log_event_broadcast(&ui_state, format!("Pipeline error: {}", e));
+                                }
+                            }
+                            Some(EnginePayload::TimelineQuery(query)) => {
+                                // A module requests timeline events. Build the response
+                                // and ship it back on the same outbound channel.
+                                let id = if query.timeline_id_uuid7.is_empty() {
+                                    None
+                                } else {
+                                    uuid::Uuid::parse_str(&query.timeline_id_uuid7)
+                                        .ok()
+                                        .map(|u| u.as_bytes().to_vec())
+                                };
+                                let event_type = if query.event_type == 0 {
+                                    None
+                                } else {
+                                    Some(query.event_type as i32)
+                                };
+                                let platform = if query.platform.is_empty() { None } else { Some(query.platform.as_str()) };
+                                let user = if query.user_uuid7.is_empty() { None } else { Some(query.user_uuid7.as_str()) };
+                                let kind = if query.kind.is_empty() { None } else { Some(query.kind.as_str()) };
+                                let raw_prefix = if query.raw_prefix.is_empty() { None } else { Some(query.raw_prefix.as_str()) };
+                                let since = if query.since_ms == 0 { None } else { Some(query.since_ms) };
+                                let pipeline_status = if query.pipeline_status.is_empty() {
+                                    None
+                                } else {
+                                    Some(query.pipeline_status.as_str())
+                                };
+                                let rows = db
+                                    .query_timeline(
+                                        id.as_deref(),
+                                        event_type,
+                                        platform,
+                                        user,
+                                        kind,
+                                        raw_prefix,
+                                        since,
+                                        pipeline_status,
+                                        query.limit,
+                                        query.offset,
+                                    )
+                                    .await;
+                                match rows {
+                                    Ok(json) => {
+                                        let events = serde_json::from_str::<Vec<serde_json::Value>>(&json)
+                                            .unwrap_or_default()
+                                            .into_iter()
+                                            .filter_map(|row| {
+                                                Some(cockatiel_protobuf::TimelineEvent {
+                                                    timeline_id_uuid7: row.get("timeline_id_uuid7")?.as_str()?.to_string(),
+                                                    event_type: row
+                                                        .get("event_type")
+                                                        .and_then(|v| v.as_i64())
+                                                        .unwrap_or(0) as i32,
+                                                    command_flag: row.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                                    data_blob: Vec::new(),
+                                                    error_message: row.get("error_message").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                                    raw_flags: row.get("flags").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                                    message_origin: String::new(),
+                                                    stream_origin: row.get("platform").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                                    raw_message: row.get("raw_message").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                                    processed_message: row.get("processed_message").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                                    user_uuid7: row.get("user_uuid7").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                                    version: 0,
+                                                    pipeline_status: row.get("pipeline_status").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                                })
+                                            })
+                                            .collect();
+                                        let result = TimelineQueryResult {
+                                            events,
+                                            truncated: false,
+                                            request_id: query.request_id.clone(),
+                                        };
+                                        let reply = ContainerForModule {
+                                            version: 2,
+                                            auth_token: container.auth_token.clone(),
+                                            module_instance_uuid7: container.module_instance_uuid7.clone(),
+                                            payload: Some(ModulePayload::TimelineQueryResult(result)),
+                                        };
+                                        let mut buf = Vec::new();
+                                        if reply.encode(&mut buf).is_ok() {
+                                            if let Err(e) = bounded_ws_send(&mut websocket, WsMessage::Binary(buf), bounds.send_timeout_secs).await {
+                                                log_event_broadcast(&ui_state, format!("TimelineQuery reply send failed: {}", e));
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log_event_broadcast(&ui_state, format!("TimelineQuery failed: {}", e));
+                                    }
+                                }
+                            }
+                            Some(EnginePayload::Log(ref lg)) => {
+                                log_event(&ui_state, format!("[{}] {}", module_name, lg.log));
+                                log_to_timeline(&db, "module_log", &module_name, &lg.log).await;
+                            }
+                            Some(EnginePayload::Err(ref err)) => {
+                                log_event(&ui_state, format!("[{}] Error: {}", module_name, err.log));
+                                log_to_timeline(&db, "module_error", &module_name, &err.log).await;
+                            }
+                            Some(EnginePayload::DatabaseQuery(ref query)) => {
+                                // The query surface, its gates and its response
+                                // envelope all live in `queries`; this arm only lends
+                                // it the connection's ambient state and ships the answer
+                                // back on the same 1s bound it always used.
+                                let was_requested = shutdown.stage() == ShutdownStage::Requested;
+                                let ctx = QueryContext {
+                                    db: &db,
+                                    auth_store: &auth_store,
+                                    orchestrator: &orchestrator,
+                                    ui_state: &ui_state,
+                                    user_db_client: &user_db_client,
+                                    config_state: &config_state,
+                                    module_registry: &module_registry,
+                                    discovered_registry: &discovered_registry,
+                                    prompt_routes: &prompt_routes,
+                                    channel_stats: &channel_stats,
+                                    leaderboard: &leaderboard,
+                                    stream_schedule: &stream_schedule,
+                                    module_name: &module_name,
+                                    instance_uuid7: &instance_uuid7,
+                                    tx: &tx,
+                                    shutdown: &shutdown,
+                                    peer_loopback,
+                                };
+                                let outcome =
+                                    queries::handle_query(&ctx, &query.query_id, &query.sql).await;
+                                // Did THIS query raise a shutdown request? Reading the
+                                // signal either side of the call is what makes the
+                                // answer below unambiguous: a concurrent request on
+                                // another socket cannot claim this connection's write.
+                                let answered_with_shutdown =
+                                    !was_requested && shutdown.stage() == ShutdownStage::Requested;
+                                let queued = queries::send_query_response(
+                                    &ctx,
+                                    &container.auth_token,
+                                    &query.query_id,
+                                    outcome,
+                                )
+                                .await;
+                                // Armed only now — AFTER the answer is on the channel.
+                                // The channel is FIFO and the answer was queued before
+                                // this point, so the very next frame this socket writes
+                                // IS the answer, whatever the log-broadcast task has
+                                // enqueued around it. The outbound arm below completes
+                                // the handoff once that write lands; the main loop is
+                                // holding the exit until it does.
+                                shutdown_flush = answered_with_shutdown && queued;
+                                if answered_with_shutdown && !queued {
+                                    // The answer could not even be queued (the outbound
+                                    // channel is wedged — `send_query_response` has
+                                    // already logged the drop). There is nothing to
+                                    // write and nothing to wait for, so release the
+                                    // exit rather than leaving the engine running after
+                                    // it accepted the request.
+                                    shutdown.mark_answered();
+                                }
+                            }
+        Some(EnginePayload::QueryRequest(req)) => {
+                                // The typed Phase-2 query surface: dispatch by QueryOp
+                                // and reply with a QueryResponse (not the legacy
+                                // DatabaseQueryResult envelope).
+                                let ctx = QueryContext {
+                                    db: &db,
+                                    auth_store: &auth_store,
+                                    orchestrator: &orchestrator,
+                                    ui_state: &ui_state,
+                                    user_db_client: &user_db_client,
+                                    config_state: &config_state,
+                                    module_registry: &module_registry,
+                                    discovered_registry: &discovered_registry,
+                                    prompt_routes: &prompt_routes,
+                                    channel_stats: &channel_stats,
+                                    leaderboard: &leaderboard,
+                                    stream_schedule: &stream_schedule,
+                                    module_name: &module_name,
+                                    instance_uuid7: &instance_uuid7,
+                                    tx: &tx,
+                                    shutdown: &shutdown,
+                                    peer_loopback,
+                                };
+                                let outcome =
+                                    queries::handle_query_request(&ctx, &req).await;
                                 let reply = ContainerForModule {
                                     version: 2,
                                     auth_token: container.auth_token.clone(),
                                     module_instance_uuid7: container.module_instance_uuid7.clone(),
-                                    payload: Some(ModulePayload::TimelineQueryResult(result)),
+                                    payload: Some(ModulePayload::QueryResponse(
+                                        cockatiel_protobuf::QueryResponse {
+                                            request_id: req.request_id.clone(),
+                                            operation: req.operation,
+                                            success: outcome.success,
+                                            error: outcome.error,
+                                            result: Some(cockatiel_protobuf::QueryResult {
+                                                result_blob: outcome.result_blob,
+                                            }),
+                                        },
+                                    )),
                                 };
                                 let mut buf = Vec::new();
                                 if reply.encode(&mut buf).is_ok() {
                                     if let Err(e) = bounded_ws_send(&mut websocket, WsMessage::Binary(buf), bounds.send_timeout_secs).await {
-                                        log_event_broadcast(&ui_state, format!("TimelineQuery reply send failed: {}", e));
+                                        log_event_broadcast(&ui_state, format!("QueryResponse send failed: {}", e));
                                     }
                                 }
                             }
-                            Err(e) => {
-                                log_event_broadcast(&ui_state, format!("TimelineQuery failed: {}", e));
-                            }
-                        }
-                    }
-                    Some(EnginePayload::Log(ref lg)) => {
-                        log_event(&ui_state, format!("[{}] {}", module_name, lg.log));
-                        log_to_timeline(&db, "module_log", &module_name, &lg.log).await;
-                    }
-                    Some(EnginePayload::Err(ref err)) => {
-                        log_event(&ui_state, format!("[{}] Error: {}", module_name, err.log));
-                        log_to_timeline(&db, "module_error", &module_name, &err.log).await;
-                    }
-                    Some(EnginePayload::DatabaseQuery(ref query)) => {
-                        // The query surface, its gates and its response
-                        // envelope all live in `queries`; this arm only lends
-                        // it the connection's ambient state and ships the answer
-                        // back on the same 1s bound it always used.
-                        let was_requested = shutdown.stage() == ShutdownStage::Requested;
-                        let ctx = QueryContext {
-                            db: &db,
-                            auth_store: &auth_store,
-                            orchestrator: &orchestrator,
-                            ui_state: &ui_state,
-                            user_db_client: &user_db_client,
-                            config_state: &config_state,
-                            module_registry: &module_registry,
-                            discovered_registry: &discovered_registry,
-                            prompt_routes: &prompt_routes,
-                            channel_stats: &channel_stats,
-                            leaderboard: &leaderboard,
-                            stream_schedule: &stream_schedule,
-                            module_name: &module_name,
-                            instance_uuid7: &instance_uuid7,
-                            tx: &tx,
-                            shutdown: &shutdown,
-                            peer_loopback,
-                        };
-                        let outcome =
-                            queries::handle_query(&ctx, &query.query_id, &query.sql).await;
-                        // Did THIS query raise a shutdown request? Reading the
-                        // signal either side of the call is what makes the
-                        // answer below unambiguous: a concurrent request on
-                        // another socket cannot claim this connection's write.
-                        let answered_with_shutdown =
-                            !was_requested && shutdown.stage() == ShutdownStage::Requested;
-                        let queued = queries::send_query_response(
-                            &ctx,
-                            &container.auth_token,
-                            &query.query_id,
-                            outcome,
-                        )
-                        .await;
-                        // Armed only now — AFTER the answer is on the channel.
-                        // The channel is FIFO and the answer was queued before
-                        // this point, so the very next frame this socket writes
-                        // IS the answer, whatever the log-broadcast task has
-                        // enqueued around it. The outbound arm below completes
-                        // the handoff once that write lands; the main loop is
-                        // holding the exit until it does.
-                        shutdown_flush = answered_with_shutdown && queued;
-                        if answered_with_shutdown && !queued {
-                            // The answer could not even be queued (the outbound
-                            // channel is wedged — `send_query_response` has
-                            // already logged the drop). There is nothing to
-                            // write and nothing to wait for, so release the
-                            // exit rather than leaving the engine running after
-                            // it accepted the request.
-                            shutdown.mark_answered();
-                        }
-                    }
-Some(EnginePayload::QueryRequest(req)) => {
-                        // The typed Phase-2 query surface: dispatch by QueryOp
-                        // and reply with a QueryResponse (not the legacy
-                        // DatabaseQueryResult envelope).
-                        let ctx = QueryContext {
-                            db: &db,
-                            auth_store: &auth_store,
-                            orchestrator: &orchestrator,
-                            ui_state: &ui_state,
-                            user_db_client: &user_db_client,
-                            config_state: &config_state,
-                            module_registry: &module_registry,
-                            discovered_registry: &discovered_registry,
-                            prompt_routes: &prompt_routes,
-                            channel_stats: &channel_stats,
-                            leaderboard: &leaderboard,
-                            stream_schedule: &stream_schedule,
-                            module_name: &module_name,
-                            instance_uuid7: &instance_uuid7,
-                            tx: &tx,
-                            shutdown: &shutdown,
-                            peer_loopback,
-                        };
-                        let outcome =
-                            queries::handle_query_request(&ctx, &req).await;
-                        let reply = ContainerForModule {
-                            version: 2,
-                            auth_token: container.auth_token.clone(),
-                            module_instance_uuid7: container.module_instance_uuid7.clone(),
-                            payload: Some(ModulePayload::QueryResponse(
-                                cockatiel_protobuf::QueryResponse {
-                                    request_id: req.request_id.clone(),
-                                    operation: req.operation,
-                                    success: outcome.success,
-                                    error: outcome.error,
-                                    result: Some(cockatiel_protobuf::QueryResult {
-                                        result_blob: outcome.result_blob,
-                                    }),
-                                },
-                            )),
-                        };
-                        let mut buf = Vec::new();
-                        if reply.encode(&mut buf).is_ok() {
-                            if let Err(e) = bounded_ws_send(&mut websocket, WsMessage::Binary(buf), bounds.send_timeout_secs).await {
-                                log_event_broadcast(&ui_state, format!("QueryResponse send failed: {}", e));
-                            }
-                        }
-                    }
-                    Some(EnginePayload::SendToPlatforms(send)) => {
-                        // The actor (the human who triggered the send) must be
-                        // verified against the user DB before anything routes.
-                        let actor_lookup = if !send.actor_uuid7.is_empty() {
-                            user_db_client.get_user(&send.actor_uuid7, "", "", "").await
-                        } else {
-                            user_db_client.get_user("", &send.actor_platform, &send.actor_handle, &send.actor_handle).await
-                        };
-                        let actor_ok = match actor_lookup {
-                            Ok(resp) => match resp.user {
-                                Some(user) => user.is_moderator || user.is_admin || user.is_owner,
-                                None => false,
-                            },
-                            Err(e) => {
-                                log_event_broadcast(&ui_state, format!("[SendToPlatforms] actor lookup failed: {}", e));
-                                false
-                            }
-                        };
-                        if !actor_ok {
-                            let actor_where = if send.actor_platform.is_empty() { String::new() } else { format!(" on {}", send.actor_platform) };
-                            log_event(
-                                &ui_state,
-                                format!("[SendToPlatforms] denied: actor '{}{}' is not a verified moderator/admin/owner", send.actor_handle, actor_where),
-                            );
-                            continue;
-                        }
-
-                        // Route an outbound message to the target adapter(s).
-                        // platform: "twitch"|"kick"|"youtube"|"all"
-let targets: Vec<&str> = match send.platform.as_str() {
-                            "all" => vec!["twitch-adapter", "kick-adapter", "youtube-adapter", "discord-adapter"],
-                            "twitch" => vec!["twitch-adapter"],
-                            "kick" => vec!["kick-adapter"],
-                            "youtube" => vec!["youtube-adapter"],
-                            "discord" => vec!["discord-adapter"],
-                            other => {
-                                log_event(&ui_state, format!("[SendToPlatforms] unknown platform '{}'", other));
-                                Vec::new()
-                            }
-                        };
-                        let forward = ContainerForModule {
-                            version: 2,
-                            auth_token: container.auth_token.clone(),
-                            module_instance_uuid7: container.module_instance_uuid7.clone(),
-                            payload: Some(ModulePayload::SendToPlatforms(send.clone())),
-                        };
-                        for name in targets {
-                            let sent = crate::pipeline::send_to_module(&orchestrator.module_senders, name, forward.clone(), "SendToPlatforms").await;
-                            if matches!(sent, SendOutcome::Sent) {
-                                log_event_broadcast(&ui_state, format!("[SendToPlatforms] '{}' -> {}", container.module_name, name));
-                            } else if matches!(sent, SendOutcome::Dropped) {
-                                log_event_broadcast(&ui_state, format!("[SendToPlatforms] adapter '{}' dropped (channel full)", name));
-                            } else {
-                                log_event_broadcast(&ui_state, format!("[SendToPlatforms] adapter '{}' not connected", name));
-                            }
-                        }
-
-                        // Timeline archival: record who sent the outbound message.
-                        let flags = serde_json::json!({
-                            "actor_platform": send.actor_platform,
-                            "actor_handle": send.actor_handle,
-                            "target": send.platform,
-                        }).to_string();
-                        if let Err(e) = db.insert_archival_event("engine", "send_to_platforms", &send.msg, &flags).await {
-                            log_event_broadcast(&ui_state, format!("[SendToPlatforms] archival insert failed: {}", e));
-                        } else {
-                            log_event_broadcast(&ui_state, format!("[SendToPlatforms] '{}' -> {} (by {})", send.msg, send.platform, send.actor_handle));
-                        }
-                    }
-Some(EnginePayload::ModuleControl(_)) => {
-                        // Process lifecycle is owned by the TUI supervisor.
-                        // The engine no longer starts/stops modules.
-                        log_event_broadcast(&ui_state, "[{}] ModuleControl ignored (processes owned by TUI)".to_string());
-                    }
-                    Some(EnginePayload::Commands(commands)) => {
-                        // Command registration: the module subscribes to these
-                        // (flag, command) pairs. An EMPTY list = catch-all
-                        // (receives every message). `alert_on_unknown_command`
-                        // opts into the apology reply for unregistered commands
-                        // under this module's flags.
-                        let n = commands.commands.len();
-                        cmd_registry.lock().unwrap().register(&module_name, commands.clone());
-                        log_event_broadcast(
-                            &ui_state,
-                            format!(
-                                "[Commands] {} registered ({} command(s), catch_all={})",
-                                module_name,
-                                n,
-                                n == 0
-                            ),
-                        );
-                    }
-                    Some(EnginePayload::Command(command)) => {
-                        // Standalone command invocation: a module/UI sends a
-                        // `Command` outside of any chat message. The engine
-                        // routes it to the owning module (delivered as a
-                        // MessagePreProcess carrying the command, origin =
-                        // the sender's module identity). Unregistered commands
-                        // are logged + ignored.
-                        let owner = {
-                        let registry = cmd_registry.lock().unwrap();
-                        registry.owner(&command.command_flag, &command.command_name)
-                    }; // guard dropped before any await
-                    if let Some(owner) = owner {
-                            let forward = ContainerForModule {
-                                version: 2,
-                                auth_token: String::new(),
-                                module_instance_uuid7: String::new(),
-                                payload: Some(ModulePayload::MessagePreProcess(
-                                    cockatiel_protobuf::MessagePreProcess {
-                                        message_uuid7: String::new(),
-                                        raw_message: Some(cockatiel_protobuf::ChatMessage {
-                                            platform: format!("command:{}", module_name),
-                                            raw_data: vec![],
-                                            raw_message: String::new(),
-                                            user_uuid7: String::new(),
-                                            command: Some(command.clone()),
-                                            channel_id: String::new(),
-                                            user_data: None,
-                                        }),
-                                        audio: Vec::new(),
-                                        audio_type: String::new(),
+                            Some(EnginePayload::SendToPlatforms(send)) => {
+                                // The actor (the human who triggered the send) must be
+                                // verified against the user DB before anything routes.
+                                let actor_lookup = if !send.actor_uuid7.is_empty() {
+                                    user_db_client.get_user(&send.actor_uuid7, "", "", "").await
+                                } else {
+                                    user_db_client.get_user("", &send.actor_platform, &send.actor_handle, &send.actor_handle).await
+                                };
+                                let actor_ok = match actor_lookup {
+                                    Ok(resp) => match resp.user {
+                                        Some(user) => user.is_moderator || user.is_admin || user.is_owner,
+                                        None => false,
                                     },
-                                )),
-                            };
-                            let sent = crate::pipeline::send_to_module(&orchestrator.module_senders, &owner, forward, "command").await;
-                            if matches!(sent, SendOutcome::Sent) {
-                                log_event_broadcast(
-                                    &ui_state,
-                                    format!(
-                                        "[Commands] {} invoked '{}' -> {}",
-                                        module_name,
-                                        command.command_name,
-                                        owner
-                                    ),
-                                );
-                            } else if matches!(sent, SendOutcome::Dropped) {
-                                log_event_broadcast(
-                                    &ui_state,
-                                    format!(
-                                        "[Commands] owner '{}' of '{}' dropped (channel full)",
-                                        owner, command.command_name
-                                    ),
-                                );
-                            } else {
-                                log_event_broadcast(
-                                    &ui_state,
-                                    format!("[Commands] owner '{}' of '{}' not connected", owner, command.command_name),
-                                );
-                            }
-                        } else {
-                            log_event_broadcast(
-                                &ui_state,
-                                format!(
-                                    "[Commands] unregistered command '{}' invoked by {}",
-                                    command.command_name, module_name
-                                ),
-                            );
-                        }
-                    }
-                    Some(EnginePayload::Prompt(ref prompt)) => {
-                        // A module is asking the user something (e.g. "allow this
-                        // action?"). Forward it to every OTHER connected module so
-                        // they can display it, and remember the origin so a
-                        // PromptResponse can be routed back to it.
-                        let prompt = prompt.clone();
-                        prompt_routes.lock().unwrap().insert(
-                            prompt.prompt_id_uuid7.clone(),
-                            PromptSink::Module(module_name.clone(), tx.clone()),
-                        );
-                        let forward = ContainerForModule {
-                            version: 2,
-                            auth_token: container.auth_token.clone(),
-                            module_instance_uuid7: container.module_instance_uuid7.clone(),
-                            payload: Some(ModulePayload::Prompt(prompt)),
-                        };
-                        let senders: Vec<tokio::sync::mpsc::Sender<ContainerForModule>> = {
-                            let senders = orchestrator.module_senders.lock().await;
-                            senders
-                                .iter()
-                                .filter(|(n, _)| n.as_str() != module_name.as_str())
-                                .map(|(_, s)| s.clone())
-                                .collect()
-                        };
-                        for sender in senders {
-                            let _ = sender.try_send(forward.clone());
-                        }
-                    }
-                    Some(EnginePayload::PredictionUpdate(ref update)) => {
-                        // The predictions module (the brain) broadcasts a
-                        // prediction bar to every connected module so they can
-                        // display it. Only the brain — or the TUI control
-                        // surface — may do this: a random module spoofing a bar
-                        // would be indistinguishable from a real one, so the
-                        // origin is gated before the forward.
-                        if module_name != "events" && !is_control_surface(&module_name) {
-                            log_event_broadcast(
-                                &ui_state,
-                                format!("[PredictionUpdate] ignored from '{}': only the events module or TUI may broadcast", module_name),
-                            );
-                        } else {
-                            let update = update.clone();
-                            let forward = ContainerForModule {
-                                version: 2,
-                                auth_token: container.auth_token.clone(),
-                                module_instance_uuid7: container.module_instance_uuid7.clone(),
-                                payload: Some(ModulePayload::PredictionUpdate(update)),
-                            };
-                            let senders: Vec<tokio::sync::mpsc::Sender<ContainerForModule>> = {
-                                let senders = orchestrator.module_senders.lock().await;
-                                senders
-                                    .iter()
-                                    .filter(|(n, _)| n.as_str() != module_name.as_str())
-                                    .map(|(_, s)| s.clone())
-                                    .collect()
-                            };
-                            for sender in senders {
-                                let _ = sender.try_send(forward.clone());
-                            }
-                        }
-                    }
-                    Some(EnginePayload::PollUpdate(ref update)) => {
-                        // Same relay contract as PredictionUpdate: the
-                        // predictions module broadcasts free-vote poll state to
-                        // every connected module. Origin-gated identically — a
-                        // random module spoofing a poll would be
-                        // indistinguishable from a real one.
-                        if module_name != "events" && !is_control_surface(&module_name) {
-                            log_event_broadcast(
-                                &ui_state,
-                                format!("[PollUpdate] ignored from '{}': only the events module or TUI may broadcast", module_name),
-                            );
-                        } else {
-                            let update = update.clone();
-                            let forward = ContainerForModule {
-                                version: 2,
-                                auth_token: container.auth_token.clone(),
-                                module_instance_uuid7: container.module_instance_uuid7.clone(),
-                                payload: Some(ModulePayload::PollUpdate(update)),
-                            };
-                            let senders: Vec<tokio::sync::mpsc::Sender<ContainerForModule>> = {
-                                let senders = orchestrator.module_senders.lock().await;
-                                senders
-                                    .iter()
-                                    .filter(|(n, _)| n.as_str() != module_name.as_str())
-                                    .map(|(_, s)| s.clone())
-                                    .collect()
-                            };
-                            for sender in senders {
-                                let _ = sender.try_send(forward.clone());
-                            }
-                        }
-                    }
-                    Some(EnginePayload::ChannelStats(ref stats)) => {
-                        // Adapters push their channel's current viewer/member
-                        // count on each poll; the engine stores it so other
-                        // modules can read it on demand via the
-                        // `channel_viewers` virtual query. Origin-gated to the
-                        // platform adapters — a random module spoofing counts
-                        // would poison every consumer.
-                        if !CHANNEL_STATS_ADAPTERS.contains(&module_name.as_str()) {
-                            log_event_broadcast(
-                                &ui_state,
-                                format!("[ChannelStats] ignored from '{}': only the platform adapters may publish viewer counts", module_name),
-                            );
-                        } else {
-                            let stats = stats.clone();
-                            let mut map = channel_stats.lock().unwrap();
-                            map.insert(
-                                format!("{}:{}", stats.platform, stats.channel),
-                                ChannelStatsEntry {
-                                    platform: stats.platform,
-                                    channel: stats.channel,
-                                    viewers: stats.viewers,
-                                    is_live: stats.is_live,
-                                    title: stats.title,
-                                    updated_at: stats.updated_at,
-                                },
-                            );
-                        }
-                    }
-                    Some(EnginePayload::PromptResponse(ref resp)) => {
-                        // Route the user's answer back to whoever is waiting on
-                        // this prompt_id (the engine's own connection prompt, or
-                        // the module that originally raised the prompt).
-                        let resp = resp.clone();
-                        let sink = {
-                            let mut routes = prompt_routes.lock().unwrap();
-                            routes.remove(&resp.prompt_id_uuid7)
-                        };
-                        if let Some(sink) = sink {
-                            match sink {
-                                PromptSink::Engine(tx) => {
-                                    // oneshot send — non-blocking by construction.
-                                    let _ = tx.send(resp.accepted);
+                                    Err(e) => {
+                                        log_event_broadcast(&ui_state, format!("[SendToPlatforms] actor lookup failed: {}", e));
+                                        false
+                                    }
+                                };
+                                if !actor_ok {
+                                    let actor_where = if send.actor_platform.is_empty() { String::new() } else { format!(" on {}", send.actor_platform) };
+                                    log_event(
+                                        &ui_state,
+                                        format!("[SendToPlatforms] denied: actor '{}{}' is not a verified moderator/admin/owner", send.actor_handle, actor_where),
+                                    );
+                                    continue;
                                 }
-                                PromptSink::Module(_origin, sender) => {
+
+                                // Route an outbound message to the target adapter(s).
+                                // platform: "twitch"|"kick"|"youtube"|"all"
+        let targets: Vec<&str> = match send.platform.as_str() {
+                                    "all" => vec!["twitch-adapter", "kick-adapter", "youtube-adapter", "discord-adapter"],
+                                    "twitch" => vec!["twitch-adapter"],
+                                    "kick" => vec!["kick-adapter"],
+                                    "youtube" => vec!["youtube-adapter"],
+                                    "discord" => vec!["discord-adapter"],
+                                    other => {
+                                        log_event(&ui_state, format!("[SendToPlatforms] unknown platform '{}'", other));
+                                        Vec::new()
+                                    }
+                                };
+                                let forward = ContainerForModule {
+                                    version: 2,
+                                    auth_token: container.auth_token.clone(),
+                                    module_instance_uuid7: container.module_instance_uuid7.clone(),
+                                    payload: Some(ModulePayload::SendToPlatforms(send.clone())),
+                                };
+                                for name in targets {
+                                    let sent = crate::pipeline::send_to_module(&orchestrator.module_senders, name, forward.clone(), "SendToPlatforms").await;
+                                    if matches!(sent, SendOutcome::Sent) {
+                                        log_event_broadcast(&ui_state, format!("[SendToPlatforms] '{}' -> {}", container.module_name, name));
+                                    } else if matches!(sent, SendOutcome::Dropped) {
+                                        log_event_broadcast(&ui_state, format!("[SendToPlatforms] adapter '{}' dropped (channel full)", name));
+                                    } else {
+                                        log_event_broadcast(&ui_state, format!("[SendToPlatforms] adapter '{}' not connected", name));
+                                    }
+                                }
+
+                                // Timeline archival: record who sent the outbound message.
+                                let flags = serde_json::json!({
+                                    "actor_platform": send.actor_platform,
+                                    "actor_handle": send.actor_handle,
+                                    "target": send.platform,
+                                }).to_string();
+                                if let Err(e) = db.insert_archival_event("engine", "send_to_platforms", &send.msg, &flags).await {
+                                    log_event_broadcast(&ui_state, format!("[SendToPlatforms] archival insert failed: {}", e));
+                                } else {
+                                    log_event_broadcast(&ui_state, format!("[SendToPlatforms] '{}' -> {} (by {})", send.msg, send.platform, send.actor_handle));
+                                }
+                            }
+        Some(EnginePayload::ModuleControl(_)) => {
+                                // Process lifecycle is owned by the TUI supervisor.
+                                // The engine no longer starts/stops modules.
+                                log_event_broadcast(&ui_state, "[{}] ModuleControl ignored (processes owned by TUI)".to_string());
+                            }
+                            Some(EnginePayload::Commands(commands)) => {
+                                // Command registration: the module subscribes to these
+                                // (flag, command) pairs. An EMPTY list = catch-all
+                                // (receives every message). `alert_on_unknown_command`
+                                // opts into the apology reply for unregistered commands
+                                // under this module's flags.
+                                let n = commands.commands.len();
+                                cmd_registry.lock().unwrap().register(&module_name, commands.clone());
+                                log_event_broadcast(
+                                    &ui_state,
+                                    format!(
+                                        "[Commands] {} registered ({} command(s), catch_all={})",
+                                        module_name,
+                                        n,
+                                        n == 0
+                                    ),
+                                );
+                            }
+                            Some(EnginePayload::Command(command)) => {
+                                // Standalone command invocation: a module/UI sends a
+                                // `Command` outside of any chat message. The engine
+                                // routes it to the owning module (delivered as a
+                                // MessagePreProcess carrying the command, origin =
+                                // the sender's module identity). Unregistered commands
+                                // are logged + ignored.
+                                let owner = {
+                                let registry = cmd_registry.lock().unwrap();
+                                registry.owner(&command.command_flag, &command.command_name)
+                            }; // guard dropped before any await
+                            if let Some(owner) = owner {
+                                    let forward = ContainerForModule {
+                                        version: 2,
+                                        auth_token: String::new(),
+                                        module_instance_uuid7: String::new(),
+                                        payload: Some(ModulePayload::MessagePreProcess(
+                                            cockatiel_protobuf::MessagePreProcess {
+                                                message_uuid7: String::new(),
+                                                raw_message: Some(cockatiel_protobuf::ChatMessage {
+                                                    platform: format!("command:{}", module_name),
+                                                    raw_data: vec![],
+                                                    raw_message: String::new(),
+                                                    user_uuid7: String::new(),
+                                                    command: Some(command.clone()),
+                                                    channel_id: String::new(),
+                                                    user_data: None,
+                                                }),
+                                                audio: Vec::new(),
+                                                audio_type: String::new(),
+                                            },
+                                        )),
+                                    };
+                                    let sent = crate::pipeline::send_to_module(&orchestrator.module_senders, &owner, forward, "command").await;
+                                    if matches!(sent, SendOutcome::Sent) {
+                                        log_event_broadcast(
+                                            &ui_state,
+                                            format!(
+                                                "[Commands] {} invoked '{}' -> {}",
+                                                module_name,
+                                                command.command_name,
+                                                owner
+                                            ),
+                                        );
+                                    } else if matches!(sent, SendOutcome::Dropped) {
+                                        log_event_broadcast(
+                                            &ui_state,
+                                            format!(
+                                                "[Commands] owner '{}' of '{}' dropped (channel full)",
+                                                owner, command.command_name
+                                            ),
+                                        );
+                                    } else {
+                                        log_event_broadcast(
+                                            &ui_state,
+                                            format!("[Commands] owner '{}' of '{}' not connected", owner, command.command_name),
+                                        );
+                                    }
+                                } else {
+                                    log_event_broadcast(
+                                        &ui_state,
+                                        format!(
+                                            "[Commands] unregistered command '{}' invoked by {}",
+                                            command.command_name, module_name
+                                        ),
+                                    );
+                                }
+                            }
+                            Some(EnginePayload::Prompt(ref prompt)) => {
+                                // A module is asking the user something (e.g. "allow this
+                                // action?"). Forward it to every OTHER connected module so
+                                // they can display it, and remember the origin so a
+                                // PromptResponse can be routed back to it.
+                                let prompt = prompt.clone();
+                                prompt_routes.lock().unwrap().insert(
+                                    prompt.prompt_id_uuid7.clone(),
+                                    PromptSink::Module(module_name.clone(), tx.clone()),
+                                );
+                                let forward = ContainerForModule {
+                                    version: 2,
+                                    auth_token: container.auth_token.clone(),
+                                    module_instance_uuid7: container.module_instance_uuid7.clone(),
+                                    payload: Some(ModulePayload::Prompt(prompt)),
+                                };
+                                let senders: Vec<tokio::sync::mpsc::Sender<ContainerForModule>> = {
+                                    let senders = orchestrator.module_senders.lock().await;
+                                    senders
+                                        .iter()
+                                        .filter(|(n, _)| n.as_str() != module_name.as_str())
+                                        .map(|(_, s)| s.clone())
+                                        .collect()
+                                };
+                                for sender in senders {
+                                    let _ = sender.try_send(forward.clone());
+                                }
+                            }
+                            Some(EnginePayload::PredictionUpdate(ref update)) => {
+                                // The predictions module (the brain) broadcasts a
+                                // prediction bar to every connected module so they can
+                                // display it. Only the brain — or the TUI control
+                                // surface — may do this: a random module spoofing a bar
+                                // would be indistinguishable from a real one, so the
+                                // origin is gated before the forward.
+                                if module_name != "events" && !is_control_surface(&module_name) {
+                                    log_event_broadcast(
+                                        &ui_state,
+                                        format!("[PredictionUpdate] ignored from '{}': only the events module or TUI may broadcast", module_name),
+                                    );
+                                } else {
+                                    let update = update.clone();
                                     let forward = ContainerForModule {
                                         version: 2,
                                         auth_token: container.auth_token.clone(),
                                         module_instance_uuid7: container.module_instance_uuid7.clone(),
-                                        payload: Some(ModulePayload::PromptResponse(resp)),
+                                        payload: Some(ModulePayload::PredictionUpdate(update)),
                                     };
-                                    let _ = tokio::time::timeout(Duration::from_millis(1000), sender.send(forward)).await;
+                                    let senders: Vec<tokio::sync::mpsc::Sender<ContainerForModule>> = {
+                                        let senders = orchestrator.module_senders.lock().await;
+                                        senders
+                                            .iter()
+                                            .filter(|(n, _)| n.as_str() != module_name.as_str())
+                                            .map(|(_, s)| s.clone())
+                                            .collect()
+                                    };
+                                    for sender in senders {
+                                        let _ = sender.try_send(forward.clone());
+                                    }
                                 }
                             }
-                        }
-                    }
-                    Some(EnginePayload::AuditFlag(ref flag)) => {
-                        // A module flagged a message for human review (e.g. a
-                        // different language). Hold it and ask a connected UI.
-                        //
-                        // The DB hold MUST land BEFORE the flagging module's
-                        // pre-process ack is processed: start_in_process()
-                        // consults is_audited() before advancing, so if the
-                        // timeline row is still marked 'queued' the flagged
-                        // message slips past the hold. The row update is fast
-                        // and is AWAITED INLINE here. Only the prompt wait (up
-                        // to the 120s prompt timeout) runs DETACHED — it must
-                        // never block this module's read loop (it couldn't
-                        // answer its own liveness probe and would be killed).
-                        let uuid_bytes = flag.message_uuid7.as_bytes().to_vec();
-                        // Already held (a prior flag is unresolved): do not
-                        // re-hold or spawn a second prompt — the operator is
-                        // already looking at it.
-                        let newly_held = if db.is_audited(&uuid_bytes).await.unwrap_or(false) {
-                            false
-                        } else {
-                            match db.mark_audit(&uuid_bytes, &flag.reason).await {
-                                Ok(()) => true,
-                                Err(_) => {
-                                    log_event(
+                            Some(EnginePayload::PollUpdate(ref update)) => {
+                                // Same relay contract as PredictionUpdate: the
+                                // predictions module broadcasts free-vote poll state to
+                                // every connected module. Origin-gated identically — a
+                                // random module spoofing a poll would be
+                                // indistinguishable from a real one.
+                                if module_name != "events" && !is_control_surface(&module_name) {
+                                    log_event_broadcast(
                                         &ui_state,
-                                        format!("[audit] failed to hold message {}", flag.message_uuid7),
+                                        format!("[PollUpdate] ignored from '{}': only the events module or TUI may broadcast", module_name),
                                     );
-                                    false
+                                } else {
+                                    let update = update.clone();
+                                    let forward = ContainerForModule {
+                                        version: 2,
+                                        auth_token: container.auth_token.clone(),
+                                        module_instance_uuid7: container.module_instance_uuid7.clone(),
+                                        payload: Some(ModulePayload::PollUpdate(update)),
+                                    };
+                                    let senders: Vec<tokio::sync::mpsc::Sender<ContainerForModule>> = {
+                                        let senders = orchestrator.module_senders.lock().await;
+                                        senders
+                                            .iter()
+                                            .filter(|(n, _)| n.as_str() != module_name.as_str())
+                                            .map(|(_, s)| s.clone())
+                                            .collect()
+                                    };
+                                    for sender in senders {
+                                        let _ = sender.try_send(forward.clone());
+                                    }
                                 }
                             }
-                        };
-                        if newly_held {
-                            let flag = flag.clone();
-                            let audit_db = db.clone();
-                            let audit_senders = orchestrator.module_senders.clone();
-                            let audit_routes = prompt_routes.clone();
-                            let audit_ui = ui_state.clone();
-                            tokio::spawn(async move {
-                                handle_audit_flag(
-                                    &audit_db,
-                                    &flag,
-                                    &audit_senders,
-                                    &audit_routes,
-                                    &audit_ui,
-                                )
-                                .await;
-                            });
+                            Some(EnginePayload::ChannelStats(ref stats)) => {
+                                // Adapters push their channel's current viewer/member
+                                // count on each poll; the engine stores it so other
+                                // modules can read it on demand via the
+                                // `channel_viewers` virtual query. Origin-gated to the
+                                // platform adapters — a random module spoofing counts
+                                // would poison every consumer.
+                                if !CHANNEL_STATS_ADAPTERS.contains(&module_name.as_str()) {
+                                    log_event_broadcast(
+                                        &ui_state,
+                                        format!("[ChannelStats] ignored from '{}': only the platform adapters may publish viewer counts", module_name),
+                                    );
+                                } else {
+                                    let stats = stats.clone();
+                                    let mut map = channel_stats.lock().unwrap();
+                                    map.insert(
+                                        format!("{}:{}", stats.platform, stats.channel),
+                                        ChannelStatsEntry {
+                                            platform: stats.platform,
+                                            channel: stats.channel,
+                                            viewers: stats.viewers,
+                                            is_live: stats.is_live,
+                                            title: stats.title,
+                                            updated_at: stats.updated_at,
+                                        },
+                                    );
+                                }
+                            }
+                            Some(EnginePayload::PromptResponse(ref resp)) => {
+                                // Route the user's answer back to whoever is waiting on
+                                // this prompt_id (the engine's own connection prompt, or
+                                // the module that originally raised the prompt).
+                                let resp = resp.clone();
+                                let sink = {
+                                    let mut routes = prompt_routes.lock().unwrap();
+                                    routes.remove(&resp.prompt_id_uuid7)
+                                };
+                                if let Some(sink) = sink {
+                                    match sink {
+                                        PromptSink::Engine(tx) => {
+                                            // oneshot send — non-blocking by construction.
+                                            let _ = tx.send(resp.accepted);
+                                        }
+                                        PromptSink::Module(_origin, sender) => {
+                                            let forward = ContainerForModule {
+                                                version: 2,
+                                                auth_token: container.auth_token.clone(),
+                                                module_instance_uuid7: container.module_instance_uuid7.clone(),
+                                                payload: Some(ModulePayload::PromptResponse(resp)),
+                                            };
+                                            let _ = tokio::time::timeout(Duration::from_millis(1000), sender.send(forward)).await;
+                                        }
+                                    }
+                                }
+                            }
+                            Some(EnginePayload::AuditFlag(ref flag)) => {
+                                // A module flagged a message for human review (e.g. a
+                                // different language). Hold it and ask a connected UI.
+                                //
+                                // The DB hold MUST land BEFORE the flagging module's
+                                // pre-process ack is processed: start_in_process()
+                                // consults is_audited() before advancing, so if the
+                                // timeline row is still marked 'queued' the flagged
+                                // message slips past the hold. The row update is fast
+                                // and is AWAITED INLINE here. Only the prompt wait (up
+                                // to the 120s prompt timeout) runs DETACHED — it must
+                                // never block this module's read loop (it couldn't
+                                // answer its own liveness probe and would be killed).
+                                let uuid_bytes = flag.message_uuid7.as_bytes().to_vec();
+                                // Already held (a prior flag is unresolved): do not
+                                // re-hold or spawn a second prompt — the operator is
+                                // already looking at it.
+                                let newly_held = if db.is_audited(&uuid_bytes).await.unwrap_or(false) {
+                                    false
+                                } else {
+                                    match db.mark_audit(&uuid_bytes, &flag.reason).await {
+                                        Ok(()) => true,
+                                        Err(_) => {
+                                            log_event(
+                                                &ui_state,
+                                                format!("[audit] failed to hold message {}", flag.message_uuid7),
+                                            );
+                                            false
+                                        }
+                                    }
+                                };
+                                if newly_held {
+                                    let flag = flag.clone();
+                                    let audit_db = db.clone();
+                                    let audit_senders = orchestrator.module_senders.clone();
+                                    let audit_routes = prompt_routes.clone();
+                                    let audit_ui = ui_state.clone();
+                                    tokio::spawn(async move {
+                                        handle_audit_flag(
+                                            &audit_db,
+                                            &flag,
+                                            &audit_senders,
+                                            &audit_routes,
+                                            &audit_ui,
+                                        )
+                                        .await;
+                                    });
+                                }
+                            }
+                            Some(EnginePayload::ChatMessageRejected(ref rej)) => {
+                                // A module rejected a message: surface it clearly (no
+                                // buried log strings) and persist it as a searchable
+                                // timeline record. The message itself still flows as the
+                                // module chose — this is an audit record, not a stop.
+                                handle_chat_message_rejected(&db, &ui_state, rej).await;
+                            }
+                            _ => {}
                         }
                     }
-                    Some(EnginePayload::ChatMessageRejected(ref rej)) => {
-                        // A module rejected a message: surface it clearly (no
-                        // buried log strings) and persist it as a searchable
-                        // timeline record. The message itself still flows as the
-                        // module chose — this is an audit record, not a stop.
-                        handle_chat_message_rejected(&db, &ui_state, rej).await;
+
+                    outbound = rx.recv() => {
+                        let Some(outbound) = outbound else {
+                            break;
+                        };
+
+                        let mut bytes = Vec::new();
+                        outbound.encode(&mut bytes)?;
+
+                        if bounded_ws_send(&mut websocket, WsMessage::Binary(bytes), bounds.send_timeout_secs).await.is_err() {
+                            log_event_broadcast(&ui_state, format!(
+                                "Connection to '{}' dropped: outbound send failed/timed out ({}s)",
+                                module_name, bounds.send_timeout_secs
+                            ));
+                            break;
+                        }
+
+                        // The write landed. If this frame was the answer to an accepted
+                        // shutdown request, the caller now knows — release the process
+                        // exit. (FIFO ordering guarantees this is that answer: it was
+                        // queued before the flush was armed.)
+                        if shutdown_flush {
+                            shutdown_flush = false;
+                            shutdown.mark_answered();
+                        }
                     }
-                    _ => {}
+                    killed = kill_rx.changed() => {
+                        // The probe task flagged this session as unresponsive —
+                        // close it so the disconnect cleanup below runs.
+                        if killed.is_ok() && *kill_rx.borrow() {
+                            log_event_broadcast(&ui_state, format!(
+                                "Connection to '{}' dropped: probe flagged unresponsive",
+                                module_name
+                            ));
+                            break;
+                        }
+                    }
                 }
-            }
-
-            outbound = rx.recv() => {
-                let Some(outbound) = outbound else {
-                    break;
-                };
-
-                let mut bytes = Vec::new();
-                outbound.encode(&mut bytes)?;
-
-                if bounded_ws_send(&mut websocket, WsMessage::Binary(bytes), bounds.send_timeout_secs).await.is_err() {
-                    log_event_broadcast(&ui_state, format!(
-                        "Connection to '{}' dropped: outbound send failed/timed out ({}s)",
-                        module_name, bounds.send_timeout_secs
-                    ));
-                    break;
-                }
-
-                // The write landed. If this frame was the answer to an accepted
-                // shutdown request, the caller now knows — release the process
-                // exit. (FIFO ordering guarantees this is that answer: it was
-                // queued before the flush was armed.)
-                if shutdown_flush {
-                    shutdown_flush = false;
-                    shutdown.mark_answered();
-                }
-            }
-            killed = kill_rx.changed() => {
-                // The probe task flagged this session as unresponsive —
-                // close it so the disconnect cleanup below runs.
-                if killed.is_ok() && *kill_rx.borrow() {
-                    log_event_broadcast(&ui_state, format!(
-                        "Connection to '{}' dropped: probe flagged unresponsive",
-                        module_name
-                    ));
-                    break;
-                }
-            }
-        }
     }
 
     // Unregister the kill switch.
@@ -3162,23 +3458,10 @@ Some(EnginePayload::ModuleControl(_)) => {
         });
     }
 
-    // Unregister the module sender (keyed by module name) — but ONLY if no OTHER
-    // live session with the same name remains. A relaunch can briefly coexist
-    // with the old instance; removing the name slot unconditionally would
-    // evict the still-connected sibling's sender (killing its routing + probe
-    // delivery → it gets flagged unresponsive).
-    {
-        let sibling_alive = auth_store
-            .values()
-            .iter()
-            .any(|s| s.module_name == module_name && s.instance_uuid7 != instance_uuid7);
-        if !sibling_alive {
-            let mut senders = orchestrator.module_senders.lock().await;
-            senders.remove(&module_name);
-        }
-    }
-
-    log_event_broadcast(&ui_state, format!("Disconnected: {} [{}]", module_name, instance_uuid7));
+    log_event_broadcast(
+        &ui_state,
+        format!("Disconnected: {} [{}]", module_name, instance_uuid7),
+    );
     log_to_timeline(&db, "module_disconnect", &module_name, "disconnected").await;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3187,7 +3470,20 @@ Some(EnginePayload::ModuleControl(_)) => {
     // Only tear down the session if this socket still owns it — a reconnect
     // may have already claimed it under a new socket.
     auth_store.set_shutdown_if_socket(&instance_uuid7, now_ms, socket_token);
-    auth_store.remove_if_socket(&instance_uuid7, socket_token);
+    let still_owned = auth_store.remove_if_socket(&instance_uuid7, socket_token);
+
+    // Unregister the module sender (keyed by module name) — but ONLY if this
+    // socket still owns the auth session AND this instance owns the routing
+    // slot. A shadow that never took the slot, or a reconnected socket that
+    // lost the session, must leave the live module's sender untouched.
+    {
+        let mut senders = orchestrator.module_senders.lock().await;
+        let mut slot_owner = orchestrator.slot_owner.lock().await;
+        if still_owned && slot_owner.get(&module_name) == Some(&instance_uuid7) {
+            senders.remove(&module_name);
+            slot_owner.remove(&module_name);
+        }
+    }
 
     Ok(())
 }
