@@ -2587,14 +2587,17 @@ where
             return Ok(());
         }
 
-        // Enforce ONE live connection per module name. A new connection whose
-        // name already has a LIVE incumbent from a different instance evicts it
-        // (closes its socket) and takes over: two live connections under one name
-        // would each inject the same platform chat (duplicate ingestion — the TTS
-        // speaking twice) and appear as duplicate modules. A reconnect whose old
-        // socket is already gone is NOT a clash: its sender is closed, so the
-        // module simply reuses the name and takes the slot.
-        let incumbent = {
+        // Enforce ONE live connection per module name: while a LIVE incumbent
+        // from a different instance holds this name, REJECT the newcomer. Two
+        // live connections under one name would each inject the same platform
+        // chat (duplicate ingestion — the TTS speaking twice) and appear as
+        // duplicate modules. Rejecting (rather than evicting) guarantees only one
+        // connection is ever live, with no evict/reconnect flapping while a stale
+        // duplicate process lingers. The newcomer's client backs off and retries;
+        // once the incumbent's socket is gone — or the watchdog reaps an
+        // unresponsive incumbent — the retry succeeds. A reconnect whose old
+        // sender is already CLOSED is not a clash: it reuses the name and slot.
+        let live_incumbent = {
             let senders = orchestrator.module_senders.lock().await;
             let owners = orchestrator.slot_owner.lock().await;
             match senders.get(&module_name) {
@@ -2602,31 +2605,47 @@ where
                 _ => None,
             }
         };
-        if let Some(inc) = incumbent.filter(|inc| inc != &assigned_uuid) {
-            let kill = kill_map.lock().await.get(&inc).cloned();
-            if let Some(kill) = kill {
-                let _ = kill.send(true);
-            }
-            // Free the name so THIS connection takes the slot (the evicted
-            // socket's async cleanup will see a different owner and leave it).
-            {
-                let mut senders = orchestrator.module_senders.lock().await;
-                let mut owners = orchestrator.slot_owner.lock().await;
-                senders.remove(&module_name);
-                owners.remove(&module_name);
-            }
+        if let Some(inc) = live_incumbent.filter(|inc| inc != &assigned_uuid) {
             log_event_broadcast(
                 &ui_state,
                 format!(
-                    "Replacing duplicate connection for '{}' — evicting [{}] so only one instance is live",
+                    "Rejected duplicate connection for '{}' — [{}] is already live",
                     module_name, inc
                 ),
             );
+            log_to_timeline(
+                &db,
+                "module_reject",
+                &module_name,
+                "duplicate connection (name already live)",
+            )
+            .await;
+            let response = ContainerForModule {
+                version: 2,
+                auth_token: String::new(),
+                module_instance_uuid7: String::new(),
+                payload: Some(ModulePayload::ConnectionRequestReturn(
+                    cockatiel_protobuf::ConnectionRequestReturn {
+                        new_port: 0,
+                        module_instance_uuid7: String::new(),
+                    },
+                )),
+            };
+            let mut bytes = Vec::new();
+            response.encode(&mut bytes)?;
+            bounded_ws_send(
+                &mut websocket,
+                WsMessage::Binary(bytes),
+                bounds.send_timeout_secs,
+            )
+            .await?;
+            websocket.close(None).await?;
+            return Ok(());
         }
         route_name = module_name.clone();
-        // Drop any other session rows carrying this name (the evicted incumbent,
-        // or a previous socket whose cleanup lagged) so the module list never
-        // accumulates ghosts of the same module.
+        // Drop any dead session rows still carrying this name (a previous
+        // socket whose cleanup lagged) so the module list never accumulates
+        // ghosts of the same module.
         auth_store.remove_other_sessions_named(&module_name, &assigned_uuid);
 
         let auth_token = auth_store.generate_token(&assigned_uuid, &module_name);
