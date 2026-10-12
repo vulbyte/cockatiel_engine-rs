@@ -1244,24 +1244,6 @@ async fn an_abandon_does_not_clobber_an_audit_hold() {
     assert!(r["error_message"].is_null());
 }
 
-/// A name clash gets an incremented routing name that is not already taken.
-#[test]
-fn unique_module_name_skips_taken_names() {
-    use crate::unique_module_name;
-    assert_eq!(unique_module_name("score-messages", &[]), "score-messages-2");
-    assert_eq!(
-        unique_module_name("score-messages", &["score-messages-2".to_string()]),
-        "score-messages-3"
-    );
-    assert_eq!(
-        unique_module_name(
-            "score-messages",
-            &["score-messages-2".to_string(), "score-messages-3".to_string()]
-        ),
-        "score-messages-4"
-    );
-}
-
 /// Only a live incumbent from a DIFFERENT instance causes a shadow. A
 /// same-instance reconnect must take the slot (its new socket is the target),
 /// and a dead incumbent never blocks the slot.

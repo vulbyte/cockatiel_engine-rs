@@ -206,6 +206,18 @@ impl AuthStore {
         sessions.values().cloned().collect()
     }
 
+    /// Drop every session named `module_name` EXCEPT `keep_instance`. Used when a
+    /// module reconnects without a persisted token: the new connection reuses the
+    /// name, and any dead session left by the previous socket's lagging cleanup
+    /// must not linger as a phantom duplicate in the module list. Returns how many
+    /// were removed.
+    pub fn remove_other_sessions_named(&self, module_name: &str, keep_instance: &str) -> usize {
+        let mut sessions = self.sessions.lock().unwrap();
+        let before = sessions.len();
+        sessions.retain(|k, s| !(s.module_name == module_name && k != keep_instance));
+        before - sessions.len()
+    }
+
     /// Look up the LIVE session by module name (the per-session key is the
     /// instance uuid7). With multiple instances of one module (a relaunch
     /// before the old session's cleanup runs), this returns the newest

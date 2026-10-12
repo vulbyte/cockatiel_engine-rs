@@ -2112,20 +2112,6 @@ where
     }
 }
 
-/// A unique routing name for a module whose requested name is already live:
-/// `base-2`, `base-3`, ... The `existing` list is the current session names; the
-/// returned name is guaranteed not to appear in it.
-fn unique_module_name(base: &str, existing: &[String]) -> String {
-    let mut n: u32 = 2;
-    loop {
-        let candidate = format!("{base}-{n}");
-        if !existing.iter().any(|e| e == &candidate) {
-            return candidate;
-        }
-        n += 1;
-    }
-}
-
 async fn handle_connection<S>(
     stream: S,
     peer_loopback: bool,
@@ -2279,6 +2265,9 @@ where
             .get(&assigned_uuid)
             .map(|s| s.module_name)
             .unwrap_or_else(|| container.module_name.clone());
+        // Drop any dead sessions that still carry this client name so the module
+        // list does not accumulate ghosts of the same module across reconnects.
+        auth_store.remove_other_sessions_named(&module_name, &assigned_uuid);
         let reconnect_now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2598,36 +2587,47 @@ where
             return Ok(());
         }
 
-        // A genuine name clash — a LIVE session already owns this name, from a
-        // different instance — gets a distinct incremented name (`name-2`) so it
-        // becomes its own module (own session, registry entry and routing slot)
-        // instead of shadowing the incumbent. The auth token stays bound to the
-        // name the client PRESENTS (its containers carry it); only the routing /
-        // bookkeeping name changes. A same-instance reconnect reaches this branch
-        // only for a first contact, so it never looks like a clash.
-        let clash = auth_store.values().iter().any(|s| {
-            s.module_name == module_name
-                && s.instance_uuid7 != assigned_uuid
-                && s.shutdown_at.is_none()
-        });
-        route_name = if clash {
-            let live: Vec<String> = auth_store
-                .values()
-                .iter()
-                .map(|s| s.module_name.clone())
-                .collect();
-            let name = unique_module_name(&module_name, &live);
+        // Enforce ONE live connection per module name. A new connection whose
+        // name already has a LIVE incumbent from a different instance evicts it
+        // (closes its socket) and takes over: two live connections under one name
+        // would each inject the same platform chat (duplicate ingestion — the TTS
+        // speaking twice) and appear as duplicate modules. A reconnect whose old
+        // socket is already gone is NOT a clash: its sender is closed, so the
+        // module simply reuses the name and takes the slot.
+        let incumbent = {
+            let senders = orchestrator.module_senders.lock().await;
+            let owners = orchestrator.slot_owner.lock().await;
+            match senders.get(&module_name) {
+                Some(s) if !s.is_closed() => owners.get(&module_name).cloned(),
+                _ => None,
+            }
+        };
+        if let Some(inc) = incumbent.filter(|inc| inc != &assigned_uuid) {
+            let kill = kill_map.lock().await.get(&inc).cloned();
+            if let Some(kill) = kill {
+                let _ = kill.send(true);
+            }
+            // Free the name so THIS connection takes the slot (the evicted
+            // socket's async cleanup will see a different owner and leave it).
+            {
+                let mut senders = orchestrator.module_senders.lock().await;
+                let mut owners = orchestrator.slot_owner.lock().await;
+                senders.remove(&module_name);
+                owners.remove(&module_name);
+            }
             log_event_broadcast(
                 &ui_state,
                 format!(
-                    "Name clash: '{}' is already connected — registering this instance as '{}'",
-                    module_name, name
+                    "Replacing duplicate connection for '{}' — evicting [{}] so only one instance is live",
+                    module_name, inc
                 ),
             );
-            name
-        } else {
-            module_name.clone()
-        };
+        }
+        route_name = module_name.clone();
+        // Drop any other session rows carrying this name (the evicted incumbent,
+        // or a previous socket whose cleanup lagged) so the module list never
+        // accumulates ghosts of the same module.
+        auth_store.remove_other_sessions_named(&module_name, &assigned_uuid);
 
         let auth_token = auth_store.generate_token(&assigned_uuid, &module_name);
         let now_ms = std::time::SystemTime::now()
