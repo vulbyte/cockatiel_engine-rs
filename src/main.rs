@@ -2112,6 +2112,20 @@ where
     }
 }
 
+/// A unique routing name for a module whose requested name is already live:
+/// `base-2`, `base-3`, ... The `existing` list is the current session names; the
+/// returned name is guaranteed not to appear in it.
+fn unique_module_name(base: &str, existing: &[String]) -> String {
+    let mut n: u32 = 2;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !existing.iter().any(|e| e == &candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 async fn handle_connection<S>(
     stream: S,
     peer_loopback: bool,
@@ -2216,9 +2230,13 @@ where
 
     // ── Check if this is a reconnection (has auth_token) or new (has PIN) ──
 
-    // These will be set by either branch
+    // These will be set by either branch. `module_name` is the name the client
+    // presents (it binds the auth token); `route_name` is the name the engine
+    // routes/bookkeeps under — equal to `module_name` unless a genuine clash was
+    // given an incremented name (`score-messages-2`).
     let module_name;
     let assigned_uuid;
+    let route_name: String;
 
     if !container.auth_token.is_empty() {
         // Reconnection: verify auth token AND that the claimed module name
@@ -2255,6 +2273,12 @@ where
         );
         module_name = container.module_name.clone();
         assigned_uuid = container.module_instance_uuid7.clone();
+        // Route under the name the session was registered with (an incremented
+        // `name-2` if it originally hit a clash), not the client's claimed name.
+        route_name = auth_store
+            .get(&assigned_uuid)
+            .map(|s| s.module_name)
+            .unwrap_or_else(|| container.module_name.clone());
         let reconnect_now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2574,6 +2598,37 @@ where
             return Ok(());
         }
 
+        // A genuine name clash — a LIVE session already owns this name, from a
+        // different instance — gets a distinct incremented name (`name-2`) so it
+        // becomes its own module (own session, registry entry and routing slot)
+        // instead of shadowing the incumbent. The auth token stays bound to the
+        // name the client PRESENTS (its containers carry it); only the routing /
+        // bookkeeping name changes. A same-instance reconnect reaches this branch
+        // only for a first contact, so it never looks like a clash.
+        let clash = auth_store.values().iter().any(|s| {
+            s.module_name == module_name
+                && s.instance_uuid7 != assigned_uuid
+                && s.shutdown_at.is_none()
+        });
+        route_name = if clash {
+            let live: Vec<String> = auth_store
+                .values()
+                .iter()
+                .map(|s| s.module_name.clone())
+                .collect();
+            let name = unique_module_name(&module_name, &live);
+            log_event_broadcast(
+                &ui_state,
+                format!(
+                    "Name clash: '{}' is already connected — registering this instance as '{}'",
+                    module_name, name
+                ),
+            );
+            name
+        } else {
+            module_name.clone()
+        };
+
         let auth_token = auth_store.generate_token(&assigned_uuid, &module_name);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2581,7 +2636,7 @@ where
             .as_millis() as i64;
 
         auth_store.insert(AuthSession {
-            module_name: module_name.clone(),
+            module_name: route_name.clone(),
             instance_uuid7: assigned_uuid.clone(),
             auth_token: auth_token.clone(),
             position: position.clone(),
@@ -2598,7 +2653,7 @@ where
         });
 
         module_registry.register(module_registry::RegisteredModule {
-            name: module_name.clone(),
+            name: route_name.clone(),
             instance_uuid7: assigned_uuid.clone(),
             position: position.clone(),
             priority,
@@ -2611,12 +2666,12 @@ where
 
         log_event_broadcast(
             &ui_state,
-            format!("Approved: {} on {}", module_name, position),
+            format!("Approved: {} on {}", route_name, position),
         );
         log_to_timeline(
             &db,
             "module_connect",
-            &module_name,
+            &route_name,
             &format!("approved on '{}' [{}]", position, assigned_uuid),
         )
         .await;
@@ -2644,40 +2699,37 @@ where
 
     let instance_uuid7 = assigned_uuid;
 
-    // Register module sender for pipeline routing (keyed by module name,
-    // matching the pipeline's lookups). A duplicate same-name connection from a
-    // DIFFERENT instance must NOT evict a live incumbent's routing slot: it is
-    // accepted as a silent "shadow" and only takes the slot once the incumbent's
-    // sender is closed. A reconnect of the SAME instance always takes the slot —
-    // its new socket must become the routing target even if the old socket's
-    // task has not finished closing yet (otherwise the module would be routed
-    // to a dead socket and flagged unresponsive).
+    // Register module sender for pipeline routing under `route_name` (the
+    // incremented name for a clash, else the client name). A genuine clash was
+    // given its own name above, so this is normally a free slot; `should_shadow`
+    // still guards a same-name race where a live incumbent from a DIFFERENT
+    // instance holds the slot. A reconnect of the SAME instance always takes it.
     {
         let mut senders = orchestrator.module_senders.lock().await;
         let mut slot_owner = orchestrator.slot_owner.lock().await;
         let same_instance = slot_owner
-            .get(&module_name)
+            .get(&route_name)
             .map(|o| o == &instance_uuid7)
             .unwrap_or(false);
         let live_incumbent = senders
-            .get(&module_name)
+            .get(&route_name)
             .map(|s| !s.is_closed())
             .unwrap_or(false);
         if crate::pipeline::should_shadow(live_incumbent, same_instance) {
             let current_owner = slot_owner
-                .get(&module_name)
+                .get(&route_name)
                 .cloned()
                 .unwrap_or_else(|| "unknown".to_string());
             log_event_broadcast(
                 &ui_state,
                 format!(
                     "Duplicate connection for '{}' accepted as shadow — routing slot retained by [{}]",
-                    module_name, current_owner
+                    route_name, current_owner
                 ),
             );
         } else {
-            senders.insert(module_name.clone(), tx.clone());
-            slot_owner.insert(module_name.clone(), instance_uuid7.clone());
+            senders.insert(route_name.clone(), tx.clone());
+            slot_owner.insert(route_name.clone(), instance_uuid7.clone());
         }
     }
 
@@ -3460,9 +3512,9 @@ where
 
     log_event_broadcast(
         &ui_state,
-        format!("Disconnected: {} [{}]", module_name, instance_uuid7),
+        format!("Disconnected: {} [{}]", route_name, instance_uuid7),
     );
-    log_to_timeline(&db, "module_disconnect", &module_name, "disconnected").await;
+    log_to_timeline(&db, "module_disconnect", &route_name, "disconnected").await;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -3472,16 +3524,16 @@ where
     auth_store.set_shutdown_if_socket(&instance_uuid7, now_ms, socket_token);
     let still_owned = auth_store.remove_if_socket(&instance_uuid7, socket_token);
 
-    // Unregister the module sender (keyed by module name) — but ONLY if this
-    // socket still owns the auth session AND this instance owns the routing
-    // slot. A shadow that never took the slot, or a reconnected socket that
-    // lost the session, must leave the live module's sender untouched.
+    // Unregister the routing slot under `route_name` — but ONLY if this socket
+    // still owns the auth session AND this instance owns the slot. A shadow that
+    // never took the slot, or a reconnected socket that lost the session, must
+    // leave the live module's sender untouched.
     {
         let mut senders = orchestrator.module_senders.lock().await;
         let mut slot_owner = orchestrator.slot_owner.lock().await;
-        if still_owned && slot_owner.get(&module_name) == Some(&instance_uuid7) {
-            senders.remove(&module_name);
-            slot_owner.remove(&module_name);
+        if still_owned && slot_owner.get(&route_name) == Some(&instance_uuid7) {
+            senders.remove(&route_name);
+            slot_owner.remove(&route_name);
         }
     }
 

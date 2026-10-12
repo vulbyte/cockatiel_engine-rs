@@ -314,3 +314,46 @@ async fn a_command_reaches_its_owner_and_catch_alls_but_not_unrelated_modules() 
     assert!(r["error_message"].is_null());
     assert!(nothing_left(rx.get_mut("bystander").unwrap()));
 }
+
+/// The negative half of "completes the cycle": a message an in-process module
+/// flags for audit (what the catch-all `language-constrainer` / `banned-words`
+/// now do to command messages too) must be HELD — it never reaches the next
+/// stage and never completes. This is the assurance that the moderation gate
+/// actually stops a bad message rather than letting it finish.
+#[tokio::test]
+async fn an_audited_message_is_held_and_never_completes() {
+    let db = test_db().await;
+    let (orchestrator, mut rx) = wired_orchestrator(db.clone(), &PRE, &IN, &POST);
+
+    orchestrator
+        .handle_message_from_module(&adapter_ingest("bad message"))
+        .await
+        .unwrap();
+    let uuid7 = take_broadcast(rx.get_mut("lang").unwrap());
+    let _ = take_broadcast(rx.get_mut("banned").unwrap());
+
+    // A pre-process module flags it (mirrors AuditFlag handling in main.rs).
+    db.mark_audit(uuid7.as_bytes(), "out-of-language")
+        .await
+        .unwrap();
+
+    // The pre modules answer, but the stage must NOT advance into in-process.
+    orchestrator
+        .handle_message_from_module(&pre_reply("lang", &uuid7, "bad message"))
+        .await
+        .unwrap();
+    orchestrator
+        .handle_message_from_module(&pre_reply("banned", &uuid7, "bad message"))
+        .await
+        .unwrap();
+
+    for m in IN.iter().chain(POST.iter()) {
+        assert!(
+            nothing_left(rx.get_mut(*m).unwrap()),
+            "'{}' must not receive an audited message",
+            m
+        );
+    }
+    let r = row(&db, &uuid7).await;
+    assert_eq!(r["pipeline_status"], "audit", "audited row stays held: {r:?}");
+}
