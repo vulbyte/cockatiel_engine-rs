@@ -31,6 +31,8 @@ mod tls;
 mod config;
 use config::{Config, ConfigState, get_config, verify_config};
 
+mod removed_modules;
+
 mod auth;
 use auth::{AuthSession, AuthStore, verify_pin};
 
@@ -1210,6 +1212,11 @@ cockatiel
         pin: 0,
         jwt_secret: String::new(),
     }));
+
+    // A fresh boot re-discovers every module on disk: drop any transient
+    // "deleted module" suppression a previous run left behind, so nothing stays
+    // hidden across an engine restart.
+    let _ = removed_modules::clear_all(&removed_modules::removed_modules_path(&config_state));
 
     // Secrets (PIN + JWT secret) come from `.env` (migrated out of a legacy
     // config.json that still carried them); config.json holds settings only.
@@ -2643,6 +2650,14 @@ where
             return Ok(());
         }
         route_name = module_name.clone();
+        // The module is (re)connecting, so it is no longer suppressed: clear
+        // its name from the transient removed-modules file. This is what makes
+        // a TUI delete recoverable — the supervisor restarts the process, this
+        // reconnect re-initialises it, and its row comes back.
+        let _ = removed_modules::clear_name(
+            &removed_modules::removed_modules_path(&config_state),
+            &module_name,
+        );
         // Drop any dead session rows still carrying this name (a previous
         // socket whose cleanup lagged) so the module list never accumulates
         // ghosts of the same module.

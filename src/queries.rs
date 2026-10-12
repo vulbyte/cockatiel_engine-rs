@@ -962,6 +962,19 @@ async fn dispatch(
                     serde_json::json!(pending_prompts.contains(&s.module_name));
             }
 
+            // Transient suppression: a module the operator deleted from the TUI
+            // was just DISCOVERED on disk, so without this it would reappear in
+            // the list immediately. Drop any entry whose name is in the removed
+            // file. The engine clears the name when the module reconnects (and
+            // the whole file at startup), so this only hides it until it comes
+            // back — it is not a permanent delete.
+            let removed = crate::removed_modules::load_removed(
+                &crate::removed_modules::removed_modules_path(config_state),
+            );
+            if !removed.is_empty() {
+                entries.retain(|name, _| !removed.contains(name));
+            }
+
             // Refresh the in-memory gates from the LIVE manifests so a
             // price/rank/authority edit made in the TUI takes effect without an
             // engine restart. `module_list` is the TUI's 2s control poll, so the
