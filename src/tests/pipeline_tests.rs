@@ -1300,7 +1300,7 @@ async fn duplicate_connection_shadow_cannot_evict_live_slot() {
     );
 
     // The incumbent claims the slot.
-    let (incumbent_tx, incumbent_rx) = tokio::sync::mpsc::channel(8);
+    let (incumbent_tx, mut incumbent_rx) = tokio::sync::mpsc::channel(8);
     {
         let mut senders = orchestrator.module_senders.lock().await;
         let mut owners = orchestrator.slot_owner.lock().await;
@@ -1354,6 +1354,34 @@ async fn duplicate_connection_shadow_cannot_evict_live_slot() {
         let owners = orchestrator.slot_owner.lock().await;
         assert!(senders.contains_key("scorer"));
         assert_eq!(owners.get("scorer").map(String::as_str), Some("instance-a"));
+    }
+
+    // The watchdog path — the EXACT live score-messages failure: after the
+    // duplicate connects and disconnects, a probe to the surviving module must be
+    // DELIVERED (Sent), not dropped as NotConnected. If it were NotConnected the
+    // probe deadline would expire and the module would be killed as unresponsive.
+    {
+        let probe = ContainerForModule {
+            version: 2,
+            auth_token: String::new(),
+            module_instance_uuid7: String::new(),
+            payload: Some(ModulePayload::AuthVerify(
+                crate::cockatiel_protobuf::AuthVerify {
+                    cur_auth: String::new(),
+                },
+            )),
+        };
+        let outcome =
+            send_to_module(&orchestrator.module_senders, "scorer", probe, "probe").await;
+        assert_eq!(
+            outcome,
+            SendOutcome::Sent,
+            "a probe to the surviving module must be delivered, not dropped"
+        );
+        assert!(
+            incumbent_rx.try_recv().is_ok(),
+            "the live module must actually receive the probe"
+        );
     }
 
     // The incumbent dies (its receiver, owned by the socket, is dropped). The
