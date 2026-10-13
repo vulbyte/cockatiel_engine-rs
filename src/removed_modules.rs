@@ -88,11 +88,7 @@ mod tests {
     use uuid::Uuid;
 
     fn temp_path(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "ckt-removed-{}-{}.json",
-            tag,
-            Uuid::now_v7()
-        ))
+        std::env::temp_dir().join(format!("ckt-removed-{}-{}.json", tag, Uuid::now_v7()))
     }
 
     #[test]

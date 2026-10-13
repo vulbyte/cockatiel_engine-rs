@@ -115,7 +115,9 @@ impl StreamTracker {
         let mut updated = Vec::new();
         for user in self.attendance.keys() {
             let count = match self.streaks.get(user) {
-                Some((last, prev_count)) if Some(last.as_str()) == self.previous_stream_uuid.as_deref() => {
+                Some((last, prev_count))
+                    if Some(last.as_str()) == self.previous_stream_uuid.as_deref() =>
+                {
                     prev_count + 1
                 }
                 _ => 1,
@@ -174,7 +176,10 @@ impl StreamTracker {
             Some((first_seen, _)) => activity_multiplier(now, *first_seen, self.started_ms),
             None => 1.0,
         };
-        (streak_count, combined_multiplier(streak_mult, activity_mult))
+        (
+            streak_count,
+            combined_multiplier(streak_mult, activity_mult),
+        )
     }
 }
 

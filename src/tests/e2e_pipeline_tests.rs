@@ -355,5 +355,8 @@ async fn an_audited_message_is_held_and_never_completes() {
         );
     }
     let r = row(&db, &uuid7).await;
-    assert_eq!(r["pipeline_status"], "audit", "audited row stays held: {r:?}");
+    assert_eq!(
+        r["pipeline_status"], "audit",
+        "audited row stays held: {r:?}"
+    );
 }

@@ -595,8 +595,7 @@ pub fn refresh_config(state: &Arc<Mutex<ConfigState>>) {
     state.last_size = u32::MAX;
 }
 
-pub async fn verify_config() -> Result<(String, PathBuf), Box<dyn std::error::Error>>
-{
+pub async fn verify_config() -> Result<(String, PathBuf), Box<dyn std::error::Error>> {
     for path in ["../config.json"] {
         if let Ok(content) = get_file(path) {
             return Ok((content, PathBuf::from(path)));

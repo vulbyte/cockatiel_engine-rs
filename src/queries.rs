@@ -48,6 +48,20 @@ use crate::{
     is_test_runner, log_event, log_event_broadcast, may_read_other_credentials, userdb_actor_perm,
 };
 
+/// TEMPORARY account-merge bridge.
+///
+/// The external `cockatiel-proto` revision is unpublished, so there is no
+/// `MergeUsers` op to call yet. Until there is, the `userdb_merge_users` route
+/// tunnels a merge request through the existing `write_user_value` op using this
+/// reserved key (NUL + `__cockatiel_merge__`, which no user value will ever
+/// legitimately use); the user-db's `WriteUserValue` handler intercepts the key
+/// and merges instead of writing.
+///
+/// MUST stay byte-identical to `MERGE_RESERVED_KEY` in the user-db's
+/// `src/main.rs`. Delete this const (and the bridge) once the proto
+/// `MergeUsers` op ships.
+pub(crate) const MERGE_RESERVED_KEY: &str = "\u{0}__cockatiel_merge__";
+
 /// The result of answering one query: the triple the dispatcher has always
 /// produced. Kept as a named struct so the response envelope and the dispatch
 /// chain agree on one shape, with [`From`] to build it from a bare tuple.
@@ -1659,6 +1673,50 @@ async fn run_test_suite(
     )
 }
 
+/// Validate a `userdb_merge_users` payload and build the bridge value JSON the
+/// engine will send under [`MERGE_RESERVED_KEY`].
+///
+/// TEMPORARY: this exists only so the account-merge route can tunnel through
+/// `write_user_value` while the proto `MergeUsers` op is unpublished. Requires a
+/// non-empty `primary_uuid7` and `secondary_uuid7` that differ; `username` is
+/// passed through (empty stays empty) and `roles_from_secondary` defaults to
+/// `false`. Returns `(primary_uuid7, value_json)`.
+fn build_merge_payload(payload: &serde_json::Value) -> Result<(String, String), String> {
+    let primary = payload
+        .get("primary_uuid7")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let secondary = payload
+        .get("secondary_uuid7")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if primary.is_empty() {
+        return Err("userdb_merge_users requires primary_uuid7".to_string());
+    }
+    if secondary.is_empty() {
+        return Err("userdb_merge_users requires secondary_uuid7".to_string());
+    }
+    if primary == secondary {
+        return Err("userdb_merge_users primary and secondary must differ".to_string());
+    }
+    let username = payload
+        .get("username")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let roles_from_secondary = payload
+        .get("roles_from_secondary")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let value = serde_json::json!({
+        "primary_uuid7": primary,
+        "secondary_uuid7": secondary,
+        "username": username,
+        "roles_from_secondary": roles_from_secondary,
+    })
+    .to_string();
+    Ok((primary.to_string(), value))
+}
+
 /// Handle a `userdb_*` virtual query from the TUI. The SQL field carries a JSON
 /// payload specific to each operation. Only the engine's control surface (TUI)
 /// may reach the user database.
@@ -1798,6 +1856,19 @@ async fn userdb_virtual_query(
             client
                 .set_roles(uuid7, actor, &role, sponsor, mod_, admin, owner)
                 .await
+        }
+        "userdb_merge_users" => {
+            // TEMPORARY account-merge bridge (see `MERGE_RESERVED_KEY`): tunnel
+            // the merge through `write_user_value` under a reserved key until
+            // the proto `MergeUsers` op ships. Validation failures return early.
+            match build_merge_payload(&payload) {
+                Ok((primary, value)) => {
+                    client
+                        .write_user_value(&primary, MERGE_RESERVED_KEY, &value)
+                        .await
+                }
+                Err(e) => return (false, Vec::new(), e),
+            }
         }
         "userdb_read_user_value" => {
             let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
@@ -3141,6 +3212,11 @@ mod tests {
             ("userdb_get_user", NORMAL, false),
             ("userdb_ban", TUI, true),
             ("userdb_ban", NORMAL, false),
+            // ── userdb_merge_users rides the userdb family gate (TUI only):
+            // it is the temporary write_user_value bridge, so it must stay on
+            // the same control-surface-only path as every other mutation.
+            ("userdb_merge_users", TUI, true),
+            ("userdb_merge_users", NORMAL, false),
             // ── userdb_rate_user: the TUI ONLY (the operator stamps the engine
             // actor id). Same family gate as the rest of the userdb routes.
             ("userdb_rate_user", TUI, true),
@@ -3385,6 +3461,7 @@ mod tests {
         ("userdb_rate_user", QueryRoute::UserdbFamily),
         ("userdb_ban", QueryRoute::UserdbFamily),
         ("userdb_timeout", QueryRoute::UserdbFamily),
+        ("userdb_merge_users", QueryRoute::UserdbFamily),
         // Predictions read surface.
         ("prediction_get_score", QueryRoute::PredictionGetScore),
         // One-shot timeline aggregates (control surface).
@@ -3396,6 +3473,41 @@ mod tests {
         for (query_id, expected) in RECOGNISED {
             assert_eq!(classify_query(query_id), *expected, "query_id={query_id:?}");
         }
+    }
+
+    #[test]
+    fn merge_users_payload_validation() {
+        // Missing/empty secondary is rejected.
+        let missing_secondary = serde_json::json!({ "primary_uuid7": "a" });
+        assert!(build_merge_payload(&missing_secondary).is_err());
+        // Missing primary is rejected too.
+        let missing_primary = serde_json::json!({ "secondary_uuid7": "b" });
+        assert!(build_merge_payload(&missing_primary).is_err());
+        // Self-merge is rejected.
+        let same = serde_json::json!({ "primary_uuid7": "a", "secondary_uuid7": "a" });
+        assert!(build_merge_payload(&same).is_err());
+
+        // A valid payload builds the bridge value with the expected fields.
+        let valid = serde_json::json!({
+            "primary_uuid7": "a",
+            "secondary_uuid7": "b",
+            "username": "merged",
+            "roles_from_secondary": true,
+        });
+        let (primary, value) = build_merge_payload(&valid).unwrap();
+        assert_eq!(primary, "a");
+        let parsed: serde_json::Value = serde_json::from_str(&value).unwrap();
+        assert_eq!(parsed["primary_uuid7"], "a");
+        assert_eq!(parsed["secondary_uuid7"], "b");
+        assert_eq!(parsed["username"], "merged");
+        assert_eq!(parsed["roles_from_secondary"], true);
+
+        // Optional fields default: empty username and false roles.
+        let minimal = serde_json::json!({ "primary_uuid7": "a", "secondary_uuid7": "b" });
+        let (_, value) = build_merge_payload(&minimal).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&value).unwrap();
+        assert_eq!(parsed["username"], "");
+        assert_eq!(parsed["roles_from_secondary"], false);
     }
 
     #[test]

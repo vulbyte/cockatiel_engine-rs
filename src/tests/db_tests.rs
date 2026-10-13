@@ -915,9 +915,7 @@ async fn stream_streaks_upsert_and_load_round_trip() {
     db.upsert_stream_streak("alice", "stream-a", 1)
         .await
         .unwrap();
-    db.upsert_stream_streak("bob", "stream-a", 3)
-        .await
-        .unwrap();
+    db.upsert_stream_streak("bob", "stream-a", 3).await.unwrap();
     // Same user again: replaces rather than duplicating.
     db.upsert_stream_streak("alice", "stream-b", 2)
         .await

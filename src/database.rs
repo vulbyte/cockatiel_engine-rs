@@ -922,10 +922,7 @@ impl DatabaseManager {
         Ok(())
     }
 
-    pub async fn mark_synced(
-        &self,
-        uuid7s: &[Vec<u8>],
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn mark_synced(&self, uuid7s: &[Vec<u8>]) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
         let now = Self::now_ms();
@@ -941,9 +938,7 @@ impl DatabaseManager {
         Ok(())
     }
 
-    pub async fn get_next_queued(
-        &self,
-    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    pub async fn get_next_queued(&self) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
         self.contained(async {
             let conn = self.locked().await;
             let conn = conn.as_ref().ok_or("Local database not initialized")?;
@@ -966,9 +961,7 @@ impl DatabaseManager {
         .await
     }
 
-    pub async fn get_incomplete(
-        &self,
-    ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    pub async fn get_incomplete(&self) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
         let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
@@ -986,9 +979,7 @@ impl DatabaseManager {
         Ok(results)
     }
 
-    pub async fn get_unsynced_count(
-        &self,
-    ) -> Result<i32, Box<dyn std::error::Error>> {
+    pub async fn get_unsynced_count(&self) -> Result<i32, Box<dyn std::error::Error>> {
         self.contained(async {
             let conn = self.locked().await;
             let conn = conn.as_ref().ok_or("Local database not initialized")?;
@@ -1349,9 +1340,7 @@ impl DatabaseManager {
     /// stored as BLOB or TEXT depending on how the row was inserted (turso's
     /// `FromValue for Vec<u8>` only accepts BLOB and `String` only TEXT, so
     /// neither alone is safe) — use `get_value` and decode both.
-    pub async fn get_queued_uuids(
-        &self,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    pub async fn get_queued_uuids(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let conn = self.locked().await;
         let conn = conn.as_ref().ok_or("Local database not initialized")?;
 
@@ -1494,10 +1483,7 @@ impl DatabaseManager {
     }
 
     /// Whether a message is currently held for audit.
-    pub async fn is_audited(
-        &self,
-        uuid7: &[u8],
-    ) -> Result<bool, Box<dyn std::error::Error>> {
+    pub async fn is_audited(&self, uuid7: &[u8]) -> Result<bool, Box<dyn std::error::Error>> {
         self.contained(async {
             let conn = self.locked().await;
             let conn = conn.as_ref().ok_or("Local database not initialized")?;
