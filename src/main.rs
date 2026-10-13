@@ -702,6 +702,11 @@ pub async fn enrich_chat_user(
     // Expose the rating counters so displays can show a reprimand indicator.
     css.insert("reprimands".to_string(), user.reprimands.to_string());
     css.insert("commendations".to_string(), user.commendations.to_string());
+    // A donation carried on `raw_data` (parsed once at ingest, forwarded here on
+    // every enrich) advertises its facts alongside score/rank: `is_donation`,
+    // `donation_kind`, `donation_amount` (= display), `donation_currency`.
+    let donation = crate::pipeline::DonationInfo::parse(&chat.raw_data);
+    crate::pipeline::add_donation_css(&mut css, donation.as_ref());
 
     chat.user_uuid7 = user.uuid7.clone();
     chat.user_data = Some(cockatiel_protobuf::UserData {

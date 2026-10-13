@@ -13,7 +13,8 @@ use crate::cockatiel_protobuf::{
 use crate::command_registry::CommandRegistry;
 use crate::database::{DatabaseConfig, DatabaseManager};
 use crate::pipeline::{
-    PendingAck, PipelineConfig, PipelineOrchestrator, PipelineStage, SendOutcome, send_to_module,
+    DonationInfo, PendingAck, PipelineConfig, PipelineOrchestrator, PipelineStage, SendOutcome,
+    add_donation_css, send_to_module,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1250,8 +1251,14 @@ async fn an_abandon_does_not_clobber_an_audit_hold() {
 #[test]
 fn shadow_only_when_a_live_different_instance_holds_the_slot() {
     use crate::pipeline::should_shadow;
-    assert!(!should_shadow(false, false), "no incumbent -> take the slot");
-    assert!(!should_shadow(false, true), "dead incumbent -> take the slot");
+    assert!(
+        !should_shadow(false, false),
+        "no incumbent -> take the slot"
+    );
+    assert!(
+        !should_shadow(false, true),
+        "dead incumbent -> take the slot"
+    );
     assert!(
         !should_shadow(true, true),
         "same-instance reconnect must take the slot (old socket may still be closing)"
@@ -1353,8 +1360,7 @@ async fn duplicate_connection_shadow_cannot_evict_live_slot() {
                 },
             )),
         };
-        let outcome =
-            send_to_module(&orchestrator.module_senders, "scorer", probe, "probe").await;
+        let outcome = send_to_module(&orchestrator.module_senders, "scorer", probe, "probe").await;
         assert_eq!(
             outcome,
             SendOutcome::Sent,
@@ -1401,4 +1407,145 @@ async fn duplicate_connection_shadow_cannot_evict_live_slot() {
         assert!(!senders.contains_key("scorer"));
         assert!(!owners.contains_key("scorer"));
     }
+}
+
+/// The adapter's donation JSON as described in the contract.
+const DONATION_JSON: &[u8] = br#"{"donation":{"kind":"superchat","amount_micros":5000000,"currency":"USD","display":"$5.00","message":"nice one"}}"#;
+
+/// An adapter ingest container carrying arbitrary `raw_data`.
+fn ingest_with_raw_data(raw_data: &[u8]) -> ContainerForEngine {
+    ContainerForEngine {
+        version: 2,
+        auth_token: String::new(),
+        module_name: "adapter".into(),
+        module_instance_uuid7: String::new(),
+        payload: Some(EnginePayload::MessagePreProcess(MessagePreProcess {
+            message_uuid7: String::new(),
+            raw_message: Some(ChatMessage {
+                platform: "twitch".into(),
+                raw_data: raw_data.to_vec(),
+                raw_message: "nice one".into(),
+                user_uuid7: "user-1".into(),
+                command: None,
+                channel_id: "chan-1".into(),
+                user_data: None,
+            }),
+            audio: vec![],
+            audio_type: String::new(),
+        })),
+    }
+}
+
+/// Parse + css-key builder, as pure helpers (no DB / user-db needed): a donation
+/// yields the four keys; a plain or malformed message yields none.
+#[test]
+fn donation_parse_builds_flags_and_css_keys() {
+    let d = DonationInfo::parse(DONATION_JSON).expect("a donation");
+    assert_eq!(d.kind, "superchat");
+    assert_eq!(d.amount_micros, 5_000_000);
+    assert_eq!(d.currency, "USD");
+    assert_eq!(d.display, "$5.00");
+    assert_eq!(d.message, "nice one");
+    assert_eq!(
+        d.flags_string(),
+        "donation=superchat;amount=$5.00;currency=USD"
+    );
+
+    let mut css = HashMap::new();
+    add_donation_css(&mut css, Some(&d));
+    assert_eq!(css.get("is_donation").map(String::as_str), Some("1"));
+    assert_eq!(
+        css.get("donation_kind").map(String::as_str),
+        Some("superchat")
+    );
+    assert_eq!(
+        css.get("donation_amount").map(String::as_str),
+        Some("$5.00")
+    );
+    assert_eq!(
+        css.get("donation_currency").map(String::as_str),
+        Some("USD")
+    );
+
+    assert!(DonationInfo::parse(b"").is_none(), "empty bytes");
+    assert!(DonationInfo::parse(b"not json").is_none(), "malformed json");
+    assert!(
+        DonationInfo::parse(br#"{"foo":1}"#).is_none(),
+        "json without a donation"
+    );
+    let mut plain_css = HashMap::new();
+    add_donation_css(&mut plain_css, None);
+    assert!(plain_css.is_empty(), "a non-donation adds no keys");
+}
+
+/// Ingesting a donation flags the message (row `flags` + in-memory state) and
+/// forwards `raw_data` to the stage's `ChatMessage`.
+#[tokio::test]
+async fn ingesting_a_donation_flags_it_and_forwards_raw_data() {
+    let db = test_db().await;
+    let (orchestrator, mut rx) = wired_orchestrator(db.clone(), &["pre"], &[], &[]);
+
+    orchestrator
+        .handle_message_from_module(&ingest_with_raw_data(DONATION_JSON))
+        .await
+        .unwrap();
+
+    // raw_data reaches the pre-process stage verbatim...
+    let stage = match rx.get_mut("pre").unwrap().try_recv().unwrap().payload {
+        Some(ModulePayload::MessagePreProcess(m)) => m,
+        other => panic!("expected MessagePreProcess, got {other:?}"),
+    };
+    assert_eq!(
+        stage.raw_message.as_ref().unwrap().raw_data,
+        DONATION_JSON,
+        "raw_data must be forwarded to stages"
+    );
+    let uuid7 = stage.message_uuid7.clone();
+
+    // ...and the in-memory state is flagged as a donation.
+    {
+        let states = orchestrator.pipeline_states.lock().await;
+        let state = states.get(&uuid7).expect("in-flight state");
+        let d = state
+            .donation
+            .as_ref()
+            .expect("donation detected at ingest");
+        assert_eq!(d.kind, "superchat");
+        assert_eq!(d.display, "$5.00");
+        assert_eq!(
+            state.flags.as_deref(),
+            Some("donation=superchat;amount=$5.00;currency=USD")
+        );
+    }
+
+    // The row carries the flag string in its `flags` column.
+    let r = row(&db, &uuid7).await;
+    assert_eq!(r["flags"], "donation=superchat;amount=$5.00;currency=USD");
+}
+
+/// A plain message is untouched: no donation, no flags, empty raw_data.
+#[tokio::test]
+async fn a_plain_message_is_not_flagged_as_a_donation() {
+    let db = test_db().await;
+    let (orchestrator, mut rx) = wired_orchestrator(db.clone(), &["pre"], &[], &[]);
+
+    orchestrator
+        .handle_message_from_module(&adapter_ingest("just chatting"))
+        .await
+        .unwrap();
+
+    let stage = match rx.get_mut("pre").unwrap().try_recv().unwrap().payload {
+        Some(ModulePayload::MessagePreProcess(m)) => m,
+        other => panic!("expected MessagePreProcess, got {other:?}"),
+    };
+    assert!(
+        stage.raw_message.as_ref().unwrap().raw_data.is_empty(),
+        "a plain message carries no raw_data"
+    );
+    let uuid7 = stage.message_uuid7.clone();
+
+    let states = orchestrator.pipeline_states.lock().await;
+    let state = states.get(&uuid7).expect("in-flight state");
+    assert!(state.donation.is_none());
+    assert!(state.flags.is_none());
 }

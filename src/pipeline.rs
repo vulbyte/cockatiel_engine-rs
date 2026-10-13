@@ -260,6 +260,104 @@ pub struct PipelineMessage {
     pub channel_id: String,
     pub user_uuid7: String,
     pub user_data: Option<crate::cockatiel_protobuf::UserData>,
+    /// Adapter-supplied opaque bytes (`ChatMessage.raw_data`, UTF-8 JSON). Read
+    /// at ingest to detect a donation and forwarded to every stage so a module
+    /// sees the same payload the engine did. Deliberately NOT persisted to the
+    /// timeline (it can be kilobytes per message; the donation facts ride in
+    /// `flags` and the enriched `user_data` instead).
+    pub raw_data: Vec<u8>,
+}
+
+/// A donation the adapter attached to a chat message via `raw_data`.
+///
+/// The adapter encodes `ChatMessage.raw_data` as UTF-8 JSON:
+///
+/// `{"donation":{"kind":"superchat","amount_micros":5000000,
+/// "currency":"USD","display":"$5.00","message":"nice!"}}`
+///
+/// `amount_micros` stays `i64`: it is an external-protocol value with no
+/// 32-bit alternative at the source (a large tip in micros overflows `i32`),
+/// matching the AGENTS.md exception. Everything else is a string.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DonationInfo {
+    /// `superchat` / `supersticker` / `membership` / `gift`.
+    pub kind: String,
+    /// Amount in millionths of `currency`. `i64` (external protocol exception).
+    pub amount_micros: i64,
+    /// ISO currency code, e.g. `USD`.
+    pub currency: String,
+    /// Human-facing amount, e.g. `$5.00`.
+    pub display: String,
+    /// The donor's comment / the membership line.
+    pub message: String,
+}
+
+impl DonationInfo {
+    /// Parse `raw_data` as the adapter's donation JSON. `None` for empty bytes,
+    /// non-JSON, or JSON without a `donation.kind` — a plain message is simply
+    /// not a donation, never an error.
+    pub fn parse(raw_data: &[u8]) -> Option<Self> {
+        if raw_data.is_empty() {
+            return None;
+        }
+        let value: serde_json::Value = serde_json::from_slice(raw_data).ok()?;
+        let donation = value.get("donation")?;
+        let kind = donation.get("kind")?.as_str()?.to_string();
+        if kind.is_empty() {
+            return None;
+        }
+        let text = |key: &str| {
+            donation
+                .get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        Some(Self {
+            kind,
+            amount_micros: donation
+                .get("amount_micros")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            currency: text("currency"),
+            display: text("display"),
+            message: text("message"),
+        })
+    }
+
+    /// The engine's internal `flags` string for a donation row:
+    /// `donation=<kind>;amount=<display>;currency=<currency>`.
+    pub fn flags_string(&self) -> String {
+        format!(
+            "donation={};amount={};currency={}",
+            self.kind, self.display, self.currency
+        )
+    }
+
+    /// The four `user_data` css_properties keys a donation advertises alongside
+    /// the score/rank keys. Owned `(key, value)` pairs so callers can insert
+    /// them into any map.
+    pub fn css_properties(&self) -> [(&'static str, String); 4] {
+        [
+            ("is_donation", "1".to_string()),
+            ("donation_kind", self.kind.clone()),
+            ("donation_amount", self.display.clone()),
+            ("donation_currency", self.currency.clone()),
+        ]
+    }
+}
+
+/// Insert a donation's css keys into an enriched `user_data` map. A `None`
+/// donation is a no-op (a plain message carries no donation keys).
+pub fn add_donation_css(
+    css: &mut std::collections::HashMap<String, String>,
+    donation: Option<&DonationInfo>,
+) {
+    if let Some(d) = donation {
+        for (key, value) in d.css_properties() {
+            css.insert(key.to_string(), value);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -609,6 +707,11 @@ pub struct PipelineState {
     /// appended a marker each time, so the terminal write has to append exactly
     /// the same set.
     pub audio_type_markers: Vec<String>,
+    /// Adapter-supplied opaque bytes, forwarded to each stage's `ChatMessage`.
+    pub raw_data: Vec<u8>,
+    /// Parsed donation for this message, when `raw_data` carried one. Drives
+    /// the donation css keys on the enriched `user_data` map.
+    pub donation: Option<DonationInfo>,
 }
 
 /// The cost/authority gate for one module, read from its manifest:
@@ -1020,6 +1123,8 @@ impl PipelineOrchestrator {
             pre_process_completed_at: None,
             in_process_completed_at: None,
             audio_type_markers: Vec::new(),
+            raw_data: msg.raw_data.clone(),
+            donation: DonationInfo::parse(&msg.raw_data),
         };
 
         if !msg.user_uuid7.is_empty() {
@@ -1057,10 +1162,7 @@ impl PipelineOrchestrator {
     /// While the pipeline is paused this claims the row and then holds at the
     /// entry gate: recovery is not skipped, it is deferred to the resume like
     /// any other dispatch.
-    pub async fn recover_one(
-        &self,
-        uuid7: &str,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
+    pub async fn recover_one(&self, uuid7: &str) -> Result<bool, Box<dyn std::error::Error>> {
         // The claim check the database used to do. A row in flight is 'queued'
         // now (the pipeline writes no intermediate status), so `load_queued_message`
         // can no longer tell a live message from a stranded one — the state map
@@ -1109,6 +1211,10 @@ impl PipelineOrchestrator {
             pre_process_completed_at: None,
             in_process_completed_at: None,
             audio_type_markers: Vec::new(),
+            // `raw_data` is never persisted, so a recovered row cannot
+            // reconstruct it or its donation; only the stored `flags` survive.
+            raw_data: Vec::new(),
+            donation: None,
         };
 
         {
@@ -1141,9 +1247,7 @@ impl PipelineOrchestrator {
     /// row inserted after the snapshot is a message the live pipeline owns and
     /// drives itself), and a row this pass could not drive is handed back to
     /// the caller to log rather than retried in a tight loop.
-    pub async fn drain_queued_once(
-        &self,
-    ) -> Result<RecoveryDrain, Box<dyn std::error::Error>> {
+    pub async fn drain_queued_once(&self) -> Result<RecoveryDrain, Box<dyn std::error::Error>> {
         let uuids = self.db.get_queued_uuids().await?;
         let mut drain = RecoveryDrain {
             considered: uuids.len(),
@@ -1159,10 +1263,7 @@ impl PipelineOrchestrator {
         Ok(drain)
     }
 
-    async fn broadcast_pre_process(
-        &self,
-        uuid7: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn broadcast_pre_process(&self, uuid7: &str) -> Result<(), Box<dyn std::error::Error>> {
         // PAUSE GATE 1 of 3 — the entry gate. By the time a message reaches
         // here its timeline row is written and its state is live, so the pause
         // holds the CHAIN, not the message: nothing is lost, and resume replays
@@ -1192,7 +1293,7 @@ impl PipelineOrchestrator {
                     message_uuid7: uuid7.to_string(),
                     raw_message: Some(ChatMessage {
                         platform: state.platform.clone(),
-                        raw_data: vec![],
+                        raw_data: state.raw_data.clone(),
                         raw_message: state.raw_message.clone(),
                         user_uuid7: state.user_uuid7.clone(),
                         command: state.parsed_command.clone(),
@@ -1279,10 +1380,7 @@ impl PipelineOrchestrator {
         Ok(())
     }
 
-    async fn start_in_process(
-        &self,
-        uuid7: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn start_in_process(&self, uuid7: &str) -> Result<(), Box<dyn std::error::Error>> {
         // PAUSE GATE 2 of 3. Hold rather than dispatch: the message keeps its
         // state and its `current_in_process_index`, so the replay sends it to the
         // module it was about to reach — and the audit check, the stage stamp
@@ -1325,7 +1423,7 @@ impl PipelineOrchestrator {
                     message_uuid7: uuid7.to_string(),
                     raw_message: Some(ChatMessage {
                         platform: state.platform.clone(),
-                        raw_data: vec![],
+                        raw_data: state.raw_data.clone(),
                         raw_message: state.raw_message.clone(),
                         user_uuid7: state.user_uuid7.clone(),
                         command: state.parsed_command.clone(),
@@ -1426,10 +1524,7 @@ impl PipelineOrchestrator {
         Ok(())
     }
 
-    async fn start_post_process(
-        &self,
-        uuid7: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn start_post_process(&self, uuid7: &str) -> Result<(), Box<dyn std::error::Error>> {
         // PAUSE GATE 3 of 3 — same rule as the in-process gate: hold, keep the
         // state, let the replay finish it. Note this also covers the
         // no-module-connected completion below, so a message cannot reach a
@@ -1472,7 +1567,7 @@ impl PipelineOrchestrator {
                     message_uuid7: uuid7.to_string(),
                     raw_message: Some(ChatMessage {
                         platform: state.platform.clone(),
-                        raw_data: vec![],
+                        raw_data: state.raw_data.clone(),
                         raw_message: state.raw_message.clone(),
                         user_uuid7: state.user_uuid7.clone(),
                         command: state.parsed_command.clone(),
@@ -1625,10 +1720,7 @@ impl PipelineOrchestrator {
     /// Every terminal path (complete / failed / dropped) funnels through this,
     /// so a critical-module timeout or a module abandon preserves an operator's
     /// hold instead of clobbering it with `failed`/`dropped`.
-    async fn preserve_audit_hold(
-        &self,
-        uuid7: &str,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
+    async fn preserve_audit_hold(&self, uuid7: &str) -> Result<bool, Box<dyn std::error::Error>> {
         let uuid7_bytes = uuid7_string_to_bytes(uuid7);
         if !self.db.is_audited(&uuid7_bytes).await? {
             return Ok(false);
@@ -1640,10 +1732,7 @@ impl PipelineOrchestrator {
         Ok(true)
     }
 
-    async fn mark_complete(
-        &self,
-        uuid7: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn mark_complete(&self, uuid7: &str) -> Result<(), Box<dyn std::error::Error>> {
         let uuid7_bytes = uuid7_string_to_bytes(uuid7);
 
         // Held-for-audit messages stay held, not completed. The run's
@@ -1748,16 +1837,21 @@ impl PipelineOrchestrator {
         let Some(client) = self.user_db.as_ref() else {
             return;
         };
-        let (platform, user_uuid7) = {
+        let (platform, user_uuid7, raw_data) = {
             let states = self.pipeline_states.lock().await;
             match states.get(uuid7) {
-                Some(s) if !s.user_uuid7.is_empty() => (s.platform.clone(), s.user_uuid7.clone()),
+                Some(s) if !s.user_uuid7.is_empty() => {
+                    (s.platform.clone(), s.user_uuid7.clone(), s.raw_data.clone())
+                }
                 _ => return,
             }
         };
         let mut chat = cockatiel_protobuf::ChatMessage {
             platform,
             user_uuid7,
+            // Carry the adapter bytes so the post-process enrich re-applies the
+            // donation css keys (it sees the same payload ingest did).
+            raw_data,
             ..Default::default()
         };
         crate::enrich_chat_user(client, &mut chat).await;
@@ -1839,10 +1933,7 @@ impl PipelineOrchestrator {
     /// Resend a stage message whose receipt ping never arrived. Returns:
     /// `Ok(true)` = resent + clock restarted, `Ok(false)` = the module isn't
     /// connected (nothing to resend to), `Err` = rebuild/send failure.
-    async fn resend_stage(
-        &self,
-        entry: &PendingAck,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
+    async fn resend_stage(&self, entry: &PendingAck) -> Result<bool, Box<dyn std::error::Error>> {
         let state = {
             let states = self.pipeline_states.lock().await;
             states.get(&entry.uuid7).cloned()
@@ -1862,7 +1953,7 @@ impl PipelineOrchestrator {
                         message_uuid7: entry.uuid7.clone(),
                         raw_message: Some(ChatMessage {
                             platform: state.platform.clone(),
-                            raw_data: vec![],
+                            raw_data: state.raw_data.clone(),
                             raw_message: state.raw_message.clone(),
                             user_uuid7: state.user_uuid7.clone(),
                             command: state.parsed_command.clone(),
@@ -1883,7 +1974,7 @@ impl PipelineOrchestrator {
                         message_uuid7: entry.uuid7.clone(),
                         raw_message: Some(ChatMessage {
                             platform: state.platform.clone(),
-                            raw_data: vec![],
+                            raw_data: state.raw_data.clone(),
                             raw_message: state.raw_message.clone(),
                             user_uuid7: state.user_uuid7.clone(),
                             command: state.parsed_command.clone(),
@@ -1906,7 +1997,7 @@ impl PipelineOrchestrator {
                         message_uuid7: entry.uuid7.clone(),
                         raw_message: Some(ChatMessage {
                             platform: state.platform.clone(),
-                            raw_data: vec![],
+                            raw_data: state.raw_data.clone(),
                             raw_message: state.raw_message.clone(),
                             user_uuid7: state.user_uuid7.clone(),
                             command: state.parsed_command.clone(),
@@ -2126,17 +2217,22 @@ impl PipelineOrchestrator {
                     // New message from an adapter (input) — ingest it into the
                     // pipeline with a fresh uuid7. This is the DB-as-queue entry.
                     if let Some(chat) = &msg.raw_message {
+                        // Detect an adapter donation once, here at ingest: the
+                        // donation's facts land on the row's `flags` column and
+                        // the raw bytes are carried forward to every stage.
+                        let donation = DonationInfo::parse(&chat.raw_data);
                         let msg_in = PipelineMessage {
                             uuid7: uuid7_string().unwrap_or_default(),
                             platform: chat.platform.clone(),
                             event_type: 1,
                             raw_message: chat.raw_message.clone(),
                             command: None,
-                            flags: None,
+                            flags: donation.as_ref().map(DonationInfo::flags_string),
                             parsed_command: chat.command.clone(),
                             channel_id: chat.channel_id.clone(),
                             user_uuid7: chat.user_uuid7.clone(),
                             user_data: chat.user_data.clone(),
+                            raw_data: chat.raw_data.clone(),
                         };
                         self.insert_and_start(msg_in).await?;
                         return Ok(true);
