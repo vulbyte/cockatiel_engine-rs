@@ -1717,6 +1717,42 @@ fn build_merge_payload(payload: &serde_json::Value) -> Result<(String, String), 
     Ok((primary.to_string(), value))
 }
 
+/// Validate a `userdb_split_channel` payload. Requires a non-empty `uuid7`,
+/// `platform` and `channel_id`; `handle` is optional (the new user's username
+/// falls back to `channel_id` when it is empty). Returns the source user's
+/// uuid7 and the channel to detach.
+fn parse_split_channel_payload(
+    payload: &serde_json::Value,
+) -> Result<(String, crate::user_db_client::proto::ChannelRef), String> {
+    let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
+    let platform = payload
+        .get("platform")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let channel_id = payload
+        .get("channel_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let handle = payload.get("handle").and_then(|v| v.as_str()).unwrap_or("");
+    if uuid7.is_empty() {
+        return Err("userdb_split_channel requires uuid7".to_string());
+    }
+    if platform.is_empty() {
+        return Err("userdb_split_channel requires platform".to_string());
+    }
+    if channel_id.is_empty() {
+        return Err("userdb_split_channel requires channel_id".to_string());
+    }
+    Ok((
+        uuid7.to_string(),
+        crate::user_db_client::proto::ChannelRef {
+            platform: platform.to_string(),
+            channel_id: channel_id.to_string(),
+            handle: handle.to_string(),
+        },
+    ))
+}
+
 /// Handle a `userdb_*` virtual query from the TUI. The SQL field carries a JSON
 /// payload specific to each operation. Only the engine's control surface (TUI)
 /// may reach the user database.
@@ -1793,6 +1829,37 @@ async fn userdb_virtual_query(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             client.remove_channel(uuid7, platform, channel_id).await
+        }
+        "userdb_split_channel" => {
+            // Detach a channel from its current user and create a NEW account
+            // for it. Two sequential user-db ops: the split only makes sense if
+            // the detach succeeded, so a failed remove is surfaced and the new
+            // account is NOT created.
+            let (uuid7, channel) = match parse_split_channel_payload(&payload) {
+                Ok(v) => v,
+                Err(e) => return (false, Vec::new(), e),
+            };
+            match client
+                .remove_channel(&uuid7, &channel.platform, &channel.channel_id)
+                .await
+            {
+                Ok(resp) if resp.success => {}
+                Ok(resp) => {
+                    let err = if resp.error.is_empty() {
+                        "userdb_split_channel: remove_channel failed".to_string()
+                    } else {
+                        resp.error
+                    };
+                    return (false, Vec::new(), err);
+                }
+                Err(e) => return (false, Vec::new(), e),
+            }
+            let username = if channel.handle.is_empty() {
+                channel.channel_id.clone()
+            } else {
+                channel.handle.clone()
+            };
+            client.add_user(&username, Some(&channel)).await
         }
         "userdb_get_user" => {
             let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
@@ -3448,6 +3515,7 @@ mod tests {
         ("userdb_remove_score", QueryRoute::UserdbFamily),
         ("userdb_add_channel", QueryRoute::UserdbFamily),
         ("userdb_remove_channel", QueryRoute::UserdbFamily),
+        ("userdb_split_channel", QueryRoute::UserdbFamily),
         ("userdb_get_user", QueryRoute::UserdbFamily),
         ("userdb_list_users", QueryRoute::UserdbFamily),
         ("userdb_update_flags", QueryRoute::UserdbFamily),
@@ -3508,6 +3576,58 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&value).unwrap();
         assert_eq!(parsed["username"], "");
         assert_eq!(parsed["roles_from_secondary"], false);
+    }
+
+    #[test]
+    fn split_channel_payload_validation() {
+        // Missing uuid7 is rejected.
+        assert!(
+            parse_split_channel_payload(&serde_json::json!({
+                "platform": "twitch", "channel_id": "c1"
+            }))
+            .is_err()
+        );
+        // Missing platform is rejected.
+        assert!(
+            parse_split_channel_payload(&serde_json::json!({
+                "uuid7": "u1", "channel_id": "c1"
+            }))
+            .is_err()
+        );
+        // Missing channel_id is rejected.
+        assert!(
+            parse_split_channel_payload(&serde_json::json!({
+                "uuid7": "u1", "platform": "twitch"
+            }))
+            .is_err()
+        );
+        // Empty strings count as missing.
+        assert!(
+            parse_split_channel_payload(&serde_json::json!({
+                "uuid7": "", "platform": "twitch", "channel_id": "c1"
+            }))
+            .is_err()
+        );
+        // An empty payload is rejected.
+        assert!(parse_split_channel_payload(&serde_json::json!({})).is_err());
+
+        // A valid payload yields the source uuid7 and the channel to detach;
+        // an absent handle stays empty (the caller falls back to channel_id).
+        let (uuid7, channel) = parse_split_channel_payload(&serde_json::json!({
+            "uuid7": "u1", "platform": "twitch", "channel_id": "c1"
+        }))
+        .unwrap();
+        assert_eq!(uuid7, "u1");
+        assert_eq!(channel.platform, "twitch");
+        assert_eq!(channel.channel_id, "c1");
+        assert_eq!(channel.handle, "");
+
+        // A handle is carried through verbatim.
+        let (_, channel) = parse_split_channel_payload(&serde_json::json!({
+            "uuid7": "u1", "platform": "twitch", "channel_id": "c1", "handle": "alice_tv"
+        }))
+        .unwrap();
+        assert_eq!(channel.handle, "alice_tv");
     }
 
     #[test]
