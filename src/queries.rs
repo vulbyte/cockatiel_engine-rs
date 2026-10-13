@@ -41,6 +41,7 @@ use crate::database::DatabaseManager;
 use crate::module_manager::ModuleRegistry;
 use crate::module_registry::ModuleRegistryPersistence;
 use crate::pipeline::{PipelineOrchestrator, SendOutcome};
+use crate::stream_rewards::{SharedStreamTracker, apply_multiplier};
 use crate::user_db_client::{SharedUserDbClient, userdb_response_to_json};
 use crate::{
     EngineState, PromptSink, SharedChannelStats, SharedPromptRoutes, is_control_surface,
@@ -278,6 +279,9 @@ pub(crate) struct QueryContext<'a> {
     pub ui_state: &'a Arc<Mutex<EngineState>>,
     /// The engine-internal user database.
     pub user_db_client: &'a SharedUserDbClient,
+    /// Per-user stream streak + activity multiplier, applied to positive score
+    /// deltas in `userdb_adjust_score`.
+    pub stream_tracker: &'a SharedStreamTracker,
     /// Config + PIN, for `engine_info` and `test_run`.
     pub config_state: &'a Arc<Mutex<ConfigState>>,
     /// Persisted `modules.json` knowledge, for `module_list`.
@@ -783,6 +787,7 @@ async fn dispatch(
         orchestrator,
         ui_state,
         user_db_client,
+        stream_tracker,
         config_state,
         module_registry,
         discovered_registry,
@@ -1220,9 +1225,15 @@ async fn dispatch(
             // Real arbitrary score delta for the score-messages
             // module (no ±1 clamp, no user-db rating cooldown).
             // The TUI control surface may also call it.
-            userdb_adjust_score_virtual_query(user_db_client, sql, ui_state, module_name)
-                .await
-                .into()
+            userdb_adjust_score_virtual_query(
+                user_db_client,
+                stream_tracker,
+                sql,
+                ui_state,
+                module_name,
+            )
+            .await
+            .into()
         }
         QueryRoute::PredictionGetScore => {
             // Read a user's current score BEFORE the predictions module
@@ -1892,6 +1903,7 @@ async fn userdb_virtual_query(
 /// surface may call it.
 async fn userdb_adjust_score_virtual_query(
     client: &SharedUserDbClient,
+    stream_tracker: &SharedStreamTracker,
     sql: &str,
     ui_state: &Arc<Mutex<EngineState>>,
     requester: &str,
@@ -1967,6 +1979,16 @@ async fn userdb_adjust_score_virtual_query(
         return (true, json.into_bytes(), String::new());
     }
 
+    // Scale a POSITIVE delta by the user's stream streak x activity multiplier.
+    // The user-db proto is external and cannot carry a multiplier, so it is
+    // computed and applied here. Negative/zero deltas (penalties, no-ops) are
+    // left exactly as the caller sent them.
+    let (streak_count, combined) = stream_tracker
+        .lock()
+        .unwrap()
+        .multiplier(&uuid7, now_ms());
+    let delta = apply_multiplier(delta, combined);
+
     let outcome = client.adjust_score_only(&uuid7, delta, reason).await;
 
     match outcome {
@@ -1974,8 +1996,8 @@ async fn userdb_adjust_score_virtual_query(
             log_event(
                 ui_state,
                 format!(
-                    "[{}] userdb_adjust_score {} by {} -> {}",
-                    requester, delta, requester, uuid7
+                    "[{}] userdb_adjust_score {} (streak {} x{:.1}) -> {}",
+                    requester, delta, streak_count, combined, uuid7
                 ),
             );
             let json = userdb_response_to_json(&resp);

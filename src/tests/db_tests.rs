@@ -905,3 +905,31 @@ async fn reopen_local_produces_a_working_connection() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `stream_streaks` round-trips: a first upsert inserts, a second replaces the
+/// same user's row (no duplicate), and `load_stream_streaks` reads them back.
+#[tokio::test]
+async fn stream_streaks_upsert_and_load_round_trip() {
+    let db = test_db().await;
+
+    db.upsert_stream_streak("alice", "stream-a", 1)
+        .await
+        .unwrap();
+    db.upsert_stream_streak("bob", "stream-a", 3)
+        .await
+        .unwrap();
+    // Same user again: replaces rather than duplicating.
+    db.upsert_stream_streak("alice", "stream-b", 2)
+        .await
+        .unwrap();
+
+    let mut rows = db.load_stream_streaks().await.unwrap();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("alice".to_string(), "stream-b".to_string(), 2),
+            ("bob".to_string(), "stream-a".to_string(), 3),
+        ]
+    );
+}

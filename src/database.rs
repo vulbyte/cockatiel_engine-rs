@@ -38,6 +38,15 @@ const CREATE_STATUS_INDEX: &str = "
 CREATE INDEX IF NOT EXISTS idx_timeline_status ON timeline_events(pipeline_status)
 ";
 
+/// Persisted per-user stream streaks. The engine owns this schema (it is not
+/// part of any external proto): one row per user, updated when a stream closes.
+const CREATE_STREAM_STREAKS: &str = "
+CREATE TABLE IF NOT EXISTS stream_streaks (
+    uuid7 TEXT PRIMARY KEY,
+    last_stream_uuid TEXT,
+    streak_count INTEGER NOT NULL DEFAULT 0
+)";
+
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
     pub local_path: PathBuf,
@@ -438,6 +447,7 @@ impl DatabaseManager {
         conn.execute(CREATE_TIMELINE_EVENTS, ()).await?;
         conn.execute(CREATE_SYNCED_INDEX, ()).await?;
         conn.execute(CREATE_STATUS_INDEX, ()).await?;
+        conn.execute(CREATE_STREAM_STREAKS, ()).await?;
         Ok(conn)
     }
 
@@ -1401,6 +1411,63 @@ impl DatabaseManager {
             normalized += 1;
         }
         Ok(normalized)
+    }
+
+    // ── Stream streaks ─────────────────────────────────────────────────
+
+    /// Load every persisted per-user stream streak as
+    /// `(uuid7, last_stream_uuid, streak_count)`. Called once at startup to
+    /// seed the in-memory [`crate::stream_rewards::StreamTracker`].
+    pub async fn load_stream_streaks(
+        &self,
+    ) -> Result<Vec<(String, String, i64)>, Box<dyn std::error::Error>> {
+        let conn = self.locked().await;
+        let conn = conn.as_ref().ok_or("Local database not initialized")?;
+
+        let mut rows = conn
+            .query(
+                "SELECT uuid7, last_stream_uuid, streak_count FROM stream_streaks",
+                (),
+            )
+            .await?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let uuid7: String = row.get(0)?;
+            let last_stream_uuid: Option<String> = row.get(1)?;
+            let streak_count: Option<i64> = row.get(2)?;
+            out.push((
+                uuid7,
+                last_stream_uuid.unwrap_or_default(),
+                streak_count.unwrap_or(0),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Upsert one user's streak after a stream closes.
+    pub async fn upsert_stream_streak(
+        &self,
+        uuid7: &str,
+        last_stream_uuid: &str,
+        streak_count: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let conn = self.locked().await;
+        let conn = conn.as_ref().ok_or("Local database not initialized")?;
+        // turso 0.1.5 rejects `INSERT OR REPLACE` / `ON CONFLICT` ("ON CONFLICT
+        // clause is not supported"), so upsert as delete-then-insert.
+        conn.execute(
+            "DELETE FROM stream_streaks WHERE uuid7 = ?1",
+            turso::params![uuid7],
+        )
+        .await?;
+        conn.execute(
+            "INSERT INTO stream_streaks (uuid7, last_stream_uuid, streak_count)
+             VALUES (?1, ?2, ?3)",
+            turso::params![uuid7, last_stream_uuid, streak_count],
+        )
+        .await?;
+        Ok(())
     }
 
     // ── Audit (held-for-review messages) ───────────────────────────────

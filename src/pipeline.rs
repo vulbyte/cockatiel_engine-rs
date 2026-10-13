@@ -10,6 +10,7 @@ use crate::cockatiel_protobuf::{
 };
 use crate::command_registry::CommandRegistry;
 use crate::database::{DatabaseManager, PipelineOutcome, PipelineResult};
+use crate::stream_rewards::{SharedStreamTracker, StreamTracker};
 
 const DEFAULT_ACK_TIMEOUT_MS: u32 = 3000;
 
@@ -774,6 +775,10 @@ pub struct PipelineOrchestrator {
     /// The user database client, used by the price/rank gate to charge score
     /// and check rank. `None` in unit tests that don't gate.
     pub user_db: Option<crate::user_db_client::SharedUserDbClient>,
+    /// Per-user stream streak + within-stream activity multipliers. Shared with
+    /// the connection handler (stream open/close + score scaling) and enriched
+    /// onto outgoing `css_properties`.
+    pub stream_tracker: SharedStreamTracker,
 }
 
 impl PipelineOrchestrator {
@@ -795,6 +800,7 @@ impl PipelineOrchestrator {
             module_timings: Arc::new(Mutex::new(ModuleTimings::default())),
             module_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
             user_db: None,
+            stream_tracker: Arc::new(std::sync::Mutex::new(StreamTracker::new())),
         }
     }
 
@@ -1854,7 +1860,7 @@ impl PipelineOrchestrator {
             raw_data,
             ..Default::default()
         };
-        crate::enrich_chat_user(client, &mut chat).await;
+        crate::enrich_chat_user(client, &self.stream_tracker, &mut chat).await;
         if chat.user_data.is_some() {
             let mut states = self.pipeline_states.lock().await;
             if let Some(state) = states.get_mut(uuid7) {
@@ -2217,6 +2223,13 @@ impl PipelineOrchestrator {
                     // New message from an adapter (input) — ingest it into the
                     // pipeline with a fresh uuid7. This is the DB-as-queue entry.
                     if let Some(chat) = &msg.raw_message {
+                        // Record presence for the streak/activity multiplier.
+                        // Keyed on the user uuid the adapter (or the ingest-time
+                        // enrich) supplied; a message with no user is ignored.
+                        self.stream_tracker
+                            .lock()
+                            .unwrap()
+                            .note_attendance(&chat.user_uuid7, now_ms());
                         // Detect an adapter donation once, here at ingest: the
                         // donation's facts land on the row's `flags` column and
                         // the raw bytes are carried forward to every stage.

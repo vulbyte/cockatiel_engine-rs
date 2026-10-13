@@ -60,6 +60,8 @@ mod queries;
 use queries::{QueryContext, SharedShutdown, ShutdownStage};
 
 mod rank_chart;
+mod stream_rewards;
+use stream_rewards::SharedStreamTracker;
 mod user_db_client;
 use user_db_client::{SharedUserDbClient, UserDbClient};
 
@@ -615,6 +617,7 @@ pub async fn engine_reply_to_platform(
 
 pub async fn enrich_chat_user(
     client: &SharedUserDbClient,
+    stream_tracker: &SharedStreamTracker,
     chat: &mut cockatiel_protobuf::ChatMessage,
 ) {
     if chat.user_uuid7.is_empty() {
@@ -702,6 +705,17 @@ pub async fn enrich_chat_user(
     // Expose the rating counters so displays can show a reprimand indicator.
     css.insert("reprimands".to_string(), user.reprimands.to_string());
     css.insert("commendations".to_string(), user.commendations.to_string());
+    // Expose the stream streak + combined multiplier for this message's user.
+    // `streak` is the consecutive-stream count; `multiplier` is the combined
+    // streak x activity factor formatted with one decimal (e.g. "1.4").
+    {
+        let (streak, combined) = stream_tracker
+            .lock()
+            .unwrap()
+            .multiplier(&user.uuid7, crate::stream_rewards::now_ms());
+        css.insert("streak".to_string(), streak.to_string());
+        css.insert("multiplier".to_string(), format!("{:.1}", combined));
+    }
     // A donation carried on `raw_data` (parsed once at ingest, forwarded here on
     // every enrich) advertises its facts alongside score/rank: `is_donation`,
     // `donation_kind`, `donation_amount` (= display), `donation_currency`.
@@ -1521,6 +1535,16 @@ cockatiel
         orchestrator.user_db = Some(user_db_client.clone());
     }
 
+    // Seed persisted stream streaks from the timeline DB so a returning user's
+    // streak survives an engine restart.
+    if let Ok(rows) = db.load_stream_streaks().await {
+        orchestrator
+            .stream_tracker
+            .lock()
+            .unwrap()
+            .load_streaks(rows);
+    }
+
     // Boot PAUSED. The engine accepts module connections, ingests messages,
     // parses commands and writes the timeline exactly as it normally would, but
     // dispatches nothing to any module until the operator resumes it — so a
@@ -2081,6 +2105,21 @@ cockatiel
             &ui_state,
             "WARN: shutdown: the response could not be confirmed on the socket within 5s — exiting anyway",
         );
+    }
+    // Close any open stream so its attendance is flushed and its streak
+    // persisted before the process goes away. Best-effort: a DB hiccup must not
+    // turn a clean exit into a crash.
+    {
+        let updated = orchestrator
+            .stream_tracker
+            .lock()
+            .unwrap()
+            .close_stream(crate::stream_rewards::now_ms());
+        for (user, last_stream_uuid, streak_count) in updated {
+            let _ = db
+                .upsert_stream_streak(&user, &last_stream_uuid, streak_count)
+                .await;
+        }
     }
     // Written as an ordinary shutdown, not a crash: the TUI supervisor sees a
     // clean exit status, and its own restart policy (not this one) decides
@@ -2892,7 +2931,12 @@ where
                                         )
                                     };
                                     if fetch {
-                                        enrich_chat_user(&user_db_client, chat).await;
+                                        enrich_chat_user(
+                                            &user_db_client,
+                                            &orchestrator.stream_tracker,
+                                            chat,
+                                        )
+                                        .await;
                                     }
                                     // A real user message from an adapter: count it toward
                                     // the user's `messages_sent` (a rank factor). Best-effort
@@ -3008,6 +3052,35 @@ where
                                 }
                             }
                             Some(EnginePayload::Log(ref lg)) => {
+                                // Stream boundaries arrive as adapter log lines:
+                                // `[stream-start]` opens a stream; any end marker
+                                // closes it and persists the updated streaks.
+                                if lg.log.contains("[stream-start]") {
+                                    orchestrator
+                                        .stream_tracker
+                                        .lock()
+                                        .unwrap()
+                                        .open_stream(crate::stream_rewards::now_ms());
+                                } else if lg.log.contains("[stream-end]")
+                                    || lg.log.contains("Live chat closed")
+                                    || lg.log.contains("Stream ended")
+                                {
+                                    // Drop the guard before awaiting the DB.
+                                    let updated = orchestrator
+                                        .stream_tracker
+                                        .lock()
+                                        .unwrap()
+                                        .close_stream(crate::stream_rewards::now_ms());
+                                    for (user, last_stream_uuid, streak_count) in updated {
+                                        let _ = db
+                                            .upsert_stream_streak(
+                                                &user,
+                                                &last_stream_uuid,
+                                                streak_count,
+                                            )
+                                            .await;
+                                    }
+                                }
                                 log_event(&ui_state, format!("[{}] {}", module_name, lg.log));
                                 log_to_timeline(&db, "module_log", &module_name, &lg.log).await;
                             }
@@ -3027,6 +3100,7 @@ where
                                     orchestrator: &orchestrator,
                                     ui_state: &ui_state,
                                     user_db_client: &user_db_client,
+                                    stream_tracker: &orchestrator.stream_tracker,
                                     config_state: &config_state,
                                     module_registry: &module_registry,
                                     discovered_registry: &discovered_registry,
@@ -3083,6 +3157,7 @@ where
                                     orchestrator: &orchestrator,
                                     ui_state: &ui_state,
                                     user_db_client: &user_db_client,
+                                    stream_tracker: &orchestrator.stream_tracker,
                                     config_state: &config_state,
                                     module_registry: &module_registry,
                                     discovered_registry: &discovered_registry,
