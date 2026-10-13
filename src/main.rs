@@ -2675,16 +2675,15 @@ where
             return Ok(());
         }
 
-        // Enforce ONE live connection per module name: while a LIVE incumbent
-        // from a different instance holds this name, REJECT the newcomer. Two
-        // live connections under one name would each inject the same platform
-        // chat (duplicate ingestion — the TTS speaking twice) and appear as
-        // duplicate modules. Rejecting (rather than evicting) guarantees only one
-        // connection is ever live, with no evict/reconnect flapping while a stale
-        // duplicate process lingers. The newcomer's client backs off and retries;
-        // once the incumbent's socket is gone — or the watchdog reaps an
-        // unresponsive incumbent — the retry succeeds. A reconnect whose old
-        // sender is already CLOSED is not a clash: it reuses the name and slot.
+        // Enforce ONE live connection per module name. A new connection whose
+        // name already has a LIVE incumbent from a different instance TAKES OVER:
+        // the incumbent is closed (evicted) and the newcomer owns the slot. This
+        // makes module RESTART/reconnect robust — the supervisor may relaunch a
+        // module whose old socket is half-open or whose old process lingers, and
+        // the new process must be able to claim the name rather than be rejected
+        // into a restart loop. Exactly one connection is live either way (the
+        // evicted one's socket is closed now). A reconnect whose old sender is
+        // already CLOSED simply reuses the name and slot.
         let live_incumbent = {
             let senders = orchestrator.module_senders.lock().await;
             let owners = orchestrator.slot_owner.lock().await;
@@ -2694,41 +2693,26 @@ where
             }
         };
         if let Some(inc) = live_incumbent.filter(|inc| inc != &assigned_uuid) {
+            // Close the incumbent socket so only this connection stays live.
+            let kill = kill_map.lock().await.get(&inc).cloned();
+            if let Some(kill) = kill {
+                let _ = kill.send(true);
+            }
+            // Free the name so THIS connection takes the slot (the evicted
+            // socket's async cleanup sees a different owner and leaves it).
+            {
+                let mut senders = orchestrator.module_senders.lock().await;
+                let mut owners = orchestrator.slot_owner.lock().await;
+                senders.remove(&module_name);
+                owners.remove(&module_name);
+            }
             log_event_broadcast(
                 &ui_state,
                 format!(
-                    "Rejected duplicate connection for '{}' — [{}] is already live",
+                    "Replacing connection for '{}' — evicting [{}] so only one instance is live",
                     module_name, inc
                 ),
             );
-            log_to_timeline(
-                &db,
-                "module_reject",
-                &module_name,
-                "duplicate connection (name already live)",
-            )
-            .await;
-            let response = ContainerForModule {
-                version: 2,
-                auth_token: String::new(),
-                module_instance_uuid7: String::new(),
-                payload: Some(ModulePayload::ConnectionRequestReturn(
-                    cockatiel_protobuf::ConnectionRequestReturn {
-                        new_port: 0,
-                        module_instance_uuid7: String::new(),
-                    },
-                )),
-            };
-            let mut bytes = Vec::new();
-            response.encode(&mut bytes)?;
-            bounded_ws_send(
-                &mut websocket,
-                WsMessage::Binary(bytes),
-                bounds.send_timeout_secs,
-            )
-            .await?;
-            websocket.close(None).await?;
-            return Ok(());
         }
         route_name = module_name.clone();
         // The module is (re)connecting, so it is no longer suppressed: clear
