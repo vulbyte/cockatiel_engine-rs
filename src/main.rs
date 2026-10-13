@@ -2121,6 +2121,42 @@ cockatiel
                 .await;
         }
     }
+    // Tell every connected module the engine is going away, so each can decide
+    // to shut itself down gracefully instead of looping on a dead engine. The
+    // module is free to honour this (exit) or ignore it — the engine only makes
+    // the request (proto `Shutdown`). Best-effort; a closed sender is skipped.
+    {
+        let reason = "engine shutting down".to_string();
+        let senders: HashMap<String, tokio::sync::mpsc::Sender<ContainerForModule>> = {
+            let s = orchestrator.module_senders.lock().await;
+            s.clone()
+        };
+        let sessions = auth_store.values();
+        let mut notified = 0usize;
+        for session in sessions {
+            if let Some(tx) = senders.get(&session.module_name) {
+                let container = ContainerForModule {
+                    version: 2,
+                    auth_token: session.auth_token.clone(),
+                    module_instance_uuid7: session.instance_uuid7.clone(),
+                    payload: Some(ModulePayload::Shutdown(cockatiel_protobuf::Shutdown {
+                        reason: reason.clone(),
+                    })),
+                };
+                if tx.try_send(container).is_ok() {
+                    notified += 1;
+                }
+            }
+        }
+        if notified > 0 {
+            log_event_broadcast(
+                &ui_state,
+                format!("[engine] asked {notified} module(s) to shut down"),
+            );
+        }
+        // Brief grace period so modules can flush/exit before their sockets drop.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+    }
     // Written as an ordinary shutdown, not a crash: the TUI supervisor sees a
     // clean exit status, and its own restart policy (not this one) decides
     // whether the engine comes back.
