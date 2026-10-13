@@ -1832,6 +1832,41 @@ async fn userdb_virtual_query(
             let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
             client.remove_score(uuid7, 1, reason).await
         }
+        "userdb_rate_user" => {
+            // { uuid7, kind: "commend"|"reprimand", reason? } → a real rating
+            // recorded with the engine as the giver. Unlike the chat-command
+            // route this is the operator acting from the TUI, so the giver is
+            // the engine's own timestamped actor id (which intentionally
+            // bypasses the per-giver 24h reprimand cooldown).
+            let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
+            let kind = payload.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+            let is_commendation = match kind {
+                "commend" => true,
+                "reprimand" => false,
+                _ => {
+                    return (
+                        false,
+                        Vec::new(),
+                        format!(
+                            "userdb_rate_user requires kind 'commend' or 'reprimand', got '{}'",
+                            kind
+                        ),
+                    );
+                }
+            };
+            if uuid7.is_empty() {
+                return (
+                    false,
+                    Vec::new(),
+                    "userdb_rate_user requires uuid7".to_string(),
+                );
+            }
+            let giver = crate::actor_id::cockatiel_actor_id();
+            client
+                .rate_user(&giver, uuid7, is_commendation, "", "", reason)
+                .await
+        }
         "userdb_ban" => {
             // { uuid7, reason? } → set banned flag value
             let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
@@ -1892,6 +1927,17 @@ async fn userdb_virtual_query(
             (false, Vec::new(), e)
         }
     }
+}
+
+/// Whether `userdb_adjust_score` should scale a positive delta by the stream
+/// streak/activity multiplier. Absent or `true` keeps the original behaviour
+/// (the score-messages path); an explicit `false` skips it so an operator can
+/// apply a raw delta. A non-boolean value falls back to the default (on).
+fn use_score_multiplier(payload: &serde_json::Value) -> bool {
+    payload
+        .get("multiplier")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
 }
 
 /// Handle the `userdb_adjust_score` virtual query: apply a REAL arbitrary delta
@@ -1982,12 +2028,15 @@ async fn userdb_adjust_score_virtual_query(
     // Scale a POSITIVE delta by the user's stream streak x activity multiplier.
     // The user-db proto is external and cannot carry a multiplier, so it is
     // computed and applied here. Negative/zero deltas (penalties, no-ops) are
-    // left exactly as the caller sent them.
-    let (streak_count, combined) = stream_tracker
-        .lock()
-        .unwrap()
-        .multiplier(&uuid7, now_ms());
-    let delta = apply_multiplier(delta, combined);
+    // left exactly as the caller sent them — and an explicit
+    // `"multiplier": false` skips the scaling entirely so an operator can apply
+    // a raw delta.
+    let (delta, streak_count, combined) = if use_score_multiplier(&payload) {
+        let (streak_count, combined) = stream_tracker.lock().unwrap().multiplier(&uuid7, now_ms());
+        (apply_multiplier(delta, combined), streak_count, combined)
+    } else {
+        (delta, 0, 1.0)
+    };
 
     let outcome = client.adjust_score_only(&uuid7, delta, reason).await;
 
@@ -3092,6 +3141,14 @@ mod tests {
             ("userdb_get_user", NORMAL, false),
             ("userdb_ban", TUI, true),
             ("userdb_ban", NORMAL, false),
+            // ── userdb_rate_user: the TUI ONLY (the operator stamps the engine
+            // actor id). Same family gate as the rest of the userdb routes.
+            ("userdb_rate_user", TUI, true),
+            ("userdb_rate_user", TUI_CHILD, true),
+            ("userdb_rate_user", SCORE_MESSAGES, false),
+            ("userdb_rate_user", TEST_RUNNER, false),
+            ("userdb_rate_user", TERM_CHAT, false),
+            ("userdb_rate_user", NORMAL, false),
             // ── set_credentials: the TUI ONLY (a module must not be able to
             // rewrite another module's secrets).
             ("set_credentials", TUI, true),
@@ -3252,6 +3309,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn adjust_score_multiplier_defaults_on_and_opts_out_on_false() {
+        // Absent → the score-messages behaviour (multiplier applied).
+        assert!(use_score_multiplier(&serde_json::json!({})));
+        assert!(use_score_multiplier(&serde_json::json!({ "delta": 5 })));
+        assert!(use_score_multiplier(
+            &serde_json::json!({ "multiplier": true })
+        ));
+        // Explicit false → raw delta, no streak/activity scaling.
+        assert!(!use_score_multiplier(
+            &serde_json::json!({ "multiplier": false })
+        ));
+        // A non-boolean value falls back to the default (on).
+        assert!(use_score_multiplier(
+            &serde_json::json!({ "multiplier": "no" })
+        ));
+        assert!(use_score_multiplier(
+            &serde_json::json!({ "multiplier": 0 })
+        ));
+    }
+
     // ── 2. Branch coverage: no query_id was lost in the move ──────────────
 
     /// Every query_id the dispatcher recognised before the refactor, with the
@@ -3304,6 +3382,7 @@ mod tests {
         ("userdb_list_user_values", QueryRoute::UserdbFamily),
         ("userdb_commendation", QueryRoute::UserdbFamily),
         ("userdb_reprimand", QueryRoute::UserdbFamily),
+        ("userdb_rate_user", QueryRoute::UserdbFamily),
         ("userdb_ban", QueryRoute::UserdbFamily),
         ("userdb_timeout", QueryRoute::UserdbFamily),
         // Predictions read surface.

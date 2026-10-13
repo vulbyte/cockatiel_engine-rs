@@ -62,6 +62,7 @@ use queries::{QueryContext, SharedShutdown, ShutdownStage};
 mod rank_chart;
 mod stream_rewards;
 use stream_rewards::SharedStreamTracker;
+mod actor_id;
 mod user_db_client;
 use user_db_client::{SharedUserDbClient, UserDbClient};
 
