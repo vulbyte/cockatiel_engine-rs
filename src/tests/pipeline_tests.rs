@@ -32,6 +32,7 @@ pub(super) async fn test_db() -> DatabaseManager {
         remote_url: None,
         sync_interval_secs: 15,
         local_target_mb: 50,
+        log_min_severity: 0.3,
     });
     db.initialize().await.unwrap();
     // Setup counts its own round-trip; the tests below measure from zero.

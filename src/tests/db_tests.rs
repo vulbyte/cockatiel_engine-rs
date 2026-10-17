@@ -13,6 +13,7 @@ async fn test_db() -> DatabaseManager {
         remote_url: None,
         sync_interval_secs: 15,
         local_target_mb: 50,
+        log_min_severity: 0.3,
     });
     db.initialize().await.unwrap();
     // Setup counts its own round-trip; every test below measures from zero.
@@ -121,6 +122,7 @@ async fn sync_to_remote_writes_a_consistent_reusable_backup() {
         remote_url: Some(backup_path.to_string_lossy().into_owned()),
         sync_interval_secs: 15,
         local_target_mb: 50,
+        log_min_severity: 0.3,
     });
     db.initialize().await.unwrap();
 
@@ -148,6 +150,7 @@ async fn sync_to_remote_writes_a_consistent_reusable_backup() {
         remote_url: None,
         sync_interval_secs: 15,
         local_target_mb: 50,
+        log_min_severity: 0.3,
     });
     restored.initialize().await.unwrap();
     let json = restored
@@ -181,6 +184,7 @@ async fn sync_to_remote_creates_a_missing_backup_directory() {
         remote_url: Some(backup_path.to_string_lossy().into_owned()),
         sync_interval_secs: 15,
         local_target_mb: 50,
+        log_min_severity: 0.3,
     });
     db.initialize().await.unwrap();
     let uuid = b"backup-dir-uuid-00000001".to_vec();
@@ -744,6 +748,7 @@ async fn concurrent_reads_and_writes_do_not_panic_the_wal() {
         remote_url: None,
         sync_interval_secs: 15,
         local_target_mb: 50,
+        log_min_severity: 0.3,
     });
     db.initialize().await.unwrap();
 
@@ -795,6 +800,7 @@ async fn partial_reads_are_drained_and_do_not_wedge_the_wal() {
         remote_url: None,
         sync_interval_secs: 15,
         local_target_mb: 50,
+        log_min_severity: 0.3,
     });
     db.initialize().await.unwrap();
 
@@ -840,6 +846,7 @@ async fn a_panicking_operation_reopens_the_connection() {
         remote_url: None,
         sync_interval_secs: 15,
         local_target_mb: 50,
+        log_min_severity: 0.3,
     });
     db.initialize().await.unwrap();
 
@@ -885,6 +892,7 @@ async fn reopen_local_produces_a_working_connection() {
         remote_url: None,
         sync_interval_secs: 15,
         local_target_mb: 50,
+        log_min_severity: 0.3,
     });
     db.initialize().await.unwrap();
 
@@ -930,4 +938,104 @@ async fn stream_streaks_upsert_and_load_round_trip() {
             ("bob".to_string(), "stream-a".to_string(), 3),
         ]
     );
+}
+
+/// The noise predicate `cull_timeline_noise` deletes by, so the test and the
+/// method agree on what counts as low-value lifecycle noise.
+const NOISE: &str = "event_type = 5 AND command = 'module_lifecycle' AND (flags LIKE '%\"kind\":\"module_log\"%' OR flags LIKE '%\"kind\":\"module_connect\"%' OR flags LIKE '%\"kind\":\"module_disconnect\"%')";
+
+async fn count(db: &DatabaseManager, sql: &str) -> i64 {
+    let json = db.execute_query(sql).await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    v[0]["n"].as_i64().unwrap()
+}
+
+/// `cull_timeline_noise` keeps only the newest `keep` connect/disconnect/log
+/// rows and leaves chat and higher-severity lifecycle rows (module_error) alone.
+/// Also proves turso runs the cutoff DELETE and tolerates the best-effort
+/// `VACUUM`.
+#[tokio::test]
+async fn cull_timeline_noise_keeps_newest_and_spares_non_noise() {
+    let db = test_db().await;
+
+    for i in 0..5 {
+        let kind = match i % 3 {
+            0 => "module_log",
+            1 => "module_connect",
+            _ => "module_disconnect",
+        };
+        let flags = serde_json::json!({ "source": "engine", "kind": kind }).to_string();
+        db.insert_archival_event("engine", "module_lifecycle", &format!("noise {i}"), &flags)
+            .await
+            .unwrap();
+    }
+    // A chat row and a high-severity lifecycle row must both survive.
+    let chat = uuid::Uuid::now_v7().as_bytes().to_vec();
+    db.insert_event(&chat, 1, "twitch", &[], "hello", "", "{}")
+        .await
+        .unwrap();
+    let err_flags = serde_json::json!({ "source": "engine", "kind": "module_error" }).to_string();
+    db.insert_archival_event("engine", "module_lifecycle", "boom", &err_flags)
+        .await
+        .unwrap();
+
+    let deleted = db.cull_timeline_noise(2).await.unwrap();
+    assert_eq!(deleted, 3, "5 noise rows with keep=2 leaves 2, deletes 3");
+
+    assert_eq!(count(&db, &format!("SELECT COUNT(*) AS n FROM timeline_events WHERE {NOISE}")).await, 2);
+    assert_eq!(count(&db, "SELECT COUNT(*) AS n FROM timeline_events").await, 4);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) AS n FROM timeline_events WHERE flags LIKE '%\"kind\":\"module_error\"%'"
+        )
+        .await,
+        1
+    );
+    // The two survivors are the NEWEST noise rows (uuid7 DESC), i.e. 3 and 4.
+    let json = db
+        .execute_query(&format!(
+            "SELECT raw_message FROM timeline_events WHERE {NOISE} ORDER BY uuid7 DESC"
+        ))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let kept: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["raw_message"].as_str().unwrap())
+        .collect();
+    assert_eq!(kept, vec!["noise 4", "noise 3"]);
+}
+
+/// `keep == 0` deletes every noise row but still spares chat and higher-severity
+/// lifecycle rows.
+#[tokio::test]
+async fn cull_timeline_noise_with_zero_keep_drops_all_noise() {
+    let db = test_db().await;
+
+    for i in 0..4 {
+        let flags =
+            serde_json::json!({ "source": "engine", "kind": "module_connect" }).to_string();
+        db.insert_archival_event("engine", "module_lifecycle", &format!("noise {i}"), &flags)
+            .await
+            .unwrap();
+    }
+    let chat = uuid::Uuid::now_v7().as_bytes().to_vec();
+    db.insert_event(&chat, 1, "twitch", &[], "hello", "", "{}")
+        .await
+        .unwrap();
+    let err_flags = serde_json::json!({ "source": "engine", "kind": "module_error" }).to_string();
+    db.insert_archival_event("engine", "module_lifecycle", "boom", &err_flags)
+        .await
+        .unwrap();
+
+    let deleted = db.cull_timeline_noise(0).await.unwrap();
+    assert_eq!(deleted, 4);
+    assert_eq!(
+        count(&db, &format!("SELECT COUNT(*) AS n FROM timeline_events WHERE {NOISE}")).await,
+        0
+    );
+    assert_eq!(count(&db, "SELECT COUNT(*) AS n FROM timeline_events").await, 2);
 }

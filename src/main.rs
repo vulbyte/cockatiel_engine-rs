@@ -848,11 +848,29 @@ fn prompt_link_for(module_name: &str) -> String {
     }
 }
 
+/// 0.0–1.0 severity for a timeline log kind. Only events at or above the
+/// configured `log_min_severity` are persisted to the timeline; every event
+/// still reaches the TUI and the log file.
+fn log_severity(kind: &str) -> f32 {
+    match kind {
+        "module_connect" | "module_disconnect" => 0.1,
+        "module_log" => 0.2,
+        "module_reject" | "module_unresponsive" => 0.6,
+        "module_error" => 0.8,
+        _ => 0.5,
+    }
+}
+
 /// Persist an engine/module lifecycle or log event into the timeline database
 /// as an archival (already-complete) entry, so it is queryable without being
 /// touched by the message pipeline.
 async fn log_to_timeline(db: &DatabaseManager, kind: &str, source: &str, message: &str) {
-    let flags = serde_json::json!({ "source": source, "kind": kind }).to_string();
+    let severity = log_severity(kind);
+    if severity < db.log_min_severity() {
+        return; // below the persistence threshold; the TUI/log file already have it
+    }
+    let flags =
+        serde_json::json!({ "source": source, "kind": kind, "severity": severity }).to_string();
     // Module lifecycle events are NOT platform sends — label them distinctly so
     // the `command` column stays meaningful (send_to_platforms vs lifecycle).
     if let Err(e) = db
@@ -1271,8 +1289,9 @@ cockatiel
         remote_url: Some(config::effective_timeline_backup_location(
             &config.timeline_database_backup_location,
         )),
-        sync_interval_secs: 15,
+        sync_interval_secs: config.timeline_backup_interval_secs,
         local_target_mb: config.timeline_database_target_mb,
+        log_min_severity: config.log_min_severity,
     };
     let db = DatabaseManager::new(db_config);
     // A missing/unusable timeline DB no longer kills the engine. It starts
@@ -1726,7 +1745,9 @@ cockatiel
         let db = db.clone();
         let orchestrator = orchestrator.clone();
         let ui_state = ui_state.clone();
-        let sync_interval = std::time::Duration::from_secs(15);
+        let backup_interval_secs = config.timeline_backup_interval_secs;
+        let keep_noise_rows = config.timeline_keep_noise_rows;
+        let sync_interval = std::time::Duration::from_secs(backup_interval_secs as u64);
         const WAL_CHECKPOINT_MB: u64 = 5 * 1024 * 1024;
         // DB-size warning: fires once when the local file passes the 5 MB
         // floor and reaches 95% of the configured target; clears when it
@@ -1758,6 +1779,12 @@ cockatiel
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(sync_interval);
             let mut ticks_since_checkpoint = 0u32;
+            let mut backup_ok = false;
+            // Culling only trims ROWS; turso has no VACUUM, so the file cannot
+            // shrink and `over` stays true once crossed. Re-cull at most hourly
+            // rather than on every tick (each cull is a full noise scan + DELETE
+            // under the DB lock).
+            let mut last_cull: Option<std::time::Instant> = None;
             loop {
                 interval.tick().await;
                 // While the timeline DB is uninitialized (engine BLOCKED), every
@@ -1767,9 +1794,14 @@ cockatiel
                     continue;
                 }
                 match db.sync_to_remote().await {
-                    Ok(0) => {}
-                    Ok(n) => println!("[Sync] Synced {} events to backup", n),
-                    Err(e) => eprintln!("[Sync] Error: {}", e),
+                    Ok(0) => {} // no backup configured
+                    Ok(_) => {
+                        backup_ok = true;
+                    }
+                    Err(e) => {
+                        backup_ok = false;
+                        eprintln!("[Sync] Error: {}", e);
+                    }
                 }
                 // Checkpoint the WAL when it exceeds ~5 MB, and also roughly
                 // once a minute, so the log never grows unbounded.
@@ -1782,18 +1814,37 @@ cockatiel
                 let size = db.db_size_bytes();
                 let target = (db.target_mb() as u64) * 1024 * 1024;
                 let over = size > warn_floor && size >= (target * 95) / 100;
-                if over && !db_warned {
-                    db_warned = true;
-                    let pct = if target > 0 { (size * 100) / target } else { 0 };
-                    log_event_broadcast(
-                        &ui_state,
-                        format!(
-                            "WARNING: timeline DB is {:.1} MB ({pct}% of the {} MB target) — consider purging or raising timeline_database_target_mb",
-                            size as f64 / 1048576.0,
-                            db.target_mb()
-                        ),
-                    );
-                } else if !over && db_warned {
+                if over {
+                    let cull_due = last_cull.map_or(true, |t| {
+                        t.elapsed() >= std::time::Duration::from_secs(3600)
+                    });
+                    if db.backup_configured() && backup_ok && cull_due {
+                        match db.cull_timeline_noise(keep_noise_rows).await {
+                            Ok(n) => {
+                                last_cull = Some(std::time::Instant::now());
+                                if n > 0 {
+                                    db_warned = false;
+                                    log_event_broadcast(
+                                        &ui_state,
+                                        format!("timeline DB over target — culled {n} low-severity log rows (backup OK)"),
+                                    );
+                                }
+                            }
+                            Err(e) => eprintln!("[Timeline] cull failed: {}", e),
+                        }
+                    } else if !db_warned {
+                        db_warned = true;
+                        let pct = if target > 0 { (size * 100) / target } else { 0 };
+                        log_event_broadcast(
+                            &ui_state,
+                            format!(
+                                "WARNING: timeline DB is {:.1} MB ({pct}% of the {} MB target) and has no recent backup — not culling; consider purging or raising timeline_database_target_mb",
+                                size as f64 / 1048576.0,
+                                db.target_mb()
+                            ),
+                        );
+                    }
+                } else {
                     db_warned = false;
                 }
             }

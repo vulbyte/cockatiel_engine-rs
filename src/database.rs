@@ -53,6 +53,9 @@ pub struct DatabaseConfig {
     pub remote_url: Option<String>,
     pub sync_interval_secs: u32,
     pub local_target_mb: u32,
+    /// Minimum log severity (0.0–1.0) persisted to the timeline. Events below
+    /// this never reach the timeline DB (they still stream to the TUI/log file).
+    pub log_min_severity: f32,
 }
 
 /// Check the configured timeline DB path is usable WITHOUT opening the DB.
@@ -367,6 +370,11 @@ impl DatabaseManager {
     /// The configured target size (MB) for the local DB.
     pub fn target_mb(&self) -> u32 {
         self.config.local_target_mb
+    }
+
+    /// The configured minimum severity (0.0–1.0) persisted to the timeline.
+    pub fn log_min_severity(&self) -> f32 {
+        self.config.log_min_severity
     }
 
     /// Whether the local timeline connection has been opened yet. `false` while
@@ -1604,10 +1612,10 @@ impl DatabaseManager {
     }
 
     /// Write a consistent snapshot of the local DB to the configured backup path.
-    /// Merges the WAL into the main file, then copies it while the DB lock is
-    /// held (no concurrent writes) so the snapshot is authoritative and the
-    /// backup file stays portable/inspectable. Returns 1 on success, 0 when no
-    /// backup is configured.
+    /// Merges the WAL into the main file under the DB lock, then copies the file
+    /// WITHOUT holding the lock so the message pipeline stays responsive during
+    /// the (potentially slow) copy. Returns 1 on success, 0 when no backup is
+    /// configured.
     pub async fn sync_to_remote(&self) -> Result<u32, Box<dyn std::error::Error>> {
         self.contained(async {
             let Some(bp) = self.config.remote_url.as_deref() else {
@@ -1617,32 +1625,38 @@ impl DatabaseManager {
                 return Ok(0);
             }
 
-            let conn = self.locked().await;
-            let conn = conn.as_ref().ok_or("Local database not initialized")?;
-            // Merge the WAL so the copy is authoritative — but only when a -wal
-            // file actually exists for the local DB (checkpointing a missing WAL
-            // should not fail the backup). Best-effort either way: a failed
-            // checkpoint must never fail the backup.
-            // (PRAGMA returns a result row — drain it to `Done` so the read
-            // transaction is ended; an error mid-drain may leave the tx open, so
-            // force a reopen before the connection is used again.)
-            let wal_path = format!("{}-wal", self.config.local_path.to_string_lossy());
-            if std::path::Path::new(&wal_path).exists()
-                && let Ok(mut stmt) = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await
+            // Phase 1: merge the WAL into the main file under the lock, then let
+            // the guard drop so the copy below is lock-free. Only checkpoint when
+            // a -wal file actually exists for the local DB (checkpointing a
+            // missing WAL should not fail the backup). Best-effort either way: a
+            // failed checkpoint must never fail the backup. (PRAGMA returns a
+            // result row — drain it to `Done` so the read transaction is ended;
+            // an error mid-drain may leave the tx open, so force a reopen before
+            // the connection is used again.)
             {
-                loop {
-                    match stmt.next().await {
-                        Ok(Some(_)) => {}
-                        Ok(None) => break,
-                        Err(_) => {
-                            self.needs_reopen.store(true, Ordering::SeqCst);
-                            break;
+                let conn = self.locked().await;
+                let conn = conn.as_ref().ok_or("Local database not initialized")?;
+                let wal_path = format!("{}-wal", self.config.local_path.to_string_lossy());
+                if std::path::Path::new(&wal_path).exists()
+                    && let Ok(mut stmt) = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await
+                {
+                    loop {
+                        match stmt.next().await {
+                            Ok(Some(_)) => {}
+                            Ok(None) => break,
+                            Err(_) => {
+                                self.needs_reopen.store(true, Ordering::SeqCst);
+                                break;
+                            }
                         }
                     }
                 }
             }
 
-            // Copy while the lock is held → no concurrent writes → consistent.
+            // Phase 2: copy WITHOUT the lock. After the checkpoint above the main
+            // file is a stable snapshot — new writes land in the WAL and the next
+            // checkpoint merges them — so copying lock-free cannot tear the
+            // snapshot and keeps the message pipeline responsive during the copy.
             Self::ensure_backup_parent(bp);
             let tmp = format!("{}.tmp", bp);
             let _ = std::fs::remove_file(&tmp);
@@ -1654,16 +1668,112 @@ impl DatabaseManager {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
             }
-            // `conn` borrows the lock guard; this only ends the borrow. The
-            // guard itself is still held for the rename below, so the copy and
-            // the rename happen with no concurrent writes.
-            let _ = conn;
 
             // POSIX rename() atomically replaces an existing target — never delete
             // the last good backup before the new snapshot lands.
             std::fs::rename(&tmp, bp)
                 .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
             Ok(1)
+        })
+        .await
+    }
+
+    /// `COUNT(*)` of rows matching `noise`.
+    async fn count_noise(
+        conn: &turso::Connection,
+        noise: &str,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        let mut rows = conn
+            .query(
+                &format!("SELECT COUNT(*) FROM timeline_events WHERE {noise}"),
+                (),
+            )
+            .await?;
+        let count = match rows.next().await? {
+            Some(row) => match row.get_value(0)? {
+                turso::Value::Integer(n) => n as u64,
+                _ => 0,
+            },
+            None => 0,
+        };
+        // Drain to `Done` so the read transaction is not left open.
+        while rows.next().await?.is_some() {}
+        Ok(count)
+    }
+
+    /// Cull low-value lifecycle noise (module connect/disconnect/log rows) from
+    /// the timeline, keeping the newest `keep` of them. Intended to run after a
+    /// successful backup when the DB is over target, so the dropped rows are
+    /// still recoverable from the snapshot. Returns the number of rows deleted.
+    /// The `VACUUM` that follows is best-effort and never fails the method.
+    pub async fn cull_timeline_noise(&self, keep: u32) -> Result<u64, Box<dyn std::error::Error>> {
+        self.contained(async {
+            let conn = self.locked().await;
+            let conn = conn.as_ref().ok_or("Local database not initialized")?;
+            // `flags` is compact JSON written by serde_json, so the kind markers
+            // appear literally. This keeps chat (event_type=1), module_reject,
+            // module_error, send_to_platforms and test_archive rows.
+            let noise = "event_type = 5 AND command = 'module_lifecycle' AND (flags LIKE '%\"kind\":\"module_log\"%' OR flags LIKE '%\"kind\":\"module_connect\"%' OR flags LIKE '%\"kind\":\"module_disconnect\"%')";
+
+            // turso 0.1.5 cannot express this as `... NOT IN (SELECT ...)`: its
+            // translator hits a `todo!()` on a subquery IN. So find the cutoff
+            // uuid7 — the OLDEST row to KEEP — and delete the noise rows older
+            // than it. uuid7 is time-ordered, so `ORDER BY uuid7 DESC LIMIT 1
+            // OFFSET keep-1` is the keep-th newest; fewer than `keep` noise rows
+            // means nothing to cull. The cutoff is inlined as an `X'..'` literal
+            // (the bytes come straight from the DB, so they are safe), and the
+            // count is COUNT(*) before minus after: turso's `execute` return
+            // value (`n_change`) is unreliable for this DELETE.
+            let deleted = if keep == 0 {
+                let before = Self::count_noise(conn, noise).await?;
+                conn.execute(&format!("DELETE FROM timeline_events WHERE {noise}"), ())
+                    .await?;
+                before
+            } else {
+                // Scope the read so its turso transaction ends before the DELETE.
+                let cutoff: Option<Vec<u8>> = {
+                    // `keep` is a u32 we control; inline it — turso ignores a
+                    // bound parameter in OFFSET.
+                    let mut rows = conn
+                        .query(
+                            &format!("SELECT uuid7 FROM timeline_events WHERE {noise} ORDER BY uuid7 DESC LIMIT 1 OFFSET {}", keep - 1),
+                            (),
+                        )
+                        .await?;
+                    let cutoff = match rows.next().await? {
+                        Some(row) => match row.get_value(0)? {
+                            turso::Value::Blob(b) => Some(b),
+                            turso::Value::Text(t) => Some(t.into_bytes()),
+                            _ => None,
+                        },
+                        None => None,
+                    };
+                    // Drain to `Done` so the read transaction is not left open
+                    // before the DELETE runs on the same connection.
+                    while rows.next().await?.is_some() {}
+                    cutoff
+                };
+                match cutoff {
+                    Some(c) => {
+                        let hex: String = c.iter().map(|b| format!("{:02X}", b)).collect();
+                        let before = Self::count_noise(conn, noise).await?;
+                        conn.execute(
+                            &format!(
+                                "DELETE FROM timeline_events WHERE {noise} AND uuid7 < X'{hex}'"
+                            ),
+                            (),
+                        )
+                        .await?;
+                        let after = Self::count_noise(conn, noise).await?;
+                        before.saturating_sub(after)
+                    }
+                    None => 0,
+                }
+            };
+
+            // Best-effort compaction; turso may not support VACUUM, which is fine.
+            let _ = conn.execute("VACUUM", ()).await;
+            Ok(deleted)
         })
         .await
     }

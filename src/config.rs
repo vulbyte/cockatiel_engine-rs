@@ -92,6 +92,21 @@ pub struct Config {
     /// field is for the display / other surfaces.
     #[serde(default = "default_creator_role")]
     pub prediction_creator_role: String,
+
+    /// Seconds between timeline DB backups (full-file snapshot). Defaults to 300.
+    #[serde(default = "default_timeline_backup_interval_secs")]
+    pub timeline_backup_interval_secs: u32,
+
+    /// Minimum log severity (0.0–1.0) persisted to the timeline. Events below this
+    /// never reach the timeline DB (they still stream to the TUI and the log file).
+    /// Defaults to 0.3.
+    #[serde(default = "default_log_min_severity")]
+    pub log_min_severity: f32,
+
+    /// Keep at most this many low-severity lifecycle noise rows when the timeline
+    /// is culled over target. Defaults to 1000.
+    #[serde(default = "default_timeline_keep_noise_rows")]
+    pub timeline_keep_noise_rows: u32,
 }
 
 fn default_probe_interval_secs() -> u32 {
@@ -145,6 +160,18 @@ fn default_shutdown_on_request() -> bool {
 /// "mod". See [`prediction_creator_role`](Config::prediction_creator_role).
 fn default_creator_role() -> String {
     "mod".to_string()
+}
+
+fn default_timeline_backup_interval_secs() -> u32 {
+    300
+}
+
+fn default_log_min_severity() -> f32 {
+    0.3
+}
+
+fn default_timeline_keep_noise_rows() -> u32 {
+    1000
 }
 
 /// Should the engine boot with the message pipeline held?
@@ -489,7 +516,10 @@ const CONFIG_TEMPLATE: &str = r#"{
     "recovery_grace_secs": 10,
     "start_paused": true,
     "shutdown_on_request": false,
-    "prediction_creator_role": "mod"
+    "prediction_creator_role": "mod",
+    "timeline_backup_interval_secs": 300,
+    "log_min_severity": 0.3,
+    "timeline_keep_noise_rows": 1000
 }"#;
 
 pub fn create_config(directory: PathBuf) -> Result<String, String> {
