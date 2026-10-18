@@ -3521,6 +3521,38 @@ where
                                     }
                                 }
                             }
+                            Some(EnginePayload::TimerUpdate(ref update)) => {
+                                // Same relay contract as PredictionUpdate/PollUpdate:
+                                // the events module broadcasts a countdown timer to
+                                // every connected module so the events-window can render
+                                // it. Origin-gated identically — a random module
+                                // spoofing a timer would be indistinguishable.
+                                if module_name != "events" && !is_control_surface(&module_name) {
+                                    log_event_broadcast(
+                                        &ui_state,
+                                        format!("[TimerUpdate] ignored from '{}': only the events module or TUI may broadcast", module_name),
+                                    );
+                                } else {
+                                    let update = update.clone();
+                                    let forward = ContainerForModule {
+                                        version: 2,
+                                        auth_token: container.auth_token.clone(),
+                                        module_instance_uuid7: container.module_instance_uuid7.clone(),
+                                        payload: Some(ModulePayload::TimerUpdate(update)),
+                                    };
+                                    let senders: Vec<tokio::sync::mpsc::Sender<ContainerForModule>> = {
+                                        let senders = orchestrator.module_senders.lock().await;
+                                        senders
+                                            .iter()
+                                            .filter(|(n, _)| n.as_str() != module_name.as_str())
+                                            .map(|(_, s)| s.clone())
+                                            .collect()
+                                    };
+                                    for sender in senders {
+                                        let _ = sender.try_send(forward.clone());
+                                    }
+                                }
+                            }
                             Some(EnginePayload::ChannelStats(ref stats)) => {
                                 // Adapters push their channel's current viewer/member
                                 // count on each poll; the engine stores it so other
