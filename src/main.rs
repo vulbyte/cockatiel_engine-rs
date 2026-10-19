@@ -1844,9 +1844,12 @@ cockatiel
                         t.elapsed() >= std::time::Duration::from_secs(3600)
                     });
                     if db.backup_configured() && backup_ok && cull_due {
+                        // Stamp BEFORE the attempt so a cull that FAILS (e.g. a
+                        // corrupt index) still waits the full interval instead of
+                        // retrying every backup tick and spamming the log.
+                        last_cull = Some(std::time::Instant::now());
                         match db.cull_timeline_noise(keep_noise_rows).await {
                             Ok(n) => {
-                                last_cull = Some(std::time::Instant::now());
                                 if n > 0 {
                                     db_warned = false;
                                     log_event_broadcast(
