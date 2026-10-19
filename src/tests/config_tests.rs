@@ -28,6 +28,24 @@ fn temp_state(
     (state, path)
 }
 
+/// The log-broadcast headroom is a quarter of the channel, clamped so it can
+/// never consume the whole buffer: logs must stay reachable even at the smallest
+/// configured capacity, or a small `module_outbound_channel_capacity` would
+/// silently disable log delivery entirely.
+#[test]
+fn log_reserve_leaves_headroom_but_never_locks_out_logs() {
+    assert_eq!(crate::log_reserve_for(256), 64);
+    assert_eq!(crate::log_reserve_for(8), 2);
+    assert_eq!(crate::log_reserve_for(4), 1);
+    assert_eq!(crate::log_reserve_for(1), 0);
+    assert_eq!(crate::log_reserve_for(0), 0);
+    // Always strictly less than the effective capacity (>= 1), so at least one
+    // slot is ever reachable for a log.
+    for cap in 0..512usize {
+        assert!(crate::log_reserve_for(cap) < cap.max(1), "cap={cap}");
+    }
+}
+
 #[test]
 fn backfill_writes_missing_keys_and_preserves_existing() {
     let dir = std::env::temp_dir().join(format!("cockatiel-backfill-{}", uuid::Uuid::new_v4()));

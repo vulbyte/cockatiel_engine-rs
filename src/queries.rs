@@ -23,8 +23,11 @@ use prost::Message;
 use std::{
     collections::HashMap,
     env,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -594,15 +597,48 @@ pub(crate) async fn send_query_response(
     match tokio::time::timeout(Duration::from_millis(1000), ctx.tx.send(response)).await {
         Ok(_) => true,
         Err(_) => {
-            log_event_broadcast(
-                ctx.ui_state,
-                format!(
-                    "[{}] dropped query response (outbound full)",
-                    ctx.module_name
-                ),
-            );
+            report_dropped_query_response(ctx);
             false
         }
+    }
+}
+
+/// Count of query responses dropped because a module's outbound channel was full,
+/// accumulated since the last report. Reported at most once per
+/// [`DROP_REPORT_INTERVAL`] so a burst cannot flood the log with one line per
+/// drop (a single saturated window used to emit tens of thousands of identical
+/// lines).
+static DROPPED_QUERY_RESPONSES: AtomicU64 = AtomicU64::new(0);
+static LAST_DROP_REPORT: Mutex<Option<Instant>> = Mutex::new(None);
+const DROP_REPORT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Log a dropped query response — but at most one aggregated line per
+/// [`DROP_REPORT_INTERVAL`]. The per-drop detail is otherwise identical and
+/// useless at volume, and the drop itself is already best-effort by design.
+fn report_dropped_query_response(ctx: &QueryContext<'_>) {
+    DROPPED_QUERY_RESPONSES.fetch_add(1, Ordering::Relaxed);
+    let due = {
+        let mut last = LAST_DROP_REPORT.lock().unwrap();
+        let due = match *last {
+            Some(t) => t.elapsed() >= DROP_REPORT_INTERVAL,
+            None => true,
+        };
+        if due {
+            *last = Some(Instant::now());
+        }
+        due
+    };
+    if due {
+        let total = DROPPED_QUERY_RESPONSES.swap(0, Ordering::Relaxed);
+        log_event_broadcast(
+            ctx.ui_state,
+            format!(
+                "dropped {total} query response(s) since the last report \
+                 (outbound channel full; latest: {}; {} slots free)",
+                ctx.module_name,
+                ctx.tx.capacity()
+            ),
+        );
     }
 }
 

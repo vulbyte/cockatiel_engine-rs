@@ -107,6 +107,13 @@ pub struct Config {
     /// is culled over target. Defaults to 1000.
     #[serde(default = "default_timeline_keep_noise_rows")]
     pub timeline_keep_noise_rows: u32,
+
+    /// Capacity of each module connection's outbound message channel. Query
+    /// responses and routed messages queue here while the socket write catches
+    /// up; a larger buffer rides out bursts (e.g. the TUI's periodic stats poll)
+    /// instead of dropping query responses. Defaults to 256.
+    #[serde(default = "default_module_outbound_channel_capacity")]
+    pub module_outbound_channel_capacity: usize,
 }
 
 fn default_probe_interval_secs() -> u32 {
@@ -172,6 +179,10 @@ fn default_log_min_severity() -> f32 {
 
 fn default_timeline_keep_noise_rows() -> u32 {
     1000
+}
+
+fn default_module_outbound_channel_capacity() -> usize {
+    256
 }
 
 /// Should the engine boot with the message pipeline held?

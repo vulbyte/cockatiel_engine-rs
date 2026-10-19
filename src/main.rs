@@ -232,6 +232,16 @@ struct EngineBounds {
     max_connections: usize,
     handshake_timeout_secs: u32,
     send_timeout_secs: u32,
+    module_outbound_channel_capacity: usize,
+}
+
+/// Slots held back from log broadcasts on each module channel, so a log storm
+/// cannot consume the whole buffer and starve query responses (which share the
+/// channel). A quarter of the capacity — but never the whole channel, so at
+/// least one slot stays reachable for logs when the configured capacity is tiny.
+fn log_reserve_for(capacity: usize) -> usize {
+    let capacity = capacity.max(1);
+    (capacity / 4).min(capacity.saturating_sub(1))
 }
 
 pub fn log_event(state: &Arc<Mutex<EngineState>>, text: impl Into<String>) {
@@ -1480,6 +1490,18 @@ cockatiel
     }
     {
         let module_senders = Arc::clone(&module_senders);
+        // Every module's outbound channel is shared by logs AND non-log traffic
+        // (query responses, routed control frames). Logs are best-effort and the
+        // traffic to sacrifice: without a reserve a log storm fills the whole
+        // channel and query responses — sharing it — time out and are dropped.
+        // Hold back a quarter of the channel for that non-log traffic, while
+        // always leaving at least one slot so a tiny configured capacity cannot
+        // lock logs out entirely.
+        let outbound_capacity = config.module_outbound_channel_capacity.max(1);
+        let log_reserve = log_reserve_for(outbound_capacity);
+        println!(
+            "[Cockatiel] module outbound channel capacity: {outbound_capacity} (log reserve {log_reserve})"
+        );
         tokio::spawn(async move {
             while let Some(line) = log_rx.recv().await {
                 let container = ContainerForModule {
@@ -1496,9 +1518,12 @@ cockatiel
                     senders.values().cloned().collect()
                 };
                 for sender in senders {
-                    // Best-effort: a full module queue must never wedge the
-                    // log broadcast (which would then back up unboundedly).
-                    let _ = sender.try_send(container.clone());
+                    // Best-effort AND headroom-limited: a full module queue must
+                    // never wedge the log broadcast, and a log storm must not
+                    // consume the slots reserved for query responses.
+                    if sender.capacity() > log_reserve {
+                        let _ = sender.try_send(container.clone());
+                    }
                 }
             }
         });
@@ -2012,6 +2037,7 @@ cockatiel
         max_connections: config.max_connections,
         handshake_timeout_secs: config.handshake_timeout_secs,
         send_timeout_secs: config.send_timeout_secs,
+        module_outbound_channel_capacity: config.module_outbound_channel_capacity.max(1),
     };
     // Connection ceiling: each spawned connection holds one permit for its
     // whole lifetime; when the ceiling is reached, new connections are dropped
@@ -2287,7 +2313,8 @@ where
         }),
     )
     .await?;
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<ContainerForModule>(64);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<ContainerForModule>(bounds.module_outbound_channel_capacity);
 
     // Loopback status is computed from the pre-TLS peer address (passed in) —
     // a TlsStream doesn't expose peer_addr directly.
