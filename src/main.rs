@@ -505,13 +505,14 @@ async fn connected_module_names(
 }
 
 /// Whether a `SendToPlatforms` may be routed. An ordinary send needs a verified
-/// moderator/admin/owner actor (so a module cannot speak as the bot without an
-/// operator behind it). A **proxied** send (the Discord RP "possess" feature) is
-/// authorized by the SENDING MODULE instead — the module verifies that the human
-/// owns the character it is posting as — so the mod-only actor gate does not
-/// apply to it. Pure, so the policy is testable.
-fn send_to_platforms_allowed(actor_ok: bool, is_proxy: bool) -> bool {
-    is_proxy || actor_ok
+/// moderator/admin/owner actor (`actor_ok`). A **proxied** send (the Discord RP
+/// "possess" feature) is authorized by the SENDING MODULE instead — the module
+/// verifies that the human owns the character it is posting as — so the mod-only
+/// gate does not apply to it. A module may also send on behalf of a user its own
+/// `authority` gate admits (`module_ok`), which is how a public module (gate
+/// authority 0) may reply to an ordinary user. Pure, so the policy is testable.
+fn send_to_platforms_allowed(actor_ok: bool, is_proxy: bool, module_ok: bool) -> bool {
+    is_proxy || actor_ok || module_ok
 }
 
 /// Parse a raw chat message for registered commands and act:
@@ -3318,26 +3319,45 @@ where
                                 } else {
                                     user_db_client.get_user("", &send.actor_platform, &send.actor_handle, &send.actor_handle).await
                                 };
-                                let actor_ok = match actor_lookup {
+                                let (actor_ok, actor_tier) = match actor_lookup {
                                     Ok(resp) => match resp.user {
-                                        Some(user) => user.is_moderator || user.is_admin || user.is_owner,
-                                        None => false,
+                                        Some(user) => {
+                                            let tier = if user.is_owner {
+                                                3
+                                            } else if user.is_admin {
+                                                2
+                                            } else if user.is_moderator {
+                                                1
+                                            } else {
+                                                0
+                                            };
+                                            (tier >= 1, tier)
+                                        }
+                                        None => (false, 0),
                                     },
                                     Err(e) => {
                                         log_event_broadcast(&ui_state, format!("[SendToPlatforms] actor lookup failed: {}", e));
-                                        false
+                                        (false, 0)
                                     }
                                 };
-                                // A proxied send (Discord RP "possess") is authorized
-                                // by the SENDING MODULE — which verifies the human
-                                // owns the character it posts as — so the mod-only
-                                // actor gate does not apply to it. Ordinary sends
-                                // still require a verified moderator/admin/owner.
-                                if !send_to_platforms_allowed(actor_ok, send.proxy.is_some()) {
+                                // Allowed when ANY holds: a proxied send (Discord
+                                // RP — the SENDING MODULE vouches for the human);
+                                // a verified mod/admin/owner actor; or a send on
+                                // behalf of a user the SENDING MODULE's own
+                                // authority gate admits (the operator opts a module
+                                // into replying by opening its gate).
+                                let module_ok = orchestrator
+                                    .module_gates
+                                    .lock()
+                                    .unwrap()
+                                    .get(container.module_name.as_str())
+                                    .is_some_and(|g| g.authority == 0 || actor_tier >= g.authority);
+                                if !send_to_platforms_allowed(actor_ok, send.proxy.is_some(), module_ok)
+                                {
                                     let actor_where = if send.actor_platform.is_empty() { String::new() } else { format!(" on {}", send.actor_platform) };
                                     log_event(
                                         &ui_state,
-                                        format!("[SendToPlatforms] denied: actor '{}{}' is not a verified moderator/admin/owner", send.actor_handle, actor_where),
+                                        format!("[SendToPlatforms] denied: actor '{}{}' is not authorized", send.actor_handle, actor_where),
                                     );
                                     continue;
                                 }

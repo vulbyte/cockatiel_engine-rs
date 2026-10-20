@@ -1555,13 +1555,15 @@ async fn a_plain_message_is_not_flagged_as_a_donation() {
 /// mod/admin/owner actor, but a proxied send (the Discord RP "possess" feature)
 /// is authorized by the sending module, so the mod-only gate is lifted for it.
 #[test]
-fn proxied_sends_bypass_the_mod_actor_gate() {
+fn send_to_platforms_authorization_policy() {
     use crate::send_to_platforms_allowed as allowed;
-    assert!(!allowed(false, false), "a plain send from a non-mod is denied");
-    assert!(allowed(true, false), "a mod's plain send is allowed");
-    assert!(
-        allowed(false, true),
-        "a proxied send is allowed regardless of the actor's role"
-    );
-    assert!(allowed(true, true));
+    // Plain send, non-mod actor, module gate closed → denied.
+    assert!(!allowed(false, false, false));
+    // A verified moderator/admin/owner actor may send.
+    assert!(allowed(true, false, false));
+    // A proxied send (Discord RP) is authorized by the sending module.
+    assert!(allowed(false, true, false));
+    // A module whose own authority gate admits the actor may send (e.g. a
+    // public module replying to an ordinary user).
+    assert!(allowed(false, false, true));
 }
