@@ -375,8 +375,9 @@ enum CommandAction {
     /// Send the built-in help list back to the chat. `Some(arg)` = the module
     /// name after `!help`, for the per-module detail view.
     Help(Option<String>),
-    /// Send the apology reply (unregistered command under an alerting flag).
-    Alert,
+    /// Send the invalid-command reply (unregistered command under an alerting
+    /// flag): the typed `flag`+`name` for a helpful "did you mean …?" message.
+    Alert { flag: String, name: String },
     /// Nothing (not a flagged command, or a known command already attached).
     None,
 }
@@ -406,9 +407,42 @@ fn classify_command(raw: &str, registry: &CommandRegistry) -> CommandAction {
         return CommandAction::Attach(parsed.command);
     }
     if registry.alert_owner_for(&flag).is_some() {
-        return CommandAction::Alert;
+        return CommandAction::Alert { flag, name };
     }
     CommandAction::None
+}
+
+/// The registered command (under `flag`) closest to the typed `name`, if any is
+/// close enough to be worth suggesting — a small edit distance, or a shared
+/// prefix (so `!rolll` → `!roll`). `None` when nothing is close.
+fn closest_command(reg: &CommandRegistry, flag: &str, name: &str) -> Option<String> {
+    let want = name.to_ascii_lowercase();
+    let mut best: Option<(usize, String)> = None;
+    for n in reg.names(flag) {
+        let d = edit_distance(&want, &n.to_ascii_lowercase());
+        if best.as_ref().map(|(bd, _)| d < *bd).unwrap_or(true) {
+            best = Some((d, n));
+        }
+    }
+    best.and_then(|(d, n)| {
+        let ln = n.to_ascii_lowercase();
+        (d <= 2 || ln.starts_with(&want) || want.starts_with(&ln)).then_some(n)
+    })
+}
+
+/// Levenshtein edit distance (small inputs — command names).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur.push((prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
 }
 
 /// What the ingest-side command handling did to a message. The caller uses
@@ -558,7 +592,7 @@ pub async fn handle_command_on_ingest(
             let channel_id = chat.channel_id.clone();
             engine_reply_to_platform(orchestrator, ui_state, &platform, &channel_id, &reply).await;
         }
-        CommandAction::Alert => {
+        CommandAction::Alert { flag, name } => {
             let who = if chat
                 .user_data
                 .as_ref()
@@ -573,10 +607,18 @@ pub async fn handle_command_on_ingest(
             };
             let platform = chat.platform.clone();
             let channel_id = chat.channel_id.clone();
-            let reply = format!(
-                "sorry {}, that command isn't valid, try '!help' to see all available commands",
-                who
-            );
+            let closest = {
+                let reg = registry.lock().unwrap();
+                closest_command(&reg, &flag, &name)
+            };
+            let reply = match closest {
+                Some(c) => format!(
+                    "{who}, `{flag}{name}` isn't a command — did you mean `{flag}{c}`? (see `!help`)"
+                ),
+                None => format!(
+                    "{who}, `{flag}{name}` isn't a command — try `!help` to see all available commands"
+                ),
+            };
             engine_reply_to_platform(orchestrator, ui_state, &platform, &channel_id, &reply).await;
         }
         CommandAction::None => {}

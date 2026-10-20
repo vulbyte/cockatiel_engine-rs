@@ -37,13 +37,15 @@ pub(crate) fn command_recipients(
     stage_modules: &[String],
 ) -> Option<Vec<String>> {
     let Some(cmd) = parsed_command else {
-        // No command: every stage module that is NOT command-scoped. Catch-alls
-        // and never-registered modules (scorers, censors, displays) receive it;
-        // command-scoped modules are skipped so their price gate is not charged.
+        // No command: every stage module that is NOT command-scoped, PLUS any
+        // command-scoped module that opted to keep seeing chat
+        // (`alert_on_unknown_command` — e.g. a module that owns a command but
+        // also parses its own subcommands and reacts to plain messages). A pure
+        // command owner is skipped so its price gate is not charged.
         return Some(
             stage_modules
                 .iter()
-                .filter(|m| !registry.is_command_scoped(m))
+                .filter(|m| !registry.is_command_scoped(m) || registry.wants_plain_messages(m))
                 .cloned()
                 .collect(),
         );
@@ -1604,7 +1606,11 @@ impl PipelineOrchestrator {
                 .and_then(|c| registry.owner(&c.command_flag, &c.command_name));
             cfg.post_process_modules
                 .iter()
-                .filter(|m| !registry.is_command_scoped(m) || owner.as_deref() == Some(m.as_str()))
+                .filter(|m| {
+                    !registry.is_command_scoped(m)
+                        || owner.as_deref() == Some(m.as_str())
+                        || registry.wants_plain_messages(m)
+                })
                 .cloned()
                 .collect()
         };

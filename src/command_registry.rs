@@ -59,6 +59,15 @@ impl CommandRegistry {
         self.index.keys().any(|(f, _)| f == flag)
     }
 
+    /// The command names registered under `flag` (for a "did you mean" hint).
+    pub fn names(&self, flag: &str) -> Vec<String> {
+        self.index
+            .keys()
+            .filter(|(f, _)| f == flag)
+            .map(|(_, n)| n.clone())
+            .collect()
+    }
+
     /// The registered Flag definitions for a (flag, command), if any.
     pub fn command_flags(&self, flag: &str, name: &str) -> Vec<Flag> {
         self.index
@@ -112,6 +121,17 @@ impl CommandRegistry {
         self.modules
             .get(module)
             .map(|r| !r.commands.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Whether a command-scoped module should STILL receive plain (non-command)
+    /// messages. A module that opted into `alert_on_unknown_command` is a
+    /// catch-all-style handler for its flag (it wants to see chat), so it is not
+    /// excluded from the plain-message fanout the way a pure command owner is.
+    pub fn wants_plain_messages(&self, module: &str) -> bool {
+        self.modules
+            .get(module)
+            .map(|r| r.alert_on_unknown)
             .unwrap_or(false)
     }
 

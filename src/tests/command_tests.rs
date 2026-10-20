@@ -78,10 +78,13 @@ fn known_command_attaches() {
 #[test]
 fn unknown_on_alerting_flag_alerts() {
     let r = reg_with_commands();
-    assert!(matches!(
-        classify_command("!bogus whatever", &r),
-        CommandAction::Alert
-    ));
+    match classify_command("!bogus whatever", &r) {
+        CommandAction::Alert { flag, name } => {
+            assert_eq!(flag, "!");
+            assert_eq!(name, "bogus");
+        }
+        other => panic!("expected Alert, got {other:?}"),
+    }
 }
 
 #[test]
@@ -91,6 +94,32 @@ fn plain_message_is_none() {
         classify_command("just chatting", &r),
         CommandAction::None
     ));
+}
+
+#[test]
+fn alerting_module_wants_plain_messages_pure_owner_does_not() {
+    let r = reg_with_commands();
+    // A module that opted into alerts also keeps seeing plain chat.
+    assert!(r.wants_plain_messages("tts-service"));
+    assert!(r.is_command_scoped("tts-service"));
+    // A pure command owner does not.
+    assert!(!r.wants_plain_messages("reprimand"));
+}
+
+#[test]
+fn closest_command_suggests_near_misses_only() {
+    let r = reg_with_commands();
+    assert_eq!(crate::closest_command(&r, "!", "reprimandd").as_deref(), Some("reprimand"));
+    assert_eq!(crate::closest_command(&r, "!", "ts").as_deref(), Some("tts"));
+    // nothing close → no suggestion
+    assert_eq!(crate::closest_command(&r, "!", "bogusxyz"), None);
+}
+
+#[test]
+fn edit_distance_basic() {
+    assert_eq!(crate::edit_distance("roll", "roll"), 0);
+    assert_eq!(crate::edit_distance("rolll", "roll"), 1);
+    assert_eq!(crate::edit_distance("", "abc"), 3);
 }
 
 /// A4 — parser fuzzing: adversarial inputs never panic.
