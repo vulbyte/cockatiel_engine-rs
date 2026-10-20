@@ -605,6 +605,8 @@ pub async fn engine_reply_to_platform(
         actor_handle: "cockatiel".to_string(),
         actor_uuid7: String::new(),
         channel_id: channel_id.to_string(),
+        // Engine-originated sends are never proxied and delete nothing.
+        ..Default::default()
     };
     let container = ContainerForModule {
         version: 2,
