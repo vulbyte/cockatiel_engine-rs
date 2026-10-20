@@ -504,6 +504,16 @@ async fn connected_module_names(
         .collect()
 }
 
+/// Whether a `SendToPlatforms` may be routed. An ordinary send needs a verified
+/// moderator/admin/owner actor (so a module cannot speak as the bot without an
+/// operator behind it). A **proxied** send (the Discord RP "possess" feature) is
+/// authorized by the SENDING MODULE instead — the module verifies that the human
+/// owns the character it is posting as — so the mod-only actor gate does not
+/// apply to it. Pure, so the policy is testable.
+fn send_to_platforms_allowed(actor_ok: bool, is_proxy: bool) -> bool {
+    is_proxy || actor_ok
+}
+
 /// Parse a raw chat message for registered commands and act:
 /// - a known command is attached to `chat.command` (the pipeline routes it);
 /// - `!help` lists every registered command back to the chat;
@@ -3318,7 +3328,12 @@ where
                                         false
                                     }
                                 };
-                                if !actor_ok {
+                                // A proxied send (Discord RP "possess") is authorized
+                                // by the SENDING MODULE — which verifies the human
+                                // owns the character it posts as — so the mod-only
+                                // actor gate does not apply to it. Ordinary sends
+                                // still require a verified moderator/admin/owner.
+                                if !send_to_platforms_allowed(actor_ok, send.proxy.is_some()) {
                                     let actor_where = if send.actor_platform.is_empty() { String::new() } else { format!(" on {}", send.actor_platform) };
                                     log_event(
                                         &ui_state,
