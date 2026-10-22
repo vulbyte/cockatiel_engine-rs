@@ -70,7 +70,7 @@ use user_db_client::{SharedUserDbClient, UserDbClient};
 pub use cockatiel_proto::proto as cockatiel_protobuf;
 
 use cockatiel_protobuf::{
-    ContainerForEngine, ContainerForModule, Log, ProcessPosition, Prompt, PromptType,
+    ContainerForEngine, ContainerForModule, Log, ProcessPosition, Prompt, PromptType, StatusNotice,
     TimelineQueryResult, container_for_engine::Payload as EnginePayload,
     container_for_module::Payload as ModulePayload,
 };
@@ -101,6 +101,12 @@ pub(crate) struct ChannelStatsEntry {
 /// push their latest `ChannelStats` on each poll; other modules read them on
 /// demand via the `channel_viewers` virtual query.
 pub(crate) type SharedChannelStats = Arc<Mutex<HashMap<String, ChannelStatsEntry>>>;
+
+/// The engine's in-memory store of the latest non-blocking status notice per
+/// `source` (e.g. the YouTube adapter's quota banner). Modules publish a
+/// `StatusNotice`; the engine keys it by `source` (last write wins, an empty
+/// `text` clears it) and relays it to every other connected module.
+pub(crate) type SharedStatusNotices = Arc<Mutex<HashMap<String, StatusNotice>>>;
 
 /// The platform adapters allowed to publish channel stats. A random module
 /// spoofing viewer counts would poison every consumer, so the relay gate keys
@@ -2066,6 +2072,10 @@ cockatiel
     // by other modules via the `channel_viewers` virtual query.
     let channel_stats: SharedChannelStats = Arc::new(Mutex::new(HashMap::new()));
 
+    // Latest non-blocking status notice per source, published by modules (e.g.
+    // the YouTube adapter's quota banner) and relayed to every module.
+    let status_notices: SharedStatusNotices = Arc::new(Mutex::new(HashMap::new()));
+
     // Latest stream leaderboard, pushed by the `stream-leaderboard` module and
     // read by the TUI via the `stream_leaderboard` virtual query.
     let leaderboard: queries::SharedLeaderboard = Arc::new(Mutex::new(None));
@@ -2158,6 +2168,7 @@ cockatiel
         let user_db_client = Arc::clone(&user_db_client);
         let prompt_routes = Arc::clone(&prompt_routes);
         let channel_stats = Arc::clone(&channel_stats);
+        let status_notices = Arc::clone(&status_notices);
         let leaderboard = Arc::clone(&leaderboard);
         let stream_schedule = Arc::clone(&stream_schedule);
         let kill_map = Arc::clone(&kill_map);
@@ -2196,6 +2207,7 @@ cockatiel
                         user_db_client,
                         prompt_routes,
                         channel_stats,
+                        status_notices,
                         leaderboard,
                         stream_schedule,
                         kill_map,
@@ -2352,6 +2364,7 @@ async fn handle_connection<S>(
     user_db_client: SharedUserDbClient,
     prompt_routes: SharedPromptRoutes,
     channel_stats: SharedChannelStats,
+    status_notices: SharedStatusNotices,
     leaderboard: queries::SharedLeaderboard,
     stream_schedule: queries::SharedStreamSchedule,
     kill_map: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
@@ -3660,6 +3673,40 @@ where
                                     for sender in senders {
                                         let _ = sender.try_send(forward.clone());
                                     }
+                                }
+                            }
+                            Some(EnginePayload::StatusNotice(ref notice)) => {
+                                // A module surfaces a non-blocking status for the
+                                // UI (e.g. the YouTube adapter's quota banner).
+                                // Store it keyed by source (an empty text clears
+                                // the entry) and relay it to every OTHER
+                                // connected module, mirroring the PollUpdate
+                                // relay's origin filter + try_send.
+                                let notice = notice.clone();
+                                {
+                                    let mut map = status_notices.lock().unwrap();
+                                    if notice.text.is_empty() {
+                                        map.remove(&notice.source);
+                                    } else {
+                                        map.insert(notice.source.clone(), notice.clone());
+                                    }
+                                }
+                                let forward = ContainerForModule {
+                                    version: 2,
+                                    auth_token: container.auth_token.clone(),
+                                    module_instance_uuid7: container.module_instance_uuid7.clone(),
+                                    payload: Some(ModulePayload::StatusNotice(notice)),
+                                };
+                                let senders: Vec<tokio::sync::mpsc::Sender<ContainerForModule>> = {
+                                    let senders = orchestrator.module_senders.lock().await;
+                                    senders
+                                        .iter()
+                                        .filter(|(n, _)| n.as_str() != module_name.as_str())
+                                        .map(|(_, s)| s.clone())
+                                        .collect()
+                                };
+                                for sender in senders {
+                                    let _ = sender.try_send(forward.clone());
                                 }
                             }
                             Some(EnginePayload::ChannelStats(ref stats)) => {
