@@ -888,6 +888,10 @@ async fn dispatch(
             crate::config::refresh_config(config_state);
             let config = get_config(config_state);
             let sessions = auth_store.values();
+            // Aggregate module-loading state for the TUI's status bar — see
+            // [`module_load_counts`] for the dedupe / liveness rules.
+            let (modules_configured, modules_live, modules_ready) =
+                module_load_counts(&config, &sessions);
             // Rolling per-module processing averages (ms), for the TUI's ms
             // column. Snapshot once so every entry reads the same numbers.
             let module_timings = orchestrator.module_timings.lock().await.all_avgs();
@@ -1028,6 +1032,16 @@ async fn dispatch(
             );
             if !removed.is_empty() {
                 entries.retain(|name, _| !removed.contains(name));
+            }
+
+            // `module_list` is (and stays) a JSON array for every existing
+            // consumer, so the aggregate is carried on each entry rather than
+            // wrapped in a new top-level object. The values are identical on
+            // every row; the TUI reads them from the first.
+            for entry in entries.values_mut() {
+                entry["modules_configured"] = serde_json::json!(modules_configured);
+                entry["modules_live"] = serde_json::json!(modules_live);
+                entry["modules_ready"] = serde_json::json!(modules_ready);
             }
 
             // Refresh the in-memory gates from the LIVE manifests so a
@@ -3009,6 +3023,38 @@ fn module_position_from_config(config: &Config, name: &str) -> Option<String> {
     }
 }
 
+/// Aggregate module-load state for `module_list`: (configured, live, ready).
+///
+/// Configured is the union of the four config ordering lists, deduplicated by
+/// name. Live counts only configured modules with an authenticated session
+/// that has not shut down and has not been declared unresponsive. Ready is
+/// true when every configured module is live (and trivially when none are
+/// configured).
+fn module_load_counts(
+    config: &Config,
+    sessions: &[crate::auth::AuthSession],
+) -> (usize, usize, bool) {
+    let configured_names: std::collections::HashSet<&str> = config
+        .inputs
+        .iter()
+        .chain(config.preprocess_modules.iter())
+        .chain(config.inprocess_modules.iter())
+        .chain(config.postprocess_modules.iter())
+        .map(|m| m.name.as_str())
+        .collect();
+    let live_names: std::collections::HashSet<&str> = sessions
+        .iter()
+        .filter(|s| s.authenticated && s.shutdown_at.is_none() && !s.unresponsive)
+        .map(|s| s.module_name.as_str())
+        .collect();
+    let configured = configured_names.len();
+    let live = configured_names
+        .iter()
+        .filter(|name| live_names.contains(*name))
+        .count();
+    (configured, live, live >= configured)
+}
+
 /// Build a ContainerForModule payload of the requested probe type. `payload_json`
 /// carries optional fields (e.g. a log line, a SQL string). Unknown types
 /// yield None (the probe is skipped).
@@ -4237,6 +4283,77 @@ fn module_position_from_config_uses_the_ordering_lists() {
         Some("postprocess")
     );
     assert_eq!(module_position_from_config(&config, "not-listed"), None);
+}
+
+#[test]
+fn module_load_counts_dedupes_the_config_and_counts_only_live_configured_sessions() {
+    // The same module can sit in two ordering lists across a stage move, so
+    // the configured count must dedupe by name. Liveness follows the per-row
+    // rules: authenticated, not shut down, not unresponsive.
+    let config: Config = serde_json::from_str(
+        r#"{
+        "timeline_database_location": "./t.db",
+        "timeline_database_backup_location": "./b.db",
+        "port": 9734,
+        "inputs": [{"name":"twitch","priority":100}],
+        "preprocessModules": [{"name":"clip","priority":100},{"name":"twitch","priority":100}],
+        "inprocessModules": [{"name":"ban","priority":100}],
+        "postprocessModules": []
+    }"#,
+    )
+    .unwrap();
+
+    let session = |name: &str, authenticated: bool, shutdown: bool, unresponsive: bool| {
+        crate::auth::AuthSession {
+            module_name: name.to_string(),
+            instance_uuid7: format!("uuid-{name}"),
+            auth_token: String::new(),
+            position: "preprocess".to_string(),
+            priority: 100,
+            authenticated,
+            connected_at: Some(1),
+            shutdown_at: if shutdown { Some(2) } else { None },
+            last_activity_ms: 1,
+            last_probe_at_ms: 0,
+            probe_deadline_ms: 0,
+            unresponsive,
+            peer_loopback: true,
+            socket_token: 1,
+        }
+    };
+
+    let sessions = vec![
+        session("twitch", true, false, false),
+        session("clip", true, false, false),
+        // Not in any ordering list — must NOT inflate the live count.
+        session("not-configured", true, false, false),
+        // Configured, but shut down.
+        session("ban", true, true, false),
+    ];
+    assert_eq!(
+        module_load_counts(&config, &sessions),
+        (3, 2, false),
+        "twitch+clip+ban configured; only twitch+clip are live"
+    );
+
+    // An unresponsive module is not live either.
+    let sessions = vec![session("twitch", true, false, true)];
+    assert_eq!(module_load_counts(&config, &sessions), (3, 0, false));
+
+    // An unauthenticated session does not count.
+    let sessions = vec![session("twitch", false, false, false)];
+    assert_eq!(module_load_counts(&config, &sessions), (3, 0, false));
+
+    // Nothing configured → ready by definition.
+    let empty: Config = serde_json::from_str(
+        r#"{
+        "timeline_database_location": "./t.db",
+        "timeline_database_backup_location": "./b.db",
+        "port": 9734
+    }"#,
+    )
+    .unwrap();
+    assert_eq!(module_load_counts(&empty, &[]), (0, 0, true));
 }
 
 #[test]
