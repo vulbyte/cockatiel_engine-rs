@@ -38,6 +38,18 @@ const CREATE_STATUS_INDEX: &str = "
 CREATE INDEX IF NOT EXISTS idx_timeline_status ON timeline_events(pipeline_status)
 ";
 
+const CREATE_PERSISTED_INDEX: &str = "
+CREATE INDEX IF NOT EXISTS idx_timeline_persisted ON timeline_events(persisted_at)
+";
+
+const CREATE_PLATFORM_STATUS_INDEX: &str = "
+CREATE INDEX IF NOT EXISTS idx_timeline_platform_status ON timeline_events(platform, pipeline_status)
+";
+
+const CREATE_STATUS_USER_COMMAND_INDEX: &str = "
+CREATE INDEX IF NOT EXISTS idx_timeline_status_user_command ON timeline_events(pipeline_status, user_uuid7, command)
+";
+
 /// Persisted per-user stream streaks. The engine owns this schema (it is not
 /// part of any external proto): one row per user, updated when a stream closes.
 const CREATE_STREAM_STREAKS: &str = "
@@ -455,6 +467,9 @@ impl DatabaseManager {
         conn.execute(CREATE_TIMELINE_EVENTS, ()).await?;
         conn.execute(CREATE_SYNCED_INDEX, ()).await?;
         conn.execute(CREATE_STATUS_INDEX, ()).await?;
+        conn.execute(CREATE_PERSISTED_INDEX, ()).await?;
+        conn.execute(CREATE_PLATFORM_STATUS_INDEX, ()).await?;
+        conn.execute(CREATE_STATUS_USER_COMMAND_INDEX, ()).await?;
         conn.execute(CREATE_STREAM_STREAKS, ()).await?;
         Ok(conn)
     }
