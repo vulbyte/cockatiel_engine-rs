@@ -9,7 +9,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -991,8 +991,17 @@ async fn broadcast_prompt_and_wait(
         payload: Some(ModulePayload::Prompt(prompt)),
     };
     for sender in senders {
-        // Best-effort broadcast: a full module queue must never wedge a prompt.
-        let _ = sender.try_send(container.clone());
+        // A prompt must be surfaced reliably, so give a briefly-full queue a
+        // moment to drain rather than dropping the prompt at the first instant
+        // of back-pressure. Still bounded: one wedged module must never wedge
+        // the broadcast for every other UI.
+        if sender.try_send(container.clone()).is_err() {
+            let _ = tokio::time::timeout(
+                Duration::from_millis(500),
+                sender.send(container.clone()),
+            )
+            .await;
+        }
     }
 
     log_event(ui_state, log_label.to_string());
@@ -2347,6 +2356,27 @@ where
     }
 }
 
+/// The same bounded send, for a `Sink` half rather than a whole
+/// `WebSocketStream`. The connection loop splits its socket so a dedicated
+/// writer task owns the sink and keeps draining the outbound channel while the
+/// read loop is busy — a handler blocked on a slow timeline query must never be
+/// able to stall the drain.
+async fn bounded_sink_send<Si>(
+    sink: &mut Si,
+    msg: WsMessage,
+    timeout_secs: u32,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    Si: futures_util::Sink<WsMessage> + Unpin,
+    Si::Error: std::error::Error + Send + Sync + 'static,
+{
+    match tokio::time::timeout(Duration::from_secs(timeout_secs as u64), sink.send(msg)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(Box::new(e)),
+        Err(_) => Err("outbound WebSocket send timed out".into()),
+    }
+}
+
 async fn handle_connection<S>(
     stream: S,
     peer_loopback: bool,
@@ -2372,7 +2402,7 @@ async fn handle_connection<S>(
     shutdown: SharedShutdown,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let socket_token = NEXT_SOCKET_TOKEN.fetch_add(1, Ordering::Relaxed);
     let mut websocket = accept_async_with_config(
@@ -2989,15 +3019,48 @@ where
         .await
         .insert(instance_uuid7.clone(), kill_tx);
 
+    // Split the socket so a dedicated writer task owns the sink and keeps
+    // draining the outbound channel while the read loop is busy. A connection
+    // handler that blocks for seconds on a slow timeline query (the timeline DB
+    // is a single connection behind one mutex) otherwise cannot reach its own
+    // outbound drain; the channel then fills and query responses and prompts to
+    // the UI are dropped. Decoupling the write half — the same shape the TUI's
+    // own ws_client uses — makes drops caused by a stalled reader impossible.
+    let (mut ws_sink, mut ws_reader) = websocket.split();
     // Set once this connection has queued the answer to an accepted
-    // `engine_shutdown` request. The answer is, by construction, the next
-    // container this socket writes, so the outbound arm can hand the exit back
-    // to the main loop at exactly the moment the TUI has the response in hand.
-    let mut shutdown_flush = false;
+    // `engine_shutdown` request. The writer checks it after each frame lands.
+    let shutdown_flush = Arc::new(AtomicBool::new(false));
+    let writer_flush = Arc::clone(&shutdown_flush);
+    let writer_shutdown = shutdown.clone();
+    let writer_timeout = bounds.send_timeout_secs;
+    let (writer_done_tx, mut writer_done_rx) = tokio::sync::oneshot::channel::<()>();
+    let writer = tokio::spawn(async move {
+        // Dropped when this task exits, resolving `writer_done_rx` so the read
+        // loop learns the socket is gone even if it is parked on a read.
+        let _keep = writer_done_tx;
+        while let Some(outbound) = rx.recv().await {
+            let mut bytes = Vec::new();
+            if outbound.encode(&mut bytes).is_err() {
+                continue;
+            }
+            if bounded_sink_send(&mut ws_sink, WsMessage::Binary(bytes), writer_timeout)
+                .await
+                .is_err()
+            {
+                break;
+            }
+            // The frame landed. If this was the answer to an accepted shutdown
+            // request, the caller now has it — release the process exit.
+            if writer_flush.swap(false, Ordering::SeqCst) {
+                writer_shutdown.mark_answered();
+            }
+        }
+        let _ = ws_sink.close().await;
+    });
 
     loop {
         tokio::select! {
-                    incoming = websocket.next() => {
+                    incoming = ws_reader.next() => {
                         let Some(incoming) = incoming else {
                             break;
                         };
@@ -3040,8 +3103,10 @@ where
                                     container.module_name, container.module_instance_uuid7
                                 ),
                             );
-                            websocket.close(None).await?;
-                            return Ok(());
+                            // Break (not an early return): the disconnect cleanup
+                            // below aborts the writer task and unregisters this
+                            // socket's slot.
+                            break;
                         }
 
                         // Any valid container proves the module is alive (this also
@@ -3209,11 +3274,17 @@ where
                                             module_instance_uuid7: container.module_instance_uuid7.clone(),
                                             payload: Some(ModulePayload::TimelineQueryResult(result)),
                                         };
-                                        let mut buf = Vec::new();
-                                        if reply.encode(&mut buf).is_ok() {
-                                            if let Err(e) = bounded_ws_send(&mut websocket, WsMessage::Binary(buf), bounds.send_timeout_secs).await {
-                                                log_event_broadcast(&ui_state, format!("TimelineQuery reply send failed: {}", e));
-                                            }
+                                        // Queue on the outbound channel (drained
+                                        // by the writer task) rather than writing
+                                        // the socket from the read loop.
+                                        if tokio::time::timeout(
+                                            Duration::from_millis(1000),
+                                            tx.send(reply),
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            log_event_broadcast(&ui_state, "TimelineQuery reply send failed (outbound full)".to_string());
                                         }
                                     }
                                     Err(e) => {
@@ -3301,12 +3372,10 @@ where
                                 .await;
                                 // Armed only now — AFTER the answer is on the channel.
                                 // The channel is FIFO and the answer was queued before
-                                // this point, so the very next frame this socket writes
-                                // IS the answer, whatever the log-broadcast task has
-                                // enqueued around it. The outbound arm below completes
-                                // the handoff once that write lands; the main loop is
-                                // holding the exit until it does.
-                                shutdown_flush = answered_with_shutdown && queued;
+                                // this point, so the writer task marks the exit
+                                // answered as soon as it writes the frame that carries
+                                // the answer; the main loop holds the exit until then.
+                                shutdown_flush.store(answered_with_shutdown && queued, Ordering::SeqCst);
                                 if answered_with_shutdown && !queued {
                                     // The answer could not even be queued (the outbound
                                     // channel is wedged — `send_query_response` has
@@ -3359,11 +3428,14 @@ where
                                         },
                                     )),
                                 };
-                                let mut buf = Vec::new();
-                                if reply.encode(&mut buf).is_ok() {
-                                    if let Err(e) = bounded_ws_send(&mut websocket, WsMessage::Binary(buf), bounds.send_timeout_secs).await {
-                                        log_event_broadcast(&ui_state, format!("QueryResponse send failed: {}", e));
-                                    }
+                                // Queue on the outbound channel (drained by the
+                                // writer task) rather than writing the socket
+                                // from the read loop.
+                                if tokio::time::timeout(Duration::from_millis(1000), tx.send(reply))
+                                    .await
+                                    .is_err()
+                                {
+                                    log_event_broadcast(&ui_state, "QueryResponse send failed (outbound full)".to_string());
                                 }
                             }
                             Some(EnginePayload::SendToPlatforms(send)) => {
@@ -3824,30 +3896,15 @@ where
                         }
                     }
 
-                    outbound = rx.recv() => {
-                        let Some(outbound) = outbound else {
-                            break;
-                        };
-
-                        let mut bytes = Vec::new();
-                        outbound.encode(&mut bytes)?;
-
-                        if bounded_ws_send(&mut websocket, WsMessage::Binary(bytes), bounds.send_timeout_secs).await.is_err() {
-                            log_event_broadcast(&ui_state, format!(
-                                "Connection to '{}' dropped: outbound send failed/timed out ({}s)",
-                                module_name, bounds.send_timeout_secs
-                            ));
-                            break;
-                        }
-
-                        // The write landed. If this frame was the answer to an accepted
-                        // shutdown request, the caller now knows — release the process
-                        // exit. (FIFO ordering guarantees this is that answer: it was
-                        // queued before the flush was armed.)
-                        if shutdown_flush {
-                            shutdown_flush = false;
-                            shutdown.mark_answered();
-                        }
+                    // The writer task owns the socket sink and drains the
+                    // outbound channel. When it exits (a send failed/timed out,
+                    // or the sink closed) the read loop must end too.
+                    _ = &mut writer_done_rx => {
+                        log_event_broadcast(&ui_state, format!(
+                            "Connection to '{}' dropped: outbound send failed/timed out ({}s)",
+                            module_name, bounds.send_timeout_secs
+                        ));
+                        break;
                     }
                     killed = kill_rx.changed() => {
                         // The probe task flagged this session as unresponsive —
@@ -3863,13 +3920,18 @@ where
                 }
     }
 
+    // Stop the writer task: the read loop is over, so nothing will drain the
+    // outbound channel any more.
+    writer.abort();
+    let _ = writer.await;
+
     // Unregister the kill switch.
     kill_map.lock().await.remove(&instance_uuid7);
 
     // The socket is gone with a shutdown answer still unflushed (send failure,
     // peer hang-up, …). No answer can ever reach that caller now, so the main
     // loop must not keep waiting for one: release the exit here instead.
-    if shutdown_flush {
+    if shutdown_flush.swap(false, Ordering::SeqCst) {
         shutdown.mark_answered();
     }
 

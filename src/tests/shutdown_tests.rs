@@ -19,7 +19,7 @@ fn the_flush_is_armed_only_after_the_answer_is_queued() {
         .find("let queued = queries::send_query_response(")
         .expect("the query arm queues the answer");
     let armed = src
-        .find("shutdown_flush = answered_with_shutdown && queued;")
+        .find("shutdown_flush.store(answered_with_shutdown && queued, Ordering::SeqCst);")
         .expect("the query arm arms the flush");
     assert!(
         queued < armed,
@@ -27,26 +27,26 @@ fn the_flush_is_armed_only_after_the_answer_is_queued() {
     );
 }
 
-/// …and the confirmation happens after the write completes, in the outbound
-/// arm — scoped to that arm so a confirmation anywhere else cannot satisfy it.
+/// …and the confirmation happens after the write completes, in the writer task
+/// — scoped to that task so a confirmation anywhere else cannot satisfy it.
 #[test]
 fn the_answer_is_confirmed_only_after_the_frame_is_written() {
     let src = include_str!("../main.rs");
-    let arm_start = src
-        .find("outbound = rx.recv() => {")
-        .expect("the outbound arm of the connection loop");
-    let arm_end = src[arm_start..]
-        .find("killed = kill_rx.changed() => {")
-        .expect("the end of the outbound arm")
-        + arm_start;
-    let arm = &src[arm_start..arm_end];
+    let writer_start = src
+        .find("let writer = tokio::spawn(async move {")
+        .expect("the decoupled writer task");
+    let writer_end = src[writer_start..]
+        .find("loop {")
+        .expect("the end of the writer task")
+        + writer_start;
+    let writer = &src[writer_start..writer_end];
 
-    let write = arm
-        .find("bounded_ws_send(")
-        .expect("the outbound arm writes the frame");
-    let handoff = arm
-        .find("shutdown.mark_answered()")
-        .expect("the outbound arm hands the exit back once the frame is out");
+    let write = writer
+        .find("bounded_sink_send(")
+        .expect("the writer writes the frame");
+    let handoff = writer
+        .find("writer_shutdown.mark_answered()")
+        .expect("the writer hands the exit back once the frame is out");
     assert!(
         write < handoff,
         "the caller must have the answer before the process may exit"
@@ -100,15 +100,15 @@ fn an_answer_that_could_not_be_delivered_still_releases_the_exit() {
         src.contains("if answered_with_shutdown && !queued {"),
         "a dropped answer must be handled explicitly"
     );
-    // Two escapes from the wait: the drop above, and a socket that died with the
-    // answer still unflushed. Both end in `mark_answered`.
-    assert_eq!(
-        src.matches("if shutdown_flush {").count(),
-        2,
-        "the flush must be completed after a successful write AND on connection end"
+    // Two escapes from the wait: the writer task confirming a successful write,
+    // and a socket that died with the answer still unflushed. Both end in
+    // `mark_answered`.
+    assert!(
+        src.contains("if writer_flush.swap(false, Ordering::SeqCst) {"),
+        "the writer must confirm the flush after a successful write"
     );
     assert!(
-        src.contains("if shutdown_flush {\n        shutdown.mark_answered();\n    }"),
+        src.contains("if shutdown_flush.swap(false, Ordering::SeqCst) {\n        shutdown.mark_answered();\n    }"),
         "a connection that ends with an unflushed answer must release the exit"
     );
 }
