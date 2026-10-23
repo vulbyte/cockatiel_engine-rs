@@ -889,9 +889,13 @@ async fn dispatch(
             let config = get_config(config_state);
             let sessions = auth_store.values();
             // Aggregate module-loading state for the TUI's status bar — see
-            // [`module_load_counts`] for the dedupe / liveness rules.
-            let (modules_configured, modules_live, modules_ready) =
-                module_load_counts(&config, &sessions);
+            // [`module_load_counts`] for the expected / liveness rules. Snapshot
+            // the discovered registry once; the count re-reads each manifest's
+            // live `autostart` flag.
+            let (modules_configured, modules_live, modules_ready) = {
+                let discovered = discovered_registry.lock().unwrap();
+                module_load_counts(&discovered, &sessions)
+            };
             // Rolling per-module processing averages (ms), for the TUI's ms
             // column. Snapshot once so every entry reads the same numbers.
             let module_timings = orchestrator.module_timings.lock().await.all_avgs();
@@ -3025,30 +3029,37 @@ fn module_position_from_config(config: &Config, name: &str) -> Option<String> {
 
 /// Aggregate module-load state for `module_list`: (configured, live, ready).
 ///
-/// Configured is the union of the four config ordering lists, deduplicated by
-/// name. Live counts only configured modules with an authenticated session
-/// that has not shut down and has not been declared unresponsive. Ready is
-/// true when every configured module is live (and trivially when none are
-/// configured).
+/// Configured is the set of modules EXPECTED to run: every discovered module
+/// whose manifest says `autostart: true`, PLUS any module that is live right
+/// now (a manually-started module must count too, or the bar would stall below
+/// its target). The config ordering lists are deliberately NOT the source: the
+/// engine auto-places every discovered module — including dev/test entries and
+/// the host — into them, so they over-count and "ready" would never be
+/// reachable. The host control surface (`cockatiel-tui` / `-child`) never
+/// counts.
+///
+/// Live counts the expected modules with an authenticated session that has not
+/// shut down and has not been declared unresponsive. Ready is true when every
+/// expected module is live (and trivially when none are expected).
 fn module_load_counts(
-    config: &Config,
+    discovered: &crate::module_manager::ModuleRegistry,
     sessions: &[crate::auth::AuthSession],
 ) -> (usize, usize, bool) {
-    let configured_names: std::collections::HashSet<&str> = config
-        .inputs
-        .iter()
-        .chain(config.preprocess_modules.iter())
-        .chain(config.inprocess_modules.iter())
-        .chain(config.postprocess_modules.iter())
-        .map(|m| m.name.as_str())
-        .collect();
     let live_names: std::collections::HashSet<&str> = sessions
         .iter()
         .filter(|s| s.authenticated && s.shutdown_at.is_none() && !s.unresponsive)
         .map(|s| s.module_name.as_str())
+        .filter(|name| !is_control_surface(name))
         .collect();
-    let configured = configured_names.len();
-    let live = configured_names
+    let mut expected: std::collections::HashSet<&str> = discovered
+        .iter()
+        .filter(|(_, m)| current_autostart(m))
+        .map(|(name, _)| name.as_str())
+        .filter(|name| !is_control_surface(name))
+        .collect();
+    expected.extend(live_names.iter().copied());
+    let configured = expected.len();
+    let live = expected
         .iter()
         .filter(|name| live_names.contains(*name))
         .count();
@@ -4286,22 +4297,31 @@ fn module_position_from_config_uses_the_ordering_lists() {
 }
 
 #[test]
-fn module_load_counts_dedupes_the_config_and_counts_only_live_configured_sessions() {
-    // The same module can sit in two ordering lists across a stage move, so
-    // the configured count must dedupe by name. Liveness follows the per-row
-    // rules: authenticated, not shut down, not unresponsive.
-    let config: Config = serde_json::from_str(
-        r#"{
-        "timeline_database_location": "./t.db",
-        "timeline_database_backup_location": "./b.db",
-        "port": 9734,
-        "inputs": [{"name":"twitch","priority":100}],
-        "preprocessModules": [{"name":"clip","priority":100},{"name":"twitch","priority":100}],
-        "inprocessModules": [{"name":"ban","priority":100}],
-        "postprocessModules": []
-    }"#,
-    )
-    .unwrap();
+fn module_load_counts_expects_autostart_plus_live_and_excludes_the_host() {
+    // Expected = discovered autostart-true modules ∪ live modules. The config
+    // ordering lists are NOT consulted (the engine auto-places everything,
+    // including dev/test entries and the host, so they over-count). Liveness
+    // follows the per-row rules: authenticated, not shut down, not
+    // unresponsive. The host control surface never counts.
+    let dir = std::env::temp_dir().join(format!("ckt-load-{}", uuid::Uuid::new_v4()));
+    let write_manifest = |name: &str, autostart: bool| {
+        let mdir = dir.join(name);
+        std::fs::create_dir_all(&mdir).unwrap();
+        std::fs::write(
+            mdir.join("cockatiel_module_info.json"),
+            format!(r#"{{"name":"{}","autostart":{}}}"#, name, autostart),
+        )
+        .unwrap();
+    };
+    write_manifest("twitch", true);
+    write_manifest("clip", true);
+    write_manifest("ban", true);
+    write_manifest("manual", false);
+    // A host-named manifest is still excluded from the expected set.
+    write_manifest("cockatiel-tui", true);
+
+    let mut registry = crate::module_manager::ModuleRegistry::new();
+    registry.discover(std::slice::from_ref(&dir)).unwrap();
 
     let session = |name: &str, authenticated: bool, shutdown: bool, unresponsive: bool| {
         crate::auth::AuthSession {
@@ -4325,35 +4345,33 @@ fn module_load_counts_dedupes_the_config_and_counts_only_live_configured_session
     let sessions = vec![
         session("twitch", true, false, false),
         session("clip", true, false, false),
-        // Not in any ordering list — must NOT inflate the live count.
-        session("not-configured", true, false, false),
-        // Configured, but shut down.
+        // A manually-started, non-autostart module — counts because it is live.
+        session("manual", true, false, false),
+        // Autostart but not live.
         session("ban", true, true, false),
+        // The host is live but must not count.
+        session("cockatiel-tui", true, false, false),
     ];
     assert_eq!(
-        module_load_counts(&config, &sessions),
-        (3, 2, false),
-        "twitch+clip+ban configured; only twitch+clip are live"
+        module_load_counts(&registry, &sessions),
+        (4, 3, false),
+        "twitch+clip+ban(autostart)+manual(live) expected; twitch+clip+manual live"
     );
 
-    // An unresponsive module is not live either.
+    // An unresponsive module is not live either, so `manual` (only expected
+    // while live) drops out of the denominator too.
     let sessions = vec![session("twitch", true, false, true)];
-    assert_eq!(module_load_counts(&config, &sessions), (3, 0, false));
+    assert_eq!(module_load_counts(&registry, &sessions), (3, 0, false));
 
     // An unauthenticated session does not count.
     let sessions = vec![session("twitch", false, false, false)];
-    assert_eq!(module_load_counts(&config, &sessions), (3, 0, false));
+    assert_eq!(module_load_counts(&registry, &sessions), (3, 0, false));
 
-    // Nothing configured → ready by definition.
-    let empty: Config = serde_json::from_str(
-        r#"{
-        "timeline_database_location": "./t.db",
-        "timeline_database_backup_location": "./b.db",
-        "port": 9734
-    }"#,
-    )
-    .unwrap();
+    // Nothing discovered and nothing live → ready by definition.
+    let empty = crate::module_manager::ModuleRegistry::new();
     assert_eq!(module_load_counts(&empty, &[]), (0, 0, true));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
