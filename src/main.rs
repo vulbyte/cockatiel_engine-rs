@@ -932,6 +932,17 @@ fn log_severity(kind: &str) -> f32 {
     }
 }
 
+/// Whether a error message names database-file corruption (as opposed to a
+/// transient/query error). A corrupt timeline btree aborts full scans, which
+/// pins the noise-cull; turso cannot repair it, so the operator must run the
+/// offline repair. Detecting it lets the log say so instead of echoing a raw
+/// `IdxDelete` forever.
+fn is_corruption_error(message: &str) -> bool {
+    message.contains("Corrupt database")
+        || message.contains("IdxDelete")
+        || message.contains("malformed")
+}
+
 /// Persist an engine/module lifecycle or log event into the timeline database
 /// as an archival (already-complete) entry, so it is queryable without being
 /// touched by the message pipeline.
@@ -1928,7 +1939,18 @@ cockatiel
                                     );
                                 }
                             }
-                            Err(e) => eprintln!("[Timeline] cull failed: {}", e),
+                            Err(e) => {
+                                let msg = e.to_string();
+                                if is_corruption_error(&msg) {
+                                    eprintln!(
+                                        "[Timeline] cull failed: the timeline database is CORRUPT ({msg}). \
+                                         turso cannot repair it — run `scripts/repair-timeline-db.sh` with the \
+                                         engine stopped, then restart."
+                                    );
+                                } else {
+                                    eprintln!("[Timeline] cull failed: {msg}");
+                                }
+                            }
                         }
                     } else if !db_warned {
                         db_warned = true;
