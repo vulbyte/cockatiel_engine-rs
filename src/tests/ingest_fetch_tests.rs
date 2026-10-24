@@ -99,6 +99,9 @@ async fn test_db() -> DatabaseManager {
         sync_interval_secs: 15,
         local_target_mb: 50,
         log_min_severity: 0.3,
+        integrity_check_on_open: false,
+        integrity_check_on_backup: false,
+        integrity_check_min_mb: 0,
     });
     db.initialize().await.unwrap();
     db

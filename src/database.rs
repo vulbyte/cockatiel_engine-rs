@@ -1,7 +1,7 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use turso::Value;
 use uuid::Uuid;
@@ -68,6 +68,223 @@ pub struct DatabaseConfig {
     /// Minimum log severity (0.0–1.0) persisted to the timeline. Events below
     /// this never reach the timeline DB (they still stream to the TUI/log file).
     pub log_min_severity: f32,
+    /// Run a full integrity check on the local DB at startup (before opening it)
+    /// and recover when it is corrupt. Defaults to true.
+    pub integrity_check_on_open: bool,
+    /// Verify a snapshot before promoting it over the last-known-good backup.
+    /// Defaults to true.
+    pub integrity_check_on_backup: bool,
+    /// Minimum local DB size (MB) before the startup integrity check runs.
+    /// Defaults to 5 (the DB-size warning floor); 0 always checks.
+    pub integrity_check_min_mb: u32,
+}
+
+/// How long a single integrity check may take before it is abandoned. A
+/// 1.8 GB timeline DB takes ~2 s on a laptop; the ceiling only exists so a
+/// wedged `sqlite3`/turso call cannot block startup or the backup loop forever.
+const INTEGRITY_CHECK_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The verdict of an integrity check on a database file.
+///
+/// `Skipped` is deliberately distinct from `Corrupt`: "could not verify" must
+/// never be treated as "verified corrupt" (that would rename a healthy DB), and
+/// must never be treated as "clean" for a backup promotion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IntegrityVerdict {
+    Clean,
+    Corrupt(String),
+    Skipped(String),
+}
+
+/// Run one `sqlite3` invocation. Returns the raw output so the caller can
+/// distinguish "sqlite3 not installed" (NotFound) from "check failed".
+async fn run_sqlite3(
+    path: &Path,
+    readonly: bool,
+    sql: &str,
+) -> Result<std::process::Output, std::io::Error> {
+    let mut cmd = tokio::process::Command::new("sqlite3");
+    // Never leave an orphaned checker behind if the timeout drops the future.
+    cmd.kill_on_drop(true);
+    cmd.arg("-batch");
+    if readonly {
+        cmd.arg("-readonly");
+    }
+    cmd.arg(path).arg(sql);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.output().await
+}
+
+/// Turn a `sqlite3` run into a verdict. Only a successful `ok` is clean; a
+/// non-`ok` row (the corruption report) is corrupt. A command that never got to
+/// run the pragma (bad option, permission error) is `Skipped`, not corrupt.
+fn classify_sqlite_output(output: &std::process::Output) -> IntegrityVerdict {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() {
+        return if stdout == "ok" {
+            IntegrityVerdict::Clean
+        } else if stdout.is_empty() {
+            IntegrityVerdict::Skipped("sqlite3 quick_check returned no output".to_string())
+        } else {
+            IntegrityVerdict::Corrupt(stdout)
+        };
+    }
+    if !stdout.is_empty() {
+        let detail = [stdout, stderr]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return IntegrityVerdict::Corrupt(detail);
+    }
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("malformed")
+        || lower.contains("corrupt")
+        || lower.contains("not a database")
+        || lower.contains("file is encrypted")
+    {
+        return IntegrityVerdict::Corrupt(stderr);
+    }
+    IntegrityVerdict::Skipped(if stderr.is_empty() {
+        "sqlite3 quick_check failed".to_string()
+    } else {
+        stderr
+    })
+}
+
+/// The reliable integrity oracle: the `sqlite3` CLI's `PRAGMA quick_check`.
+///
+/// turso 0.1.5 cannot do this in-process: `PRAGMA quick_check` is not a valid
+/// pragma name there, and its `PRAGMA integrity_check` only walks the b-tree in
+/// a way that can miss torn writes (verified against the real corrupt DB — it
+/// returned `ok`). `sqlite3` is the same oracle the offline repair script uses,
+/// and it detects the known `2nd reference to page` corruption.
+///
+/// Returns `None` when `sqlite3` is not installed, so the caller can fall back
+/// to the weaker in-process turso check.
+async fn sqlite3_quick_check(path: &Path) -> Option<IntegrityVerdict> {
+    let output = match tokio::time::timeout(
+        INTEGRITY_CHECK_TIMEOUT,
+        run_sqlite3(path, true, "PRAGMA quick_check;"),
+    )
+    .await
+    {
+        Err(_) => {
+            return Some(IntegrityVerdict::Skipped(
+                "sqlite3 quick_check timed out".to_string(),
+            ));
+        }
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Ok(Err(e)) => {
+            return Some(IntegrityVerdict::Skipped(format!(
+                "sqlite3 failed to start: {e}"
+            )));
+        }
+        Ok(Ok(o)) => o,
+    };
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() && stderr.contains("unable to open") {
+        // A read-only open can fail when a hot WAL has no -shm to map (e.g.
+        // right after a hard kill). Retry read-write with query_only so SQLite
+        // may recover the WAL, while still refusing user-data writes.
+        let retry = match tokio::time::timeout(
+            INTEGRITY_CHECK_TIMEOUT,
+            run_sqlite3(path, false, "PRAGMA query_only=ON; PRAGMA quick_check;"),
+        )
+        .await
+        {
+            Err(_) => {
+                return Some(IntegrityVerdict::Skipped(
+                    "sqlite3 quick_check timed out".to_string(),
+                ));
+            }
+            Ok(Err(e)) => {
+                return Some(IntegrityVerdict::Skipped(format!(
+                    "sqlite3 failed to start: {e}"
+                )));
+            }
+            Ok(Ok(o)) => o,
+        };
+        return Some(classify_sqlite_output(&retry));
+    }
+
+    Some(classify_sqlite_output(&output))
+}
+
+async fn turso_integrity_check_inner(path: &Path) -> IntegrityVerdict {
+    let db = match turso::Builder::new_local(path.to_string_lossy().as_ref())
+        .build()
+        .await
+    {
+        Ok(db) => db,
+        Err(e) => {
+            return IntegrityVerdict::Skipped(format!("turso could not open the DB: {e}"));
+        }
+    };
+    let conn = match db.connect() {
+        Ok(c) => c,
+        Err(e) => {
+            return IntegrityVerdict::Skipped(format!("turso could not connect: {e}"));
+        }
+    };
+    let mut stmt = match conn.query("PRAGMA integrity_check", ()).await {
+        Ok(s) => s,
+        Err(e) => {
+            return IntegrityVerdict::Corrupt(format!("turso integrity_check failed: {e}"));
+        }
+    };
+    let mut lines = Vec::new();
+    loop {
+        match stmt.next().await {
+            Ok(Some(row)) => match row.get_value(0) {
+                Ok(Value::Text(t)) => lines.push(t),
+                Ok(v) => lines.push(format!("{v:?}")),
+                Err(e) => {
+                    return IntegrityVerdict::Skipped(format!("turso row error: {e}"));
+                }
+            },
+            Ok(None) => break,
+            Err(e) => {
+                return IntegrityVerdict::Corrupt(format!("turso integrity_check failed: {e}"));
+            }
+        }
+    }
+    if lines.len() == 1 && lines[0] == "ok" {
+        IntegrityVerdict::Clean
+    } else {
+        IntegrityVerdict::Corrupt(lines.join("\n"))
+    }
+}
+
+/// Best-effort in-process fallback when `sqlite3` is not installed. A panic in
+/// turso (it can slice out of bounds on a malformed cell) is contained here so
+/// an integrity probe can never take the engine down.
+async fn turso_integrity_check(path: &Path) -> IntegrityVerdict {
+    use futures_util::FutureExt;
+    let checked = std::panic::AssertUnwindSafe(turso_integrity_check_inner(path)).catch_unwind();
+    match tokio::time::timeout(INTEGRITY_CHECK_TIMEOUT, checked).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(_)) => IntegrityVerdict::Skipped("turso integrity_check panicked".to_string()),
+        Err(_) => IntegrityVerdict::Skipped("turso integrity_check timed out".to_string()),
+    }
+}
+
+/// Check a database file for corruption. Prefers the reliable `sqlite3`
+/// `PRAGMA quick_check`; falls back to turso's weaker in-process check (and says
+/// so in the log) when `sqlite3` is unavailable.
+pub(crate) async fn check_file_integrity(path: &Path) -> IntegrityVerdict {
+    match sqlite3_quick_check(path).await {
+        Some(v) => v,
+        None => {
+            eprintln!(
+                "[Database] sqlite3 not found — falling back to turso integrity_check \
+                 (best-effort; it can miss corruption)"
+            );
+            turso_integrity_check(path).await
+        }
+    }
 }
 
 /// Check the configured timeline DB path is usable WITHOUT opening the DB.
@@ -397,38 +614,154 @@ impl DatabaseManager {
         self.local.lock().await.is_some()
     }
 
+    /// The size floor below which the startup integrity check is skipped.
+    fn integrity_floor_bytes(&self) -> u64 {
+        (self.config.integrity_check_min_mb as u64) * 1024 * 1024
+    }
+
+    /// Verify the local DB before turso opens it. A hard kill can tear a btree
+    /// write and leave a DB that still OPENS but cannot be scanned/deleted from
+    /// (turso then fails the hourly cull with `IdxDelete`). The old restore path
+    /// only ran when opening failed, so it never saw this case.
+    ///
+    /// On corruption: restore a VERIFIED-CLEAN backup if one exists, otherwise
+    /// move the corrupt file (and its -wal/-shm) aside and let `open_local`
+    /// create a fresh empty DB. Nothing is deleted — the operator can still run
+    /// `scripts/repair-timeline-db.sh`.
+    async fn integrity_gate_on_open(&self) {
+        if !self.config.integrity_check_on_open {
+            return;
+        }
+        let path = &self.config.local_path;
+        if path == Path::new(":memory:") {
+            return;
+        }
+        let Ok(meta) = std::fs::metadata(path) else {
+            return; // no file yet: a fresh DB
+        };
+        if !meta.is_file() || meta.len() < self.integrity_floor_bytes() {
+            return;
+        }
+        match check_file_integrity(path).await {
+            IntegrityVerdict::Clean => {}
+            IntegrityVerdict::Corrupt(detail) => {
+                eprintln!("[Database] STARTUP INTEGRITY CHECK FAILED: {detail}");
+                if self.restore_clean_backup().await {
+                    return;
+                }
+                self.move_corrupt_aside("failed the startup integrity check");
+            }
+            IntegrityVerdict::Skipped(reason) => {
+                eprintln!("[Database] startup integrity check skipped: {reason}");
+            }
+        }
+    }
+
+    /// Replace the local DB with the backup, but ONLY after verifying the backup
+    /// itself is clean. A backup is a plain copy of the live DB, so it can be
+    /// corrupt too; blindly restoring it would trade one corrupt DB for another.
+    /// The restore is written to a temp sibling and renamed into place so a
+    /// failed copy cannot leave a half-written main file.
+    async fn restore_clean_backup(&self) -> bool {
+        let Some(bp) = self.config.remote_url.as_deref() else {
+            return false;
+        };
+        if bp.trim().is_empty() {
+            return false;
+        }
+        let backup = Path::new(bp);
+        if !backup.is_file() {
+            return false;
+        }
+        match check_file_integrity(backup).await {
+            IntegrityVerdict::Clean => {}
+            IntegrityVerdict::Corrupt(detail) => {
+                eprintln!(
+                    "[Database] backup at {bp} is ALSO CORRUPT ({detail}) — NOT restoring it"
+                );
+                return false;
+            }
+            IntegrityVerdict::Skipped(reason) => {
+                eprintln!("[Database] cannot verify backup at {bp} ({reason}) — NOT restoring it");
+                return false;
+            }
+        }
+
+        eprintln!("[Database] restoring VERIFIED-CLEAN backup {bp} over the corrupt local DB");
+        let local = self.config.local_path.to_string_lossy();
+        // Stale sidecars for the corrupt local DB would be re-applied over the
+        // restored file; drop them before the swap.
+        let _ = std::fs::remove_file(format!("{local}-wal"));
+        let _ = std::fs::remove_file(format!("{local}-shm"));
+
+        let tmp = format!("{local}.restore.tmp");
+        let _ = std::fs::remove_file(&tmp);
+        if let Err(e) = std::fs::copy(backup, &tmp) {
+            eprintln!("[Database] backup restore failed while copying: {e}");
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &self.config.local_path) {
+            eprintln!("[Database] backup restore failed while swapping in the snapshot: {e}");
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+        eprintln!("[Database] backup restored; the corrupt local DB has been replaced");
+        true
+    }
+
+    /// Move the local DB (and its -wal/-shm) out of the way so a fresh empty DB
+    /// can be created. The original file is preserved for offline repair.
+    fn move_corrupt_aside(&self, reason: &str) {
+        let path = &self.config.local_path;
+        if !path.is_file() {
+            return;
+        }
+        let aside = format!("{}.corrupt.{}", path.to_string_lossy(), Self::now_ms());
+        if let Err(e) = std::fs::rename(path, &aside) {
+            eprintln!(
+                "[Database] !! timeline DB {reason}, but moving it aside FAILED: {e}. \
+                 The engine will stay blocked; run scripts/repair-timeline-db.sh."
+            );
+            return;
+        }
+        for suffix in ["-wal", "-shm"] {
+            let src = format!("{}{suffix}", path.to_string_lossy());
+            if Path::new(&src).exists() {
+                let _ = std::fs::rename(&src, format!("{aside}{suffix}"));
+            }
+        }
+        eprintln!(
+            "[Database] !! TIMELINE DB {reason}: moved to {aside}. Starting with a FRESH EMPTY \
+             database. Run scripts/repair-timeline-db.sh (engine stopped) to recover the old data."
+        );
+    }
+
     pub async fn initialize(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Open the local DB (the write buffer / queue). If it is corrupt or
-        // otherwise can't be opened and a backup exists, restore from the
-        // backup before giving up.
+        // Catch a corrupt-but-openable DB before turso touches it. If it is
+        // corrupt, this either restores a verified-clean backup or moves the
+        // file aside so the open below creates a fresh DB.
+        self.integrity_gate_on_open().await;
+
+        // Open the local DB (the write buffer / queue). If it still cannot be
+        // opened, try a verified-clean backup, then fall back to moving the
+        // unusable file aside.
         let local_result = Self::open_local(&self.config.local_path).await;
         let conn = match local_result {
             Ok(c) => c,
-            Err(_) => {
-                if let Some(bp) = self.config.remote_url.as_deref() {
-                    let backup_file = std::path::Path::new(bp);
-                    if backup_file.exists() {
-                        eprintln!(
-                            "[Database] local DB unavailable — restoring from backup {}",
-                            bp
-                        );
-                        // A stale -wal/-shm for the corrupt local DB would be
-                        // re-applied over the restored file — drop them
-                        // (best-effort) before copying so the restored snapshot
-                        // is clean.
-                        let local_path = self.config.local_path.to_string_lossy();
-                        let _ = std::fs::remove_file(format!("{}-wal", local_path));
-                        let _ = std::fs::remove_file(format!("{}-shm", local_path));
-                        if std::fs::copy(backup_file, &self.config.local_path).is_ok() {
-                            Self::open_local(&self.config.local_path).await?
-                        } else {
-                            return Err("local DB corrupt and backup restore failed".into());
-                        }
-                    } else {
-                        return Err("local DB corrupt and no backup exists".into());
-                    }
+            Err(open_err) => {
+                if self.restore_clean_backup().await {
+                    Self::open_local(&self.config.local_path).await?
+                } else if self.config.local_path.is_file() {
+                    self.move_corrupt_aside("could not be opened");
+                    Self::open_local(&self.config.local_path).await?
                 } else {
-                    return Err("local DB corrupt and no backup configured".into());
+                    return Err(open_err);
                 }
             }
         };
@@ -1643,29 +1976,47 @@ impl DatabaseManager {
             // Phase 1: merge the WAL into the main file under the lock, then let
             // the guard drop so the copy below is lock-free. Only checkpoint when
             // a -wal file actually exists for the local DB (checkpointing a
-            // missing WAL should not fail the backup). Best-effort either way: a
-            // failed checkpoint must never fail the backup. (PRAGMA returns a
-            // result row — drain it to `Done` so the read transaction is ended;
-            // an error mid-drain may leave the tx open, so force a reopen before
-            // the connection is used again.)
+            // missing WAL should not fail the backup). (PRAGMA returns a result
+            // row — drain it to `Done` so the read transaction is ended; an error
+            // mid-drain may leave the tx open, so force a reopen before the
+            // connection is used again.)
+            //
+            // A failed checkpoint means the main file is NOT a trustworthy
+            // snapshot of the source (the WAL may hold a torn write), so the
+            // backup is skipped rather than promoting a possibly-corrupt file.
+            let mut checkpoint_failed = false;
             {
                 let conn = self.locked().await;
                 let conn = conn.as_ref().ok_or("Local database not initialized")?;
                 let wal_path = format!("{}-wal", self.config.local_path.to_string_lossy());
-                if std::path::Path::new(&wal_path).exists()
-                    && let Ok(mut stmt) = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await
-                {
-                    loop {
-                        match stmt.next().await {
-                            Ok(Some(_)) => {}
-                            Ok(None) => break,
-                            Err(_) => {
-                                self.needs_reopen.store(true, Ordering::SeqCst);
-                                break;
+                if std::path::Path::new(&wal_path).exists() {
+                    match conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await {
+                        Ok(mut stmt) => loop {
+                            match stmt.next().await {
+                                Ok(Some(_)) => {}
+                                Ok(None) => break,
+                                Err(_) => {
+                                    checkpoint_failed = true;
+                                    self.needs_reopen.store(true, Ordering::SeqCst);
+                                    break;
+                                }
                             }
+                        },
+                        Err(_) => {
+                            checkpoint_failed = true;
+                            self.needs_reopen.store(true, Ordering::SeqCst);
                         }
                     }
                 }
+            }
+
+            if checkpoint_failed {
+                eprintln!(
+                    "[Database] backup SKIPPED: WAL checkpoint failed; keeping the \
+                     last-known-good backup at {bp}. If this persists, the timeline DB may be \
+                     corrupt — stop the engine and run scripts/repair-timeline-db.sh."
+                );
+                return Err("timeline WAL checkpoint failed; backup skipped".into());
             }
 
             // Phase 2: copy WITHOUT the lock. After the checkpoint above the main
@@ -1683,6 +2034,44 @@ impl DatabaseManager {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
             }
+
+            // Phase 3: verify the SNAPSHOT before it replaces the last-known-good
+            // backup. The tmp file is exactly what would be promoted, so a corrupt
+            // source (or a torn copy) can never overwrite a healthy backup.
+            if self.config.integrity_check_on_backup {
+                match check_file_integrity(Path::new(&tmp)).await {
+                    IntegrityVerdict::Clean => {}
+                    IntegrityVerdict::Corrupt(detail) => {
+                        let _ = std::fs::remove_file(&tmp);
+                        eprintln!(
+                            "[Database] backup SKIPPED: timeline DB failed the integrity check \
+                             ({detail}); keeping the last-known-good backup at {bp}. Stop the \
+                             engine and run scripts/repair-timeline-db.sh."
+                        );
+                        return Err(format!(
+                            "timeline DB failed the integrity check; backup skipped: {detail}"
+                        )
+                        .into());
+                    }
+                    IntegrityVerdict::Skipped(reason) => {
+                        let _ = std::fs::remove_file(&tmp);
+                        eprintln!(
+                            "[Database] backup SKIPPED: could not verify the snapshot ({reason}); \
+                             keeping the last-known-good backup at {bp}"
+                        );
+                        return Err(format!(
+                            "timeline DB integrity check unavailable; backup skipped: {reason}"
+                        )
+                        .into());
+                    }
+                }
+            }
+
+            // The sqlite3 read-only retry may have created sidecars next to the
+            // tmp snapshot. The backup is a single main file, so do not promote
+            // them (and do not leave them behind after the rename).
+            let _ = std::fs::remove_file(format!("{tmp}-wal"));
+            let _ = std::fs::remove_file(format!("{tmp}-shm"));
 
             // POSIX rename() atomically replaces an existing target — never delete
             // the last good backup before the new snapshot lands.

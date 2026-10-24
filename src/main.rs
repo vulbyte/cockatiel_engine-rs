@@ -1383,6 +1383,9 @@ cockatiel
         sync_interval_secs: config.timeline_backup_interval_secs,
         local_target_mb: config.timeline_database_target_mb,
         log_min_severity: config.log_min_severity,
+        integrity_check_on_open: config.timeline_integrity_check_on_open,
+        integrity_check_on_backup: config.timeline_integrity_check_on_backup,
+        integrity_check_min_mb: config.timeline_integrity_check_min_mb,
     };
     let db = DatabaseManager::new(db_config);
     // A missing/unusable timeline DB no longer kills the engine. It starts

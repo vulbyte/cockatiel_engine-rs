@@ -68,7 +68,7 @@ fn backfill_writes_missing_keys_and_preserves_existing() {
     assert_eq!(v["port"], 9734);
     assert_eq!(v["module_approval_policy"], "auto-allow");
 
-    // The eight new keys were written at the TOP level with their defaults.
+    // The eleven new keys were written at the TOP level with their defaults.
     assert_eq!(v["max_message_bytes"], 16 * 1024 * 1024);
     assert_eq!(v["max_connections"], 128);
     assert_eq!(v["handshake_timeout_secs"], 10);
@@ -85,6 +85,18 @@ fn backfill_writes_missing_keys_and_preserves_existing() {
     assert_eq!(
         v["prediction_creator_role"], "mod",
         "a fresh config must say who may create a prediction"
+    );
+    assert_eq!(
+        v["timeline_integrity_check_on_open"], true,
+        "a fresh config must verify the timeline DB before opening it"
+    );
+    assert_eq!(
+        v["timeline_integrity_check_on_backup"], true,
+        "a fresh config must verify a snapshot before promoting it"
+    );
+    assert_eq!(
+        v["timeline_integrity_check_min_mb"], 5,
+        "the startup check is gated by the size-warning floor"
     );
 
     std::fs::remove_dir_all(&dir).ok();
@@ -105,6 +117,9 @@ fn backfill_is_a_noop_when_all_keys_present() {
         "start_paused": false,
         "shutdown_on_request": false,
         "prediction_creator_role": "owner",
+        "timeline_integrity_check_on_open": false,
+        "timeline_integrity_check_on_backup": false,
+        "timeline_integrity_check_min_mb": 0,
         "module_approval_policy": "auto-allow"
     }"#;
     let (state, path) = temp_state(&dir, original);

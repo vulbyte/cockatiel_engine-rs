@@ -14,6 +14,9 @@ async fn test_db() -> DatabaseManager {
         sync_interval_secs: 15,
         local_target_mb: 50,
         log_min_severity: 0.3,
+        integrity_check_on_open: false,
+        integrity_check_on_backup: false,
+        integrity_check_min_mb: 0,
     });
     db.initialize().await.unwrap();
     // Setup counts its own round-trip; every test below measures from zero.
@@ -123,6 +126,9 @@ async fn sync_to_remote_writes_a_consistent_reusable_backup() {
         sync_interval_secs: 15,
         local_target_mb: 50,
         log_min_severity: 0.3,
+        integrity_check_on_open: false,
+        integrity_check_on_backup: false,
+        integrity_check_min_mb: 0,
     });
     db.initialize().await.unwrap();
 
@@ -151,6 +157,9 @@ async fn sync_to_remote_writes_a_consistent_reusable_backup() {
         sync_interval_secs: 15,
         local_target_mb: 50,
         log_min_severity: 0.3,
+        integrity_check_on_open: false,
+        integrity_check_on_backup: false,
+        integrity_check_min_mb: 0,
     });
     restored.initialize().await.unwrap();
     let json = restored
@@ -185,6 +194,9 @@ async fn sync_to_remote_creates_a_missing_backup_directory() {
         sync_interval_secs: 15,
         local_target_mb: 50,
         log_min_severity: 0.3,
+        integrity_check_on_open: false,
+        integrity_check_on_backup: false,
+        integrity_check_min_mb: 0,
     });
     db.initialize().await.unwrap();
     let uuid = b"backup-dir-uuid-00000001".to_vec();
@@ -749,6 +761,9 @@ async fn concurrent_reads_and_writes_do_not_panic_the_wal() {
         sync_interval_secs: 15,
         local_target_mb: 50,
         log_min_severity: 0.3,
+        integrity_check_on_open: false,
+        integrity_check_on_backup: false,
+        integrity_check_min_mb: 0,
     });
     db.initialize().await.unwrap();
 
@@ -801,6 +816,9 @@ async fn partial_reads_are_drained_and_do_not_wedge_the_wal() {
         sync_interval_secs: 15,
         local_target_mb: 50,
         log_min_severity: 0.3,
+        integrity_check_on_open: false,
+        integrity_check_on_backup: false,
+        integrity_check_min_mb: 0,
     });
     db.initialize().await.unwrap();
 
@@ -847,6 +865,9 @@ async fn a_panicking_operation_reopens_the_connection() {
         sync_interval_secs: 15,
         local_target_mb: 50,
         log_min_severity: 0.3,
+        integrity_check_on_open: false,
+        integrity_check_on_backup: false,
+        integrity_check_min_mb: 0,
     });
     db.initialize().await.unwrap();
 
@@ -893,6 +914,9 @@ async fn reopen_local_produces_a_working_connection() {
         sync_interval_secs: 15,
         local_target_mb: 50,
         log_min_severity: 0.3,
+        integrity_check_on_open: false,
+        integrity_check_on_backup: false,
+        integrity_check_min_mb: 0,
     });
     db.initialize().await.unwrap();
 

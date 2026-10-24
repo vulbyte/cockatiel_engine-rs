@@ -97,6 +97,23 @@ pub struct Config {
     #[serde(default = "default_timeline_backup_interval_secs")]
     pub timeline_backup_interval_secs: u32,
 
+    /// Run `PRAGMA quick_check` on the timeline DB at startup (before opening
+    /// it), restoring a clean backup or moving a corrupt file aside. Defaults
+    /// to true; set false to skip the full page walk on every start.
+    #[serde(default = "default_timeline_integrity_check_on_open")]
+    pub timeline_integrity_check_on_open: bool,
+
+    /// Verify a timeline snapshot with `PRAGMA quick_check` before promoting it
+    /// over the last-known-good backup. Defaults to true: a corrupt live DB can
+    /// then never overwrite a healthy backup.
+    #[serde(default = "default_timeline_integrity_check_on_backup")]
+    pub timeline_integrity_check_on_backup: bool,
+
+    /// Minimum timeline DB size (MB) before the startup integrity check runs.
+    /// Defaults to 5 (the DB-size warning floor); set 0 to always check.
+    #[serde(default = "default_timeline_integrity_check_min_mb")]
+    pub timeline_integrity_check_min_mb: u32,
+
     /// Minimum log severity (0.0–1.0) persisted to the timeline. Events below this
     /// never reach the timeline DB (they still stream to the TUI and the log file).
     /// Defaults to 0.3.
@@ -171,6 +188,18 @@ fn default_creator_role() -> String {
 
 fn default_timeline_backup_interval_secs() -> u32 {
     300
+}
+
+fn default_timeline_integrity_check_on_open() -> bool {
+    true
+}
+
+fn default_timeline_integrity_check_on_backup() -> bool {
+    true
+}
+
+fn default_timeline_integrity_check_min_mb() -> u32 {
+    5
 }
 
 fn default_log_min_severity() -> f32 {
@@ -397,7 +426,7 @@ pub fn backfill_config_defaults(state: &Arc<Mutex<ConfigState>>) {
     };
 
     let mut changed = false;
-    let defaults: [(&str, serde_json::Value); 8] = [
+    let defaults: [(&str, serde_json::Value); 11] = [
         (
             "max_message_bytes",
             serde_json::json!(default_max_message_bytes()),
@@ -426,6 +455,18 @@ pub fn backfill_config_defaults(state: &Arc<Mutex<ConfigState>>) {
         (
             "prediction_creator_role",
             serde_json::json!(default_creator_role()),
+        ),
+        (
+            "timeline_integrity_check_on_open",
+            serde_json::json!(default_timeline_integrity_check_on_open()),
+        ),
+        (
+            "timeline_integrity_check_on_backup",
+            serde_json::json!(default_timeline_integrity_check_on_backup()),
+        ),
+        (
+            "timeline_integrity_check_min_mb",
+            serde_json::json!(default_timeline_integrity_check_min_mb()),
         ),
     ];
     for (key, value) in defaults {
@@ -529,6 +570,9 @@ const CONFIG_TEMPLATE: &str = r#"{
     "shutdown_on_request": false,
     "prediction_creator_role": "mod",
     "timeline_backup_interval_secs": 300,
+    "timeline_integrity_check_on_open": true,
+    "timeline_integrity_check_on_backup": true,
+    "timeline_integrity_check_min_mb": 5,
     "log_min_severity": 0.3,
     "timeline_keep_noise_rows": 1000
 }"#;

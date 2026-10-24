@@ -11,6 +11,7 @@ mod db_tests;
 mod e2e_pipeline_tests;
 mod handshake_tests;
 mod ingest_fetch_tests;
+mod integrity_tests;
 mod pause_tests;
 mod pin_gate_tests;
 mod pipeline_tests;
