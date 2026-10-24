@@ -2491,7 +2491,22 @@ where
     let assigned_uuid;
     let route_name: String;
 
-    if !container.auth_token.is_empty() {
+    // A control surface (the TUI) persists its engine identity across restarts,
+    // so after an engine restart its stored auth token is stale and would fail
+    // `verify_token`. Rather than wedge it in a reject/reconnect loop, fall back
+    // to PIN verification and treat it as a fresh connection — the PIN is the
+    // durable secret. (Regular modules never replay a stored identity, so this
+    // only ever triggers for the control surface.)
+    let stale_control_surface = !container.auth_token.is_empty()
+        && !auth_store.verify_token(
+            &container.module_instance_uuid7,
+            &container.auth_token,
+            &container.module_name,
+        )
+        && is_control_surface(&container.module_name)
+        && verify_pin(request.pin, config::get_pin(&config_state));
+
+    if !container.auth_token.is_empty() && !stale_control_surface {
         // Reconnection: verify auth token AND that the claimed module name
         // matches the name the token was issued to.
         let token_valid = auth_store.verify_token(
@@ -2596,6 +2611,15 @@ where
         )
         .await?;
     } else {
+        if stale_control_surface {
+            log_event(
+                &ui_state,
+                format!(
+                    "Control surface '{}' presented a stale token — accepting via PIN",
+                    container.module_name
+                ),
+            );
+        }
         // New connection: validate PIN (throttled per (peer IP, module name) —
         // 5 consecutive failures lock that identity out for 60s). Keying by
         // identity rather than IP keeps one bad module from locking out every
