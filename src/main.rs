@@ -1277,6 +1277,7 @@ async fn handle_chat_message_rejected(
 /// eventual release.
 async fn handle_audit_flag(
     db: &DatabaseManager,
+    user_db_client: &SharedUserDbClient,
     flag: &cockatiel_protobuf::AuditFlag,
     module_senders: &Arc<
         tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<ContainerForModule>>>,
@@ -1333,6 +1334,16 @@ async fn handle_audit_flag(
 
     match outcome {
         PromptOutcome::Decided(true) => {
+            crate::queries::resolve_block_appeal(
+                db,
+                user_db_client,
+                module_senders,
+                ui_state,
+                &flag.message_uuid7,
+                &flag.reason,
+                true,
+            )
+            .await;
             if db.release_audit(&uuid_bytes, true).await.is_ok() {
                 log_event(
                     ui_state,
@@ -1341,6 +1352,16 @@ async fn handle_audit_flag(
             }
         }
         PromptOutcome::Decided(false) => {
+            crate::queries::resolve_block_appeal(
+                db,
+                user_db_client,
+                module_senders,
+                ui_state,
+                &flag.message_uuid7,
+                &flag.reason,
+                false,
+            )
+            .await;
             if db.release_audit(&uuid_bytes, false).await.is_ok() {
                 log_event(
                     ui_state,
@@ -4146,12 +4167,14 @@ where
                                 if newly_held {
                                     let flag = flag.clone();
                                     let audit_db = db.clone();
+                                    let audit_udb = user_db_client.clone();
                                     let audit_senders = orchestrator.module_senders.clone();
                                     let audit_routes = prompt_routes.clone();
                                     let audit_ui = ui_state.clone();
                                     tokio::spawn(async move {
                                         handle_audit_flag(
                                             &audit_db,
+                                            &audit_udb,
                                             &flag,
                                             &audit_senders,
                                             &audit_routes,

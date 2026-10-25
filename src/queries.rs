@@ -1250,6 +1250,30 @@ async fn dispatch(
                 QueryOutcome::denied("audit action requires uuid7")
             } else {
                 let approve = route == QueryRoute::AuditApprove;
+                // A held block appeal has extra side effects: approval clears
+                // the user's block and either decision is relayed to the block
+                // module so its appeal record matches the TUI.
+                let reason = db
+                    .get_audit_entry(uuid7.as_bytes())
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|e| {
+                        e.get("reason")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                resolve_block_appeal(
+                    db,
+                    user_db_client,
+                    &orchestrator.module_senders,
+                    ui_state,
+                    uuid7,
+                    &reason,
+                    approve,
+                )
+                .await;
                 match db.release_audit(uuid7.as_bytes(), approve).await {
                     Ok(_) => {
                         let json =
@@ -1989,6 +2013,89 @@ fn parse_module_bans_report(sql: &str) -> Result<std::collections::HashSet<Strin
         }
     }
     Ok(keys)
+}
+
+/// Prefix the block module puts in the audit `flags` of a held appeal. A held
+/// row whose flags carry it is a block appeal, not an ordinary flagged message.
+pub(crate) const BLOCK_APPEAL_REASON_PREFIX: &str = "block appeal ";
+/// Engine→block-module notification of a TUI audit decision, over the existing
+/// `DatabaseQueryResult` payload (no proto change). The block module updates its
+/// local appeal record; the engine itself performs the unblock on approval.
+pub(crate) const BLOCK_APPEAL_RESOLVE_QUERY: &str = "block_appeal_resolve";
+
+/// Whether a held row's `flags`/reason marks it as a block appeal. Audio
+/// markers may be appended to the flags by a later stage write, so scan the
+/// comma-separated parts rather than only the first one.
+pub(crate) fn is_block_appeal_reason(reason: &str) -> bool {
+    reason
+        .split(',')
+        .any(|part| part.trim().starts_with(BLOCK_APPEAL_REASON_PREFIX))
+}
+
+/// Resolve a held block appeal on a TUI audit decision.
+///
+/// * approval unblocks the appealing user directly through the user DB (the TUI
+///   is a trusted control surface, so its audit action is the authority — the
+///   chat path's actor gate does not apply);
+/// * either decision is relayed to the `block` module over the legacy
+///   `DatabaseQueryResult` pair so its local `appeals.json` record is resolved
+///   too. Best-effort: a disconnected module must not fail the audit action.
+pub(crate) async fn resolve_block_appeal(
+    db: &DatabaseManager,
+    user_db_client: &SharedUserDbClient,
+    module_senders: &Arc<
+        tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<ContainerForModule>>>,
+    >,
+    ui_state: &Arc<Mutex<EngineState>>,
+    uuid7: &str,
+    reason: &str,
+    approved: bool,
+) {
+    if !is_block_appeal_reason(reason) {
+        return;
+    }
+    let user_uuid7 = db
+        .get_audit_entry(uuid7.as_bytes())
+        .await
+        .ok()
+        .flatten()
+        .and_then(|e| {
+            e.get("user_uuid7")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    if approved && !user_uuid7.is_empty() {
+        match user_db_client.unblock_user(&user_uuid7).await {
+            Ok(r) if r.success => log_event(
+                ui_state,
+                format!("[audit] block appeal approved — unblocked {}", user_uuid7),
+            ),
+            Ok(_) => log_event(
+                ui_state,
+                format!("[audit] block appeal approved but unblock failed for {}", user_uuid7),
+            ),
+            Err(e) => log_event(
+                ui_state,
+                format!("[audit] block appeal unblock failed: {}", e),
+            ),
+        }
+    }
+    let status = if approved { "approved" } else { "denied" };
+    let blob = serde_json::json!({ "uuid7": uuid7, "status": status }).to_string();
+    let container = ContainerForModule {
+        version: 2,
+        auth_token: String::new(),
+        module_instance_uuid7: String::new(),
+        payload: Some(Payload::DatabaseQueryResult(DatabaseQueryResult {
+            query_id: BLOCK_APPEAL_RESOLVE_QUERY.to_string(),
+            success: approved,
+            error: String::new(),
+            result_blob: blob.into_bytes(),
+        })),
+    };
+    let _ = crate::pipeline::send_to_module(module_senders, "block", container, "block_appeal_resolve")
+        .await;
 }
 
 async fn userdb_virtual_query(
