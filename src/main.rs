@@ -687,6 +687,102 @@ pub async fn engine_reply_to_platform(
     }
 }
 
+/// The actor id stored inside a block's `"by"` value. The engine stores the
+/// actor as JSON (an object with a `uuid7`, or a bare string); extract the uuid
+/// when present, otherwise fall back to the string form.
+fn block_actor_id(by: &serde_json::Value) -> String {
+    if let Some(uuid) = by.get("uuid7").and_then(|v| v.as_str()) {
+        return uuid.to_string();
+    }
+    if let Some(s) = by.as_str() {
+        return s.to_string();
+    }
+    by.to_string()
+}
+
+/// The `UserData.bans` entries implied by a user's `flags` JSON. A `"blocked"`
+/// key becomes one active ban (`unbanned == false`); anything else — or a
+/// malformed/absent flags blob — yields no bans. The ban is the global block:
+/// `commendee_uuid7` is the blocked user, `commender_uuid7` the actor that set
+/// it, and `reason` the stored reason.
+pub fn bans_from_flags(user_uuid7: &str, flags: &str) -> Vec<cockatiel_protobuf::Ban> {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(flags)
+    else {
+        return Vec::new();
+    };
+    let Some(blocked) = map.get("blocked") else {
+        return Vec::new();
+    };
+    let reason = blocked
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let commender_uuid7 = blocked.get("by").map(block_actor_id).unwrap_or_default();
+    vec![cockatiel_protobuf::Ban {
+        commender_uuid7,
+        commendee_uuid7: user_uuid7.to_string(),
+        unbanned: false,
+        reason,
+        raw_message: String::new(),
+        appeals: Vec::new(),
+    }]
+}
+
+/// Load every globally-blocked user from the user database into the
+/// orchestrator's in-memory block cache.
+///
+/// The user-db protocol has no blocked-only listing, so this pages through
+/// `list_users` (which carries each user's `flags` and `channels`) and keeps
+/// every user whose `flags` carry a `"blocked"` entry — the same test
+/// [`bans_from_flags`] applies on the enrich path. Both the canonical uuid7 and
+/// each `platform`+handle/channel alias are cached, so a blocked user's
+/// un-enriched message (which carries the raw adapter login in `user_uuid7`) is
+/// still dropped. Returns how many blocked users were cached.
+async fn load_blocked_users(
+    client: &SharedUserDbClient,
+    orchestrator: &PipelineOrchestrator,
+) -> Result<usize, String> {
+    const PAGE: i32 = 500;
+    let mut offset = 0i32;
+    let mut blocked = 0usize;
+    let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        let resp = client
+            .list_users("", PAGE, offset)
+            .await
+            .map_err(|e| format!("list_users failed: {}", e))?;
+        let returned = resp.users.len() as i32;
+        for user in &resp.users {
+            if bans_from_flags(&user.uuid7, &user.flags).is_empty() {
+                continue;
+            }
+            keys.insert(user.uuid7.clone());
+            for ch in &user.channels {
+                if !ch.channel_id.trim().is_empty() {
+                    keys.insert(PipelineOrchestrator::blocked_alias_key(
+                        &ch.platform,
+                        &ch.channel_id,
+                    ));
+                }
+                if !ch.handle.trim().is_empty() {
+                    keys.insert(PipelineOrchestrator::blocked_alias_key(
+                        &ch.platform,
+                        &ch.handle,
+                    ));
+                }
+            }
+            blocked += 1;
+        }
+        if returned < PAGE {
+            break;
+        }
+        offset += PAGE;
+    }
+    orchestrator.replace_blocked_users(keys);
+    Ok(blocked)
+}
+
 pub async fn enrich_chat_user(
     client: &SharedUserDbClient,
     stream_tracker: &SharedStreamTracker,
@@ -794,6 +890,7 @@ pub async fn enrich_chat_user(
     let donation = crate::pipeline::DonationInfo::parse(&chat.raw_data);
     crate::pipeline::add_donation_css(&mut css, donation.as_ref());
 
+    let bans = bans_from_flags(&user.uuid7, &user.flags);
     chat.user_uuid7 = user.uuid7.clone();
     chat.user_data = Some(cockatiel_protobuf::UserData {
         uuid: user.uuid7,
@@ -802,7 +899,7 @@ pub async fn enrich_chat_user(
         is_moderator: user.is_moderator,
         is_admin: user.is_admin,
         is_owner: user.is_owner,
-        bans: Vec::new(),
+        bans,
         commendations: Vec::new(),
         styling: Some(cockatiel_protobuf::UserStylingTemplate {
             css_properties: css,
@@ -1797,10 +1894,15 @@ cockatiel
     {
         let orchestrator = orchestrator.clone();
         let ui_state = Arc::clone(&ui_state);
+        let block_client = user_db_client.clone();
         let host = user_db_host.clone();
         let port = user_db_port;
         tokio::spawn(async move {
             let mut prev: Option<bool> = None;
+            // The block cache is seeded once, the first time the user database
+            // answers. Until then a failure is retried on the next tick rather
+            // than latching an empty cache forever.
+            let mut blocked_loaded = false;
             loop {
                 let up = tokio::time::timeout(
                     std::time::Duration::from_millis(500),
@@ -1841,6 +1943,27 @@ cockatiel
                                 outcome.resumed_messages
                             ),
                         );
+                    }
+                    if !blocked_loaded {
+                        match load_blocked_users(&block_client, &orchestrator).await {
+                            Ok(n) => {
+                                blocked_loaded = true;
+                                log_event_broadcast(
+                                    &ui_state,
+                                    format!(
+                                        "[Block] loaded {} globally-blocked user(s) into the engine cache ({} identities)",
+                                        n,
+                                        orchestrator.blocked_cache_len()
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                log_event_broadcast(
+                                    &ui_state,
+                                    format!("[Block] blocked-user cache not loaded yet: {}", e),
+                                );
+                            }
+                        }
                     }
                 }
                 prev = Some(up);

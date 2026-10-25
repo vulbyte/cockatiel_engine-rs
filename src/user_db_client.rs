@@ -15,6 +15,17 @@ use proto::{
     UserValueListRequest, UserValueRequest, user_db_request,
 };
 
+/// TEMPORARY bridge keys for the global-block feature.
+///
+/// The pinned `cockatiel-proto` revision has no `BlockUser`/`UnblockUser` op,
+/// so block/unblock tunnel through `write_user_value` under these reserved keys
+/// (the same pattern as the account-merge bridge). A write under
+/// [`BLOCK_RESERVED_KEY`] sets the user's `"blocked"` flag; [`UNBLOCK_RESERVED_KEY`]
+/// clears it. MUST stay byte-identical to the constants of the same name in the
+/// user-db module's `src/main.rs`.
+pub const BLOCK_RESERVED_KEY: &str = "\u{0}__cockatiel_block__";
+pub const UNBLOCK_RESERVED_KEY: &str = "\u{0}__cockatiel_unblock__";
+
 /// Convenience result for a module-price deduction: the user's updated record,
 /// or an "insufficient funds / user missing" marker.
 #[derive(Debug, Clone)]
@@ -308,6 +319,29 @@ impl UserDbClient {
             flags: flags.to_string(),
         }))
         .await
+    }
+
+    /// Set a user's global block (tunnelled through `write_user_value` under
+    /// [`BLOCK_RESERVED_KEY`] until a dedicated proto op ships). `by_json` is
+    /// the acting moderator as JSON; it is embedded structured when it parses
+    /// and as a plain string otherwise.
+    pub async fn block_user(
+        &self,
+        uuid7: &str,
+        reason: &str,
+        by_json: &str,
+    ) -> Result<UserDbResponse, String> {
+        let by = serde_json::from_str::<serde_json::Value>(by_json)
+            .unwrap_or_else(|_| serde_json::Value::String(by_json.to_string()));
+        let value = serde_json::json!({ "reason": reason, "by": by }).to_string();
+        self.write_user_value(uuid7, BLOCK_RESERVED_KEY, &value)
+            .await
+    }
+
+    /// Clear a user's global block (tunnelled through `write_user_value` under
+    /// [`UNBLOCK_RESERVED_KEY`]).
+    pub async fn unblock_user(&self, uuid7: &str) -> Result<UserDbResponse, String> {
+        self.write_user_value(uuid7, UNBLOCK_RESERVED_KEY, "").await
     }
 
     pub async fn set_roles(

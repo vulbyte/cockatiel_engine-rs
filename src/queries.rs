@@ -1345,6 +1345,7 @@ async fn dispatch(
             // control surface may access it. Modules are denied.
             userdb_virtual_query(
                 user_db_client,
+                orchestrator,
                 query_id,
                 sql,
                 ui_state,
@@ -1810,8 +1811,99 @@ fn parse_split_channel_payload(
 /// Handle a `userdb_*` virtual query from the TUI. The SQL field carries a JSON
 /// payload specific to each operation. Only the engine's control surface (TUI)
 /// may reach the user database.
+/// Resolve and verify both sides of a global-block operation, mirroring
+/// `mod_virtual_query`:
+///
+/// * the **actor** (the human issuing it) is verified from the payload's
+///   `actor` object — a uuid7 or a `(platform, handle)` pair — and must hold a
+///   moderator/admin/owner role in the user DB, otherwise the operation is
+///   denied;
+/// * the **target** is the payload's `uuid7`, or the user resolved from
+///   `(platform, handle)`.
+///
+/// Returns `(target_uuid7, actor_json)` where `actor_json` is the canonical
+/// actor object stored on the block.
+async fn resolve_block_actor_and_target(
+    client: &SharedUserDbClient,
+    payload: &serde_json::Value,
+    ui_state: &Arc<Mutex<EngineState>>,
+    requester: &str,
+    query_id: &str,
+) -> Result<(String, String), String> {
+    // ── Actor verification (mirrors `mod_virtual_query`) ────────────────
+    let actor = payload.get("actor").filter(|a| !a.is_null());
+    let Some(actor) = actor else {
+        log_event(
+            ui_state,
+            format!("[{}] {} denied: missing actor", requester, query_id),
+        );
+        return Err("permission denied: missing actor".to_string());
+    };
+    let actor_uuid = actor.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
+    let actor_platform = actor
+        .get("platform")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let actor_handle = actor.get("handle").and_then(|v| v.as_str()).unwrap_or("");
+    let resolved = if !actor_uuid.is_empty() {
+        client.get_user(actor_uuid, "", "", "").await
+    } else {
+        client
+            .get_user("", actor_platform, actor_handle, actor_handle)
+            .await
+    };
+    let resolved = resolved.map_err(|e| format!("Actor lookup failed: {}", e))?;
+    let Some(user) = resolved.user else {
+        log_event(
+            ui_state,
+            format!(
+                "[{}] {} denied: actor '{}' not found in user DB",
+                requester, query_id, actor_handle
+            ),
+        );
+        return Err("permission denied: actor is not a moderator/admin/owner".to_string());
+    };
+    if !(user.is_moderator || user.is_admin || user.is_owner) {
+        log_event(
+            ui_state,
+            format!(
+                "[{}] {} denied: actor '{}' lacks a mod/admin/owner role",
+                requester, query_id, user.username
+            ),
+        );
+        return Err("permission denied: actor is not a moderator/admin/owner".to_string());
+    }
+    let actor_json = serde_json::json!({
+        "uuid7": user.uuid7,
+        "platform": actor_platform,
+        "handle": if actor_handle.is_empty() { user.username.as_str() } else { actor_handle },
+    })
+    .to_string();
+
+    // ── Target resolution (mirrors `mod_virtual_query`) ─────────────────
+    let explicit_uuid = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
+    let platform = payload
+        .get("platform")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let handle = payload.get("handle").and_then(|v| v.as_str()).unwrap_or("");
+    let target = if !explicit_uuid.is_empty() {
+        explicit_uuid.to_string()
+    } else if !platform.is_empty() && !handle.is_empty() {
+        let resolved = client.get_user("", platform, handle, handle).await?;
+        let Some(user) = resolved.user else {
+            return Err(format!("User '{}' not found on {}", handle, platform));
+        };
+        user.uuid7
+    } else {
+        return Err(format!("{} requires uuid7 or platform + handle", query_id));
+    };
+    Ok((target, actor_json))
+}
+
 async fn userdb_virtual_query(
     client: &SharedUserDbClient,
+    orchestrator: &crate::pipeline::PipelineOrchestrator,
     query_id: &str,
     sql: &str,
     ui_state: &Arc<Mutex<EngineState>>,
@@ -2070,6 +2162,61 @@ async fn userdb_virtual_query(
             let flag =
                 serde_json::json!({ "banned": true, "reason": reason, "at": now }).to_string();
             client.write_user_value(uuid7, "ban", &flag).await
+        }
+        "userdb_block" => {
+            // Global block: { platform?, handle?, uuid7?, reason, actor } → set
+            // the user's "blocked" flag. The actor must be mod/admin/owner.
+            let (target, actor_json) = match resolve_block_actor_and_target(
+                client, &payload, ui_state, requester, query_id,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => return (false, Vec::new(), e),
+            };
+            let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+            let resp = client.block_user(&target, reason, &actor_json).await;
+            // Keep the engine's unconditional block cache in step: index the
+            // blocked user's uuid7 + platform channels so their next message is
+            // dropped even if it is never enriched. Only a confirmed success is
+            // cached.
+            if let Ok(r) = &resp
+                && r.success
+            {
+                let channels = r
+                    .user
+                    .as_ref()
+                    .map(|u| u.channels.as_slice())
+                    .unwrap_or(&[]);
+                orchestrator.mark_user_blocked(&target, channels);
+            }
+            resp
+        }
+        "userdb_unblock" => {
+            // Global unblock: clears the user's "blocked" flag. Only an
+            // actor's mod/admin/owner role is required; the clearing actor is
+            // not recorded (the block is simply removed).
+            let (target, _actor_json) = match resolve_block_actor_and_target(
+                client, &payload, ui_state, requester, query_id,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => return (false, Vec::new(), e),
+            };
+            let resp = client.unblock_user(&target).await;
+            // Drop the user (and their platform aliases) from the cache.
+            if let Ok(r) = &resp
+                && r.success
+            {
+                let channels = r
+                    .user
+                    .as_ref()
+                    .map(|u| u.channels.as_slice())
+                    .unwrap_or(&[]);
+                orchestrator.mark_user_unblocked(&target, channels);
+            }
+            resp
         }
         "userdb_timeout" => {
             // { uuid7, duration_secs, reason? } → set timeout value with expiry
@@ -3372,6 +3519,12 @@ mod tests {
             ("userdb_get_user", NORMAL, false),
             ("userdb_ban", TUI, true),
             ("userdb_ban", NORMAL, false),
+            // ── userdb_block / userdb_unblock: the userdb family gate (TUI
+            // only); the handler additionally requires a mod/admin/owner actor.
+            ("userdb_block", TUI, true),
+            ("userdb_block", NORMAL, false),
+            ("userdb_unblock", TUI, true),
+            ("userdb_unblock", NORMAL, false),
             // ── userdb_merge_users rides the userdb family gate (TUI only):
             // it is the temporary write_user_value bridge, so it must stay on
             // the same control-surface-only path as every other mutation.
@@ -3623,6 +3776,8 @@ mod tests {
         ("userdb_ban", QueryRoute::UserdbFamily),
         ("userdb_timeout", QueryRoute::UserdbFamily),
         ("userdb_merge_users", QueryRoute::UserdbFamily),
+        ("userdb_block", QueryRoute::UserdbFamily),
+        ("userdb_unblock", QueryRoute::UserdbFamily),
         // Predictions read surface.
         ("prediction_get_score", QueryRoute::PredictionGetScore),
         // One-shot timeline aggregates (control surface).

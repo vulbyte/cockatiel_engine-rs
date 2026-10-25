@@ -588,3 +588,235 @@ async fn attached_command_still_routes_with_the_command_attached() {
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v["pipeline_status"], "complete");
 }
+
+// ───────────────────────── global block enforcement ─────────────────────────
+
+/// A chat message whose enriched `user_data` carries one active ban, and
+/// optionally a parsed command.
+fn banned_chat(raw: &str, command_name: Option<&str>) -> ChatMessage {
+    let mut c = chat(raw);
+    c.user_data = Some(crate::cockatiel_protobuf::UserData {
+        uuid: "u-1".to_string(),
+        username: "blocked_user".to_string(),
+        bans: vec![crate::cockatiel_protobuf::Ban {
+            commender_uuid7: "mod-1".to_string(),
+            commendee_uuid7: "u-1".to_string(),
+            unbanned: false,
+            reason: "spam".to_string(),
+            raw_message: String::new(),
+            appeals: Vec::new(),
+        }],
+        ..Default::default()
+    });
+    c.command = command_name.map(|n| Command {
+        command_name: n.to_string(),
+        command_flag: "!".to_string(),
+        command_description: String::new(),
+        command_flags: vec![],
+    });
+    c
+}
+
+/// An orchestrator with a connected catch-all `watcher` so a message that is
+/// NOT dropped would be broadcast to it.
+async fn enforcement_orchestrator(
+) -> (PipelineOrchestrator, tokio::sync::mpsc::Receiver<ContainerForModule>) {
+    let db = test_db().await;
+    let cfg = PipelineConfig {
+        pre_process_modules: names(&["watcher"]),
+        ..PipelineConfig::default()
+    };
+    let registry = Arc::new(Mutex::new(registry_with_commands()));
+    registry.lock().unwrap().register(
+        "watcher",
+        Commands {
+            commands: vec![],
+            alert_on_unknown_command: false,
+        },
+    );
+    let orchestrator = test_orchestrator(db, cfg, &registry).await;
+    let rx = connect_pre_process(&orchestrator, "watcher").await;
+    (orchestrator, rx)
+}
+
+/// A blocked user's (non-appeal) message is dropped: it never reaches the
+/// pipeline or any module.
+#[tokio::test]
+async fn blocked_user_message_is_dropped_before_the_pipeline() {
+    let (orchestrator, mut rx) = enforcement_orchestrator().await;
+    assert!(
+        orchestrator
+            .handle_message_from_module(&adapter_container(banned_chat("hello", None)))
+            .await
+            .unwrap()
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "a blocked user's message must not be broadcast to any module"
+    );
+}
+
+/// A blocked user's `!appeal` is allowed through (the block module owns it).
+#[tokio::test]
+async fn blocked_user_appeal_is_allowed_through() {
+    let (orchestrator, mut rx) = enforcement_orchestrator().await;
+    assert!(
+        orchestrator
+            .handle_message_from_module(&adapter_container(banned_chat(
+                "!appeal sorry",
+                Some("appeal")
+            )))
+            .await
+            .unwrap()
+    );
+    let broadcast = recv_broadcast(&mut rx).await;
+    let Some(ModulePayload::MessagePreProcess(bcast)) = broadcast.payload else {
+        panic!("expected a pre-process broadcast");
+    };
+    let seen = bcast
+        .raw_message
+        .expect("the appeal must be routed onward with its command");
+    assert_eq!(seen.command.unwrap().command_name, "appeal");
+}
+
+/// A ban entry marked `unbanned` does not block the user.
+#[tokio::test]
+async fn unbanned_entry_does_not_block_the_message() {
+    let (orchestrator, mut rx) = enforcement_orchestrator().await;
+    let mut c = banned_chat("hello", None);
+    c.user_data.as_mut().unwrap().bans[0].unbanned = true;
+    assert!(
+        orchestrator
+            .handle_message_from_module(&adapter_container(c))
+            .await
+            .unwrap()
+    );
+    // Not dropped: the catch-all receives it.
+    let _ = recv_broadcast(&mut rx).await;
+}
+
+/// `bans_from_flags` turns a `"blocked"` flag into one active ban and ignores
+/// everything else.
+#[test]
+fn bans_from_flags_reads_the_blocked_key() {
+    let flags = r#"{"theme":"dark","blocked":{"reason":"spam","at":1,"by":{"uuid7":"mod-1","handle":"mod"}}}"#;
+    let bans = crate::bans_from_flags("u-1", flags);
+    assert_eq!(bans.len(), 1);
+    assert!(!bans[0].unbanned);
+    assert_eq!(bans[0].commendee_uuid7, "u-1");
+    assert_eq!(bans[0].commender_uuid7, "mod-1");
+    assert_eq!(bans[0].reason, "spam");
+
+    assert!(crate::bans_from_flags("u-1", "{}").is_empty());
+    assert!(crate::bans_from_flags("u-1", "not json").is_empty());
+    assert!(crate::bans_from_flags("u-1", "[1,2,3]").is_empty());
+
+    // A bare-string actor is used as-is.
+    let bans = crate::bans_from_flags("u-1", r#"{"blocked":{"reason":"r","by":"mod-2"}}"#);
+    assert_eq!(bans[0].commender_uuid7, "mod-2");
+}
+
+// ─────────────── the engine-side cache closes the un-enriched gap ───────────
+
+/// One of a blocked user's platform channels, used to seed the cache.
+fn blocked_channel() -> crate::cockatiel_protobuf::ChannelRef {
+    crate::cockatiel_protobuf::ChannelRef {
+        platform: "twitch".to_string(),
+        channel_id: "some_chatter".to_string(),
+        handle: "some_chatter".to_string(),
+    }
+}
+
+/// THE gap this cache exists for: a plain message from a blocked user is
+/// dropped even when it was never enriched (`user_data == None`), because the
+/// message carries only the raw adapter identity. The check matches the cached
+/// `platform`+identifier alias, not just a uuid7.
+#[tokio::test]
+async fn cached_blocked_user_plain_message_is_dropped_without_enrichment() {
+    let (orchestrator, mut rx) = enforcement_orchestrator().await;
+    orchestrator.mark_user_blocked("0198aabb-0000-7000-8000-0000000000bb", &[blocked_channel()]);
+
+    // `chat()` sends a platform handle, and `user_data` is None (no enrich).
+    let mut c = chat("hello");
+    c.user_data = None;
+    assert!(
+        orchestrator
+            .handle_message_from_module(&adapter_container(c))
+            .await
+            .unwrap()
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "a cached-blocked user's un-enriched message must not be broadcast"
+    );
+}
+
+/// A cached-blocked user's `!appeal` still reaches the block module.
+#[tokio::test]
+async fn cached_blocked_user_appeal_is_allowed_through() {
+    let (orchestrator, mut rx) = enforcement_orchestrator().await;
+    orchestrator.mark_user_blocked("0198aabb-0000-7000-8000-0000000000bb", &[blocked_channel()]);
+
+    let mut c = chat("!appeal sorry");
+    c.user_data = None;
+    c.command = Some(Command {
+        command_name: "appeal".to_string(),
+        command_flag: "!".to_string(),
+        command_description: String::new(),
+        command_flags: vec![],
+    });
+    assert!(
+        orchestrator
+            .handle_message_from_module(&adapter_container(c))
+            .await
+            .unwrap()
+    );
+    let broadcast = recv_broadcast(&mut rx).await;
+    let Some(ModulePayload::MessagePreProcess(bcast)) = broadcast.payload else {
+        panic!("expected a pre-process broadcast");
+    };
+    assert_eq!(
+        bcast.raw_message.unwrap().command.unwrap().command_name,
+        "appeal"
+    );
+}
+
+/// Unblocking removes the user's identities from the cache, so their plain
+/// message flows again.
+#[tokio::test]
+async fn unblocking_lets_the_message_through_again() {
+    let (orchestrator, mut rx) = enforcement_orchestrator().await;
+    let uuid = "0198aabb-0000-7000-8000-0000000000bb";
+    orchestrator.mark_user_blocked(uuid, &[blocked_channel()]);
+    orchestrator.mark_user_unblocked(uuid, &[blocked_channel()]);
+
+    let mut c = chat("hello");
+    c.user_data = None;
+    assert!(
+        orchestrator
+            .handle_message_from_module(&adapter_container(c))
+            .await
+            .unwrap()
+    );
+    // Not dropped: the catch-all receives it.
+    let _ = recv_broadcast(&mut rx).await;
+}
+
+/// An empty identifier (a system/adapter message with no user identity) is
+/// never blocked, and an unknown identity does not match.
+#[tokio::test]
+async fn empty_and_unknown_identifiers_are_not_blocked() {
+    let db = test_db().await;
+    let registry = Arc::new(Mutex::new(CommandRegistry::default()));
+    let orchestrator = test_orchestrator(db, PipelineConfig::default(), &registry).await;
+    orchestrator.mark_user_blocked("blocked-uuid", &[blocked_channel()]);
+
+    assert!(!orchestrator.is_identifier_blocked("twitch", ""));
+    assert!(!orchestrator.is_identifier_blocked("twitch", "   "));
+    assert!(!orchestrator.is_identifier_blocked("twitch", "someone_else"));
+    // The cached uuid7 and the cached channel alias both match; a DIFFERENT
+    // platform with the same handle does not.
+    assert!(orchestrator.is_identifier_blocked("twitch", "blocked-uuid"));
+    assert!(orchestrator.is_identifier_blocked("twitch", "some_chatter"));
+    assert!(!orchestrator.is_identifier_blocked("kick", "some_chatter"));
+}

@@ -781,6 +781,15 @@ pub struct PipelineOrchestrator {
     /// the connection handler (stream open/close + score scaling) and enriched
     /// onto outgoing `css_properties`.
     pub stream_tracker: SharedStreamTracker,
+    /// Cached identities of globally-blocked users: each blocked user's uuid7
+    /// plus every `platform\0handle` / `platform\0channel_id` alias from their
+    /// channels. This is the cheap, unconditional gate for the new-message arm:
+    /// `UserData.bans` is only populated when a message is enriched (a display
+    /// or catch-all is connected, or it carries a command), so without this a
+    /// blocked user's plain message slips through when nothing is enriched.
+    /// Loaded once at startup from the user-db and kept in sync by the
+    /// `userdb_block` / `userdb_unblock` handlers.
+    pub blocked_users: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl PipelineOrchestrator {
@@ -803,6 +812,7 @@ impl PipelineOrchestrator {
             module_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
             user_db: None,
             stream_tracker: Arc::new(std::sync::Mutex::new(StreamTracker::new())),
+            blocked_users: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -810,6 +820,71 @@ impl PipelineOrchestrator {
     /// manifests.
     pub fn set_module_gates(&self, gates: HashMap<String, ModuleGate>) {
         *self.module_gates.lock().unwrap() = gates;
+    }
+
+    /// The alias key under which a blocked user's platform channel is indexed,
+    /// so an un-enriched adapter message — which carries a platform login in
+    /// `user_uuid7`, not the canonical uuid7 — can still be matched against the
+    /// block cache. The NUL separator cannot appear in a platform name or a
+    /// handle/channel id, so the key is unambiguous.
+    pub fn blocked_alias_key(platform: &str, identifier: &str) -> String {
+        format!("{}\u{0}{}", platform, identifier)
+    }
+
+    /// Whether the sender is globally blocked, before any enrichment.
+    ///
+    /// `identifier` is whatever the adapter put in `user_uuid7`: the canonical
+    /// uuid7 once the message has been enriched, or the raw platform
+    /// login/channel id before it has. Both the uuid7 and the
+    /// `platform`+identifier alias are checked. An empty identifier (a
+    /// system/adapter message with no user identity) is never treated as
+    /// blocked.
+    pub fn is_identifier_blocked(&self, platform: &str, identifier: &str) -> bool {
+        let id = identifier.trim();
+        if id.is_empty() {
+            return false;
+        }
+        let cache = self.blocked_users.lock().unwrap();
+        cache.contains(id) || cache.contains(&Self::blocked_alias_key(platform, id))
+    }
+
+    /// Add a user's uuid7 and every one of their platform channels to the block
+    /// cache (called on `userdb_block`).
+    pub fn mark_user_blocked(&self, uuid7: &str, channels: &[cockatiel_protobuf::ChannelRef]) {
+        if uuid7.trim().is_empty() {
+            return;
+        }
+        let mut cache = self.blocked_users.lock().unwrap();
+        cache.insert(uuid7.to_string());
+        for ch in channels {
+            if !ch.channel_id.trim().is_empty() {
+                cache.insert(Self::blocked_alias_key(&ch.platform, &ch.channel_id));
+            }
+            if !ch.handle.trim().is_empty() {
+                cache.insert(Self::blocked_alias_key(&ch.platform, &ch.handle));
+            }
+        }
+    }
+
+    /// Remove a user's uuid7 and platform channels from the block cache (called
+    /// on `userdb_unblock`).
+    pub fn mark_user_unblocked(&self, uuid7: &str, channels: &[cockatiel_protobuf::ChannelRef]) {
+        let mut cache = self.blocked_users.lock().unwrap();
+        cache.remove(uuid7);
+        for ch in channels {
+            cache.remove(&Self::blocked_alias_key(&ch.platform, &ch.channel_id));
+            cache.remove(&Self::blocked_alias_key(&ch.platform, &ch.handle));
+        }
+    }
+
+    /// Replace the whole block cache (used by the one-time startup load).
+    pub fn replace_blocked_users(&self, entries: HashSet<String>) {
+        *self.blocked_users.lock().unwrap() = entries;
+    }
+
+    /// Number of entries (uuid7s + aliases) currently in the block cache.
+    pub fn blocked_cache_len(&self) -> usize {
+        self.blocked_users.lock().unwrap().len()
     }
 
     /// Whether `module_name` is permitted to receive a message for `user_uuid7`
@@ -2240,6 +2315,36 @@ impl PipelineOrchestrator {
                         // donation's facts land on the row's `flags` column and
                         // the raw bytes are carried forward to every stage.
                         let donation = DonationInfo::parse(&chat.raw_data);
+                        // Global block enforcement: a user with an active ban
+                        // (any `bans` entry not yet unbanned) is dropped before
+                        // the pipeline ever starts — UNLESS the message invokes
+                        // `appeal`, which must reach the block module so a
+                        // blocked user can contest the block. The row has not
+                        // been inserted yet (that is `insert_and_start`), so
+                        // there is nothing to `mark_dropped`; we return without
+                        // creating it.
+                        //
+                        // The `bans` check only fires for an ENRICHED message.
+                        // The block cache is the unconditional gate: it is keyed
+                        // by uuid7 AND by `platform`+the raw adapter identity,
+                        // so a blocked user's plain message is dropped even when
+                        // nothing fetched their user data (no display/catch-all
+                        // connected). Both checks are kept.
+                        let has_active_ban = chat
+                            .user_data
+                            .as_ref()
+                            .map(|ud| ud.bans.iter().any(|b| !b.unbanned))
+                            .unwrap_or(false);
+                        let is_appeal = chat
+                            .command
+                            .as_ref()
+                            .map(|c| c.command_name == "appeal")
+                            .unwrap_or(false);
+                        let cached_block =
+                            self.is_identifier_blocked(&chat.platform, &chat.user_uuid7);
+                        if (has_active_ban || cached_block) && !is_appeal {
+                            return Ok(true);
+                        }
                         let msg_in = PipelineMessage {
                             uuid7: uuid7_string().unwrap_or_default(),
                             platform: chat.platform.clone(),
