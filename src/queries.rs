@@ -384,8 +384,20 @@ pub(crate) enum QueryRoute {
     /// An adapter's report of applying a `stream_control` revision. Restricted
     /// to the platform adapters.
     StreamControlStatus,
+    /// Global block / unblock (`userdb_block`, `userdb_unblock`). Open to any
+    /// authenticated module at the dispatcher; the handler
+    /// (`resolve_block_actor_and_target`) enforces that the *actor* named in
+    /// the payload is a mod/admin/owner. Same "gated in the handler" shape as
+    /// the `mod_*` family.
+    UserdbBlock,
+    /// A chat module's report of the bans it currently holds
+    /// (`module_bans_report`). The engine merges each reported identity into the
+    /// module-ban cache, so a ban manually added/removed in a module's
+    /// `bans.json` is picked up on the next refresh. Open to every authenticated
+    /// module: a module reports only its OWN bans and the engine aggregates.
+    ModuleBansReport,
     /// Any `userdb_`-prefixed query_id, after the exact `userdb_adjust_score`
-    /// match above has had its chance.
+    /// and `userdb_block`/`userdb_unblock` matches above have had their chance.
     UserdbFamily,
     SetCredentials,
     TestArchive,
@@ -437,6 +449,12 @@ pub(crate) fn classify_query(query_id: &str) -> QueryRoute {
         "chat_reply" => QueryRoute::ChatReply,
         // Must precede the `userdb_` prefix test below — see the doc comment.
         "userdb_adjust_score" => QueryRoute::UserdbAdjustScore,
+        // Also must precede the `userdb_` prefix test: block/unblock are the
+        // one slice of the userdb family a normal module may call, with the
+        // actor gate applied inside the handler.
+        "userdb_block" | "userdb_unblock" => QueryRoute::UserdbBlock,
+        // A module's report of its own bans — merged into the engine cache.
+        "module_bans_report" => QueryRoute::ModuleBansReport,
         _ if query_id.starts_with("userdb_") => QueryRoute::UserdbFamily,
         "prediction_get_score" => QueryRoute::PredictionGetScore,
         "channel_viewers" => QueryRoute::ChannelViewers,
@@ -518,6 +536,15 @@ pub(crate) fn caller_gate(route: QueryRoute, caller: &str) -> Option<&'static st
             .then_some("chat_reply denied: not the clip module or the TUI"),
         QueryRoute::PredictionGetScore => (!is_control_surface(caller) && caller != "events")
             .then_some("prediction_get_score denied: not the events module"),
+        // Block / unblock are the one slice of the userdb family a normal
+        // module may call: admitted here, with the actor named in the payload
+        // required to be mod/admin/owner inside the handler (exactly the
+        // "gated in the handler, not here" shape of the `mod_*` family).
+        QueryRoute::UserdbBlock => None,
+        // Any authenticated module may report its own bans; the engine just
+        // aggregates them. There is no cross-module privilege to protect — a
+        // module that lies about its bans only affects its own scope.
+        QueryRoute::ModuleBansReport => None,
         QueryRoute::UserdbFamily => {
             (!is_control_surface(caller)).then_some("User database access denied: not the TUI")
         }
@@ -1340,6 +1367,34 @@ async fn dispatch(
             // A platform adapter reports the result of applying a revision.
             stream_control_status_write(ctx.stream_schedule, sql)
         }
+        QueryRoute::UserdbBlock => {
+            // Global block / unblock. Any authenticated module reaches the
+            // handler; `userdb_virtual_query` → `resolve_block_actor_and_target`
+            // verifies the payload's actor holds a mod/admin/owner role.
+            userdb_virtual_query(
+                user_db_client,
+                orchestrator,
+                query_id,
+                sql,
+                ui_state,
+                module_name,
+                *peer_loopback,
+            )
+            .await
+            .into()
+        }
+        QueryRoute::ModuleBansReport => {
+            // A chat module's current bans. Replace that module's slice of the
+            // aggregate cache; an empty report clears it. A malformed blob is a
+            // request error, never a panic.
+            match parse_module_bans_report(sql) {
+                Ok(keys) => {
+                    orchestrator.replace_module_bans(module_name, keys);
+                    QueryOutcome::success(Vec::new())
+                }
+                Err(e) => QueryOutcome::denied(e),
+            }
+        }
         QueryRoute::UserdbFamily => {
             // User database is engine-internal — only the TUI
             // control surface may access it. Modules are denied.
@@ -1808,6 +1863,14 @@ fn parse_split_channel_payload(
     ))
 }
 
+/// The block/unblock actor gate, as a pure predicate over a resolved user:
+/// only a moderator, admin, or owner may block or unblock anyone. Split out so
+/// the "a non-mod actor is rejected" rule is unit-testable without a live user
+/// DB.
+fn block_actor_has_authority(user: &crate::user_db_client::proto::User) -> bool {
+    user.is_moderator || user.is_admin || user.is_owner
+}
+
 /// Handle a `userdb_*` virtual query from the TUI. The SQL field carries a JSON
 /// payload specific to each operation. Only the engine's control surface (TUI)
 /// may reach the user database.
@@ -1863,7 +1926,7 @@ async fn resolve_block_actor_and_target(
         );
         return Err("permission denied: actor is not a moderator/admin/owner".to_string());
     };
-    if !(user.is_moderator || user.is_admin || user.is_owner) {
+    if !block_actor_has_authority(&user) {
         log_event(
             ui_state,
             format!(
@@ -1899,6 +1962,33 @@ async fn resolve_block_actor_and_target(
         return Err(format!("{} requires uuid7 or platform + handle", query_id));
     };
     Ok((target, actor_json))
+}
+
+/// Parse a module's `module_bans_report` payload into the set of banned
+/// identities. The wire shape is `{"bans": ["id", ...]}`; a bare JSON array is
+/// also accepted so a module need not wrap it. Blank identities are dropped.
+/// Anything else is an error the caller is told about (never a panic).
+fn parse_module_bans_report(sql: &str) -> Result<std::collections::HashSet<String>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(sql).map_err(|e| format!("Invalid module bans payload: {}", e))?;
+    let list = match &value {
+        serde_json::Value::Object(map) => map
+            .get("bans")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "module bans payload requires a `bans` array".to_string())?,
+        serde_json::Value::Array(items) => items,
+        _ => return Err("module bans payload must be an object or an array".to_string()),
+    };
+    let mut keys = std::collections::HashSet::new();
+    for item in list {
+        if let Some(id) = item.as_str() {
+            let id = id.trim();
+            if !id.is_empty() {
+                keys.insert(id.to_string());
+            }
+        }
+    }
+    Ok(keys)
 }
 
 async fn userdb_virtual_query(
@@ -3519,12 +3609,14 @@ mod tests {
             ("userdb_get_user", NORMAL, false),
             ("userdb_ban", TUI, true),
             ("userdb_ban", NORMAL, false),
-            // ── userdb_block / userdb_unblock: the userdb family gate (TUI
-            // only); the handler additionally requires a mod/admin/owner actor.
+            // ── userdb_block / userdb_unblock: open at the dispatcher to any
+            // authenticated module (the block module issues them); the handler
+            // requires the payload's *actor* to be mod/admin/owner, so the
+            // effective gate is the actor role, not the caller.
             ("userdb_block", TUI, true),
-            ("userdb_block", NORMAL, false),
+            ("userdb_block", NORMAL, true),
             ("userdb_unblock", TUI, true),
-            ("userdb_unblock", NORMAL, false),
+            ("userdb_unblock", NORMAL, true),
             // ── userdb_merge_users rides the userdb family gate (TUI only):
             // it is the temporary write_user_value bridge, so it must stay on
             // the same control-surface-only path as every other mutation.
@@ -3598,6 +3690,40 @@ mod tests {
                 allows(query_id, caller)
             );
         }
+    }
+
+    #[test]
+    fn block_and_unblock_admit_normal_callers_at_the_dispatcher_gate() {
+        // The block module is an ordinary adapter (NORMAL): it must reach the
+        // handler, which is where the mod/admin/owner actor check lives.
+        assert!(allows("userdb_block", NORMAL));
+        assert!(allows("userdb_unblock", NORMAL));
+        // The control surface keeps its access too.
+        assert!(allows("userdb_block", TUI));
+        assert!(allows("userdb_unblock", TUI_CHILD));
+        // They route to the dedicated block route, not the TUI-only family.
+        assert_eq!(classify_query("userdb_block"), QueryRoute::UserdbBlock);
+        assert_eq!(classify_query("userdb_unblock"), QueryRoute::UserdbBlock);
+    }
+
+    #[test]
+    fn block_actor_gate_rejects_non_mods() {
+        use crate::user_db_client::proto::User;
+        // A plain member (no roles) is denied.
+        assert!(!block_actor_has_authority(&User::default()));
+        // Any one of mod/admin/owner admits.
+        assert!(block_actor_has_authority(&User {
+            is_moderator: true,
+            ..Default::default()
+        }));
+        assert!(block_actor_has_authority(&User {
+            is_admin: true,
+            ..Default::default()
+        }));
+        assert!(block_actor_has_authority(&User {
+            is_owner: true,
+            ..Default::default()
+        }));
     }
 
     #[test]
@@ -3776,8 +3902,10 @@ mod tests {
         ("userdb_ban", QueryRoute::UserdbFamily),
         ("userdb_timeout", QueryRoute::UserdbFamily),
         ("userdb_merge_users", QueryRoute::UserdbFamily),
-        ("userdb_block", QueryRoute::UserdbFamily),
-        ("userdb_unblock", QueryRoute::UserdbFamily),
+        ("userdb_block", QueryRoute::UserdbBlock),
+        ("userdb_unblock", QueryRoute::UserdbBlock),
+        // A module's own-ban report (any authenticated module).
+        ("module_bans_report", QueryRoute::ModuleBansReport),
         // Predictions read surface.
         ("prediction_get_score", QueryRoute::PredictionGetScore),
         // One-shot timeline aggregates (control surface).

@@ -131,6 +131,18 @@ pub struct Config {
     /// instead of dropping query responses. Defaults to 256.
     #[serde(default = "default_module_outbound_channel_capacity")]
     pub module_outbound_channel_capacity: usize,
+
+    /// Whether the engine periodically asks each chat module for the bans it
+    /// currently holds (`bans.json`) and aggregates them with the global block
+    /// list. Defaults to true.
+    #[serde(default = "default_module_bans_enabled")]
+    pub module_bans_enabled: bool,
+
+    /// Seconds between per-module ban refreshes. A refresh asks every chat
+    /// module to report its current bans, so hand edits to a module's
+    /// `bans.json` are picked up. Defaults to 60; 0 falls back to the default.
+    #[serde(default = "default_module_bans_refresh_secs")]
+    pub module_bans_refresh_secs: u32,
 }
 
 fn default_probe_interval_secs() -> u32 {
@@ -212,6 +224,14 @@ fn default_timeline_keep_noise_rows() -> u32 {
 
 fn default_module_outbound_channel_capacity() -> usize {
     256
+}
+
+fn default_module_bans_enabled() -> bool {
+    true
+}
+
+fn default_module_bans_refresh_secs() -> u32 {
+    60
 }
 
 /// Should the engine boot with the message pipeline held?
@@ -426,7 +446,7 @@ pub fn backfill_config_defaults(state: &Arc<Mutex<ConfigState>>) {
     };
 
     let mut changed = false;
-    let defaults: [(&str, serde_json::Value); 11] = [
+    let defaults: [(&str, serde_json::Value); 13] = [
         (
             "max_message_bytes",
             serde_json::json!(default_max_message_bytes()),
@@ -467,6 +487,14 @@ pub fn backfill_config_defaults(state: &Arc<Mutex<ConfigState>>) {
         (
             "timeline_integrity_check_min_mb",
             serde_json::json!(default_timeline_integrity_check_min_mb()),
+        ),
+        (
+            "module_bans_enabled",
+            serde_json::json!(default_module_bans_enabled()),
+        ),
+        (
+            "module_bans_refresh_secs",
+            serde_json::json!(default_module_bans_refresh_secs()),
         ),
     ];
     for (key, value) in defaults {
@@ -574,7 +602,9 @@ const CONFIG_TEMPLATE: &str = r#"{
     "timeline_integrity_check_on_backup": true,
     "timeline_integrity_check_min_mb": 5,
     "log_min_severity": 0.3,
-    "timeline_keep_noise_rows": 1000
+    "timeline_keep_noise_rows": 1000,
+    "module_bans_enabled": true,
+    "module_bans_refresh_secs": 60
 }"#;
 
 pub fn create_config(directory: PathBuf) -> Result<String, String> {

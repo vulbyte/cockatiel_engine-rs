@@ -20,6 +20,19 @@ pub struct ModuleCommandReg {
     pub alert_on_unknown: bool,
 }
 
+/// A `(flag, command_name)` pair claimed by more than one module. Registration
+/// is last-writer-wins; this surfaces the overwrite so a collision is visible
+/// (and fixable) instead of being silently resolved by registration order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandCollision {
+    pub flag: String,
+    pub name: String,
+    /// The module that previously owned the pair (now shadowed).
+    pub existing_owner: String,
+    /// The module whose registration overwrote it.
+    pub new_owner: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CommandRegistry {
     /// (flag, command_name) -> module that subscribed to it.
@@ -31,20 +44,34 @@ pub struct CommandRegistry {
 impl CommandRegistry {
     /// (Re)register a module's command set. Replaces any prior registration
     /// for the same module.
-    pub fn register(&mut self, module: &str, commands: Commands) {
+    ///
+    /// Returns any `(flag, command_name)` pairs this registration claimed from a
+    /// DIFFERENT module (last-writer-wins overwrites). The caller should log
+    /// these as warnings so collisions are visible rather than silent.
+    pub fn register(&mut self, module: &str, commands: Commands) -> Vec<CommandCollision> {
         self.index.retain(|_, owner| owner != module);
         let reg = ModuleCommandReg {
             commands: commands.commands.clone(),
             catch_all: commands.commands.is_empty(),
             alert_on_unknown: commands.alert_on_unknown_command,
         };
+        let mut collisions = Vec::new();
         for cmd in &reg.commands {
-            self.index.insert(
-                (cmd.command_flag.clone(), cmd.command_name.clone()),
-                module.to_string(),
-            );
+            let key = (cmd.command_flag.clone(), cmd.command_name.clone());
+            if let Some(existing_owner) = self.index.get(&key)
+                && existing_owner != module
+            {
+                collisions.push(CommandCollision {
+                    flag: cmd.command_flag.clone(),
+                    name: cmd.command_name.clone(),
+                    existing_owner: existing_owner.clone(),
+                    new_owner: module.to_string(),
+                });
+            }
+            self.index.insert(key, module.to_string());
         }
         self.modules.insert(module.to_string(), reg);
+        collisions
     }
 
     /// The module subscribed to a specific (flag, command). None if unregistered.

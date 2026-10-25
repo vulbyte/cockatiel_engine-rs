@@ -781,6 +781,60 @@ async fn cached_blocked_user_appeal_is_allowed_through() {
     );
 }
 
+/// A user banned by a MODULE (not globally) is dropped at entry. The module-ban
+/// cache is aggregated separately from the global block cache, so a global
+/// unblock can never clear it, and an empty report clears only that module.
+#[tokio::test]
+async fn module_banned_user_message_is_dropped() {
+    let (orchestrator, mut rx) = enforcement_orchestrator().await;
+    let mut keys = std::collections::HashSet::new();
+    keys.insert("some_chatter".to_string());
+    orchestrator.replace_module_bans("rp", keys);
+
+    // The gate matches the raw adapter identity, so an UN-ENRICHED message is
+    // dropped (user_data == None).
+    let mut c = chat("hello");
+    c.user_data = None;
+    assert!(
+        orchestrator
+            .handle_message_from_module(&adapter_container(c))
+            .await
+            .unwrap()
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "a module-banned user's message must not be broadcast"
+    );
+
+    // It is a MODULE ban, not a global one: the global cache is still empty.
+    assert!(orchestrator.is_identifier_blocked("twitch", "some_chatter"));
+    assert_eq!(orchestrator.module_bans_len(), 1);
+    assert_eq!(orchestrator.blocked_cache_len(), 0);
+
+    // A module reporting no bans clears its own contribution again.
+    orchestrator.replace_module_bans("rp", std::collections::HashSet::new());
+    assert!(!orchestrator.is_identifier_blocked("twitch", "some_chatter"));
+    assert_eq!(orchestrator.module_bans_len(), 0);
+}
+
+/// A module ban is also surfaced on the enrich path: `has_module_ban_for`
+/// matches the canonical uuid7 or any of the user's platform channels, so an
+/// enriched message is marked via `UserData.bans` even when the module reported
+/// a handle rather than the uuid7.
+#[tokio::test]
+async fn module_ban_matches_the_users_channels() {
+    let db = test_db().await;
+    let registry = Arc::new(Mutex::new(CommandRegistry::default()));
+    let orchestrator = test_orchestrator(db, PipelineConfig::default(), &registry).await;
+
+    let mut keys = std::collections::HashSet::new();
+    keys.insert("some_chatter".to_string());
+    orchestrator.replace_module_bans("rp", keys);
+
+    assert!(orchestrator.has_module_ban_for("canonical-uuid", &[blocked_channel()]));
+    assert!(!orchestrator.has_module_ban_for("someone_else", &[]));
+}
+
 /// Unblocking removes the user's identities from the cache, so their plain
 /// message flows again.
 #[tokio::test]

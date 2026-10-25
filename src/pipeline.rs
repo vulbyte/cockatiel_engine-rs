@@ -95,6 +95,13 @@ pub(crate) enum SendOutcome {
     Dropped,
 }
 
+/// The `query_id` the engine sends a chat module (as a legacy
+/// `DatabaseQueryResult` push) to ask for the bans it currently holds. The
+/// module answers with a `module_bans_report` `DatabaseQuery`. These two strings
+/// are the whole engine↔module bans protocol, so no proto change / crate
+/// republish is needed.
+pub const MODULE_BANS_QUERY: &str = "module_bans_query";
+
 /// Bounded, non-wedging send to a connected module. Clones the sender out of
 /// the shared `module_senders` lock (so the lock is never held across the
 /// send), `try_send`s first, and only falls back to a short timeout send when
@@ -790,6 +797,15 @@ pub struct PipelineOrchestrator {
     /// Loaded once at startup from the user-db and kept in sync by the
     /// `userdb_block` / `userdb_unblock` handlers.
     pub blocked_users: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Per-module ban caches: module name -> the set of identities that module
+    /// currently holds a ban for. A module REPLACES its own set on every report
+    /// (a `module_bans_report` query), so a ban added or removed by hand in the
+    /// module's `bans.json` is picked up on the next refresh. Kept SEPARATE from
+    /// `blocked_users` so a global `userdb_unblock` cannot clear a module ban
+    /// and a startup reload of the global blocks cannot wipe the module bans.
+    /// The effective gate is global OR any module (see
+    /// [`is_identifier_blocked`](Self::is_identifier_blocked)).
+    pub module_bans: Arc<std::sync::Mutex<HashMap<String, HashSet<String>>>>,
 }
 
 impl PipelineOrchestrator {
@@ -813,6 +829,7 @@ impl PipelineOrchestrator {
             user_db: None,
             stream_tracker: Arc::new(std::sync::Mutex::new(StreamTracker::new())),
             blocked_users: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            module_bans: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -845,7 +862,11 @@ impl PipelineOrchestrator {
             return false;
         }
         let cache = self.blocked_users.lock().unwrap();
-        cache.contains(id) || cache.contains(&Self::blocked_alias_key(platform, id))
+        if cache.contains(id) || cache.contains(&Self::blocked_alias_key(platform, id)) {
+            return true;
+        }
+        drop(cache);
+        self.is_module_banned(platform, id)
     }
 
     /// Add a user's uuid7 and every one of their platform channels to the block
@@ -885,6 +906,61 @@ impl PipelineOrchestrator {
     /// Number of entries (uuid7s + aliases) currently in the block cache.
     pub fn blocked_cache_len(&self) -> usize {
         self.blocked_users.lock().unwrap().len()
+    }
+
+    /// Replace one module's ban set with the identities from its latest report.
+    /// An empty set removes the module's entry entirely, so a module that has
+    /// cleared its `bans.json` stops contributing to the aggregate. Called by
+    /// the `module_bans_report` query handler on every report.
+    pub fn replace_module_bans(&self, module: &str, keys: HashSet<String>) {
+        let mut map = self.module_bans.lock().unwrap();
+        if keys.is_empty() {
+            map.remove(module);
+        } else {
+            map.insert(module.to_string(), keys);
+        }
+    }
+
+    /// Whether any module currently holds a ban matching `identifier` on
+    /// `platform`. Both the bare identity and the `platform`+identifier alias
+    /// are checked, matching how `blocked_users` is keyed — a module may report
+    /// a raw handle (matched directly) or a platform-scoped one (matched by
+    /// alias).
+    pub fn is_module_banned(&self, platform: &str, identifier: &str) -> bool {
+        let id = identifier.trim();
+        if id.is_empty() {
+            return false;
+        }
+        let alias = Self::blocked_alias_key(platform, id);
+        self.module_bans
+            .lock()
+            .unwrap()
+            .values()
+            .any(|set| set.contains(id) || set.contains(&alias))
+    }
+
+    /// Whether a user (by canonical uuid7) or any of their known platform
+    /// channels is module-banned. Used by the enrich path to append a synthetic
+    /// `Ban` to `UserData.bans`, so an ENRICHED message from a module-banned
+    /// user is still dropped even when the module reported a different identity
+    /// form (e.g. a platform handle rather than the canonical uuid7).
+    pub fn has_module_ban_for(
+        &self,
+        uuid7: &str,
+        channels: &[cockatiel_protobuf::ChannelRef],
+    ) -> bool {
+        if self.is_module_banned("", uuid7) {
+            return true;
+        }
+        channels.iter().any(|ch| {
+            self.is_module_banned(&ch.platform, &ch.channel_id)
+                || self.is_module_banned(&ch.platform, &ch.handle)
+        })
+    }
+
+    /// Number of modules currently contributing a ban set (for logs).
+    pub fn module_bans_len(&self) -> usize {
+        self.module_bans.lock().unwrap().len()
     }
 
     /// Whether `module_name` is permitted to receive a message for `user_uuid7`
@@ -1941,7 +2017,7 @@ impl PipelineOrchestrator {
             raw_data,
             ..Default::default()
         };
-        crate::enrich_chat_user(client, &self.stream_tracker, &mut chat).await;
+        crate::enrich_chat_user(client, &self.stream_tracker, self, &mut chat).await;
         if chat.user_data.is_some() {
             let mut states = self.pipeline_states.lock().await;
             if let Some(state) = states.get_mut(uuid7) {

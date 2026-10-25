@@ -786,6 +786,7 @@ async fn load_blocked_users(
 pub async fn enrich_chat_user(
     client: &SharedUserDbClient,
     stream_tracker: &SharedStreamTracker,
+    orchestrator: &crate::pipeline::PipelineOrchestrator,
     chat: &mut cockatiel_protobuf::ChatMessage,
 ) {
     if chat.user_uuid7.is_empty() {
@@ -890,7 +891,22 @@ pub async fn enrich_chat_user(
     let donation = crate::pipeline::DonationInfo::parse(&chat.raw_data);
     crate::pipeline::add_donation_css(&mut css, donation.as_ref());
 
-    let bans = bans_from_flags(&user.uuid7, &user.flags);
+    let mut bans = bans_from_flags(&user.uuid7, &user.flags);
+    // Aggregate in any PER-MODULE ban this user is subject to. The engine drops
+    // a message when `UserData.bans` carries an active entry, so a module ban
+    // must surface here too: the module may have reported a handle/id that only
+    // matches after enrichment (which replaces the adapter identity with the
+    // canonical uuid7). A synthetic ban with no commender records the reason.
+    if orchestrator.has_module_ban_for(&user.uuid7, &user.channels) {
+        bans.push(cockatiel_protobuf::Ban {
+            commender_uuid7: String::new(),
+            commendee_uuid7: user.uuid7.clone(),
+            unbanned: false,
+            reason: "banned by a module".to_string(),
+            raw_message: String::new(),
+            appeals: Vec::new(),
+        });
+    }
     chat.user_uuid7 = user.uuid7.clone();
     chat.user_data = Some(cockatiel_protobuf::UserData {
         uuid: user.uuid7,
@@ -1968,6 +1984,81 @@ cockatiel
                 }
                 prev = Some(up);
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        });
+    }
+
+    // Per-module bans refresh: periodically ask every chat module for the bans
+    // it currently holds, so bans manually added/removed in a module's
+    // `bans.json` are picked up and aggregated with the global block list. The
+    // reply is a `module_bans_report` `DatabaseQuery`, handled in `queries`.
+    // The first round runs shortly after boot (modules need a moment to
+    // connect); the interval is config-driven and can be disabled entirely.
+    {
+        let orchestrator = orchestrator.clone();
+        let config_state = Arc::clone(&config_state);
+        let ui_state = Arc::clone(&ui_state);
+        tokio::spawn(async move {
+            // Let modules finish connecting before the first ask.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let mut last_logged = usize::MAX;
+            loop {
+                let config = get_config(&config_state);
+                if !config.module_bans_enabled {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    continue;
+                }
+                let mut names: Vec<String> = Vec::new();
+                for entry in config
+                    .preprocess_modules
+                    .iter()
+                    .chain(config.inprocess_modules.iter())
+                    .chain(config.postprocess_modules.iter())
+                {
+                    if !names.contains(&entry.name) {
+                        names.push(entry.name.clone());
+                    }
+                }
+                let request = ContainerForModule {
+                    version: 2,
+                    auth_token: String::new(),
+                    module_instance_uuid7: String::new(),
+                    payload: Some(ModulePayload::DatabaseQueryResult(
+                        cockatiel_protobuf::DatabaseQueryResult {
+                            query_id: crate::pipeline::MODULE_BANS_QUERY.to_string(),
+                            success: true,
+                            error: String::new(),
+                            result_blob: Vec::new(),
+                        },
+                    )),
+                };
+                for name in &names {
+                    let _ = crate::pipeline::send_to_module(
+                        &orchestrator.module_senders,
+                        name,
+                        request.clone(),
+                        "module_bans_query",
+                    )
+                    .await;
+                }
+                let contributing = orchestrator.module_bans_len();
+                if contributing != last_logged {
+                    last_logged = contributing;
+                    log_event_broadcast(
+                        &ui_state,
+                        format!(
+                            "[Bans] asked {} chat module(s) for their bans; {} module(s) currently report bans",
+                            names.len(),
+                            contributing
+                        ),
+                    );
+                }
+                let secs = if config.module_bans_refresh_secs == 0 {
+                    60
+                } else {
+                    config.module_bans_refresh_secs
+                };
+                tokio::time::sleep(std::time::Duration::from_secs(secs as u64)).await;
             }
         });
     }
@@ -3341,6 +3432,7 @@ where
                                         enrich_chat_user(
                                             &user_db_client,
                                             &orchestrator.stream_tracker,
+                                            &orchestrator,
                                             chat,
                                         )
                                         .await;
@@ -3715,7 +3807,19 @@ where
                                 // opts into the apology reply for unregistered commands
                                 // under this module's flags.
                                 let n = commands.commands.len();
-                                cmd_registry.lock().unwrap().register(&module_name, commands.clone());
+                                let collisions = cmd_registry
+                                    .lock()
+                                    .unwrap()
+                                    .register(&module_name, commands.clone());
+                                for c in &collisions {
+                                    log_event_broadcast(
+                                        &ui_state,
+                                        format!(
+                                            "WARN: '{}{}' registered by '{}' overrides existing owner '{}' (last-writer-wins) — resolve the command ownership collision",
+                                            c.flag, c.name, c.new_owner, c.existing_owner
+                                        ),
+                                    );
+                                }
                                 log_event_broadcast(
                                     &ui_state,
                                     format!(
